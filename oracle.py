@@ -34,6 +34,7 @@ MODEL_VERSION_RE = re.compile(r"gemini-(\d+(?:\.\d+)?)", re.IGNORECASE)
 DISCOVERY_SOURCE_MODES = {"external_first", "playwright_first", "external_only"}
 DEFAULT_DISCOVERY_SOURCE_MODE = "external_first"
 DEFAULT_GEMINI_MODEL = "models/gemini-2.0-flash"
+DEFAULT_OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 
 
 @dataclass
@@ -52,12 +53,16 @@ class DiscoveryOracle:
         *,
         gemini_api_key: Optional[str] = None,
         gemini_model: str = DEFAULT_GEMINI_MODEL,
+        openrouter_api_key: Optional[str] = None,
         min_ai_score: int = 60,
     ) -> None:
         self.repository = repository
         self.min_ai_score = min_ai_score
         self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
         self.gemini_model = self._normalize_model_name(os.getenv("GEMINI_MODEL") or gemini_model)
+        self.openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
+        self.openrouter_api_base = (os.getenv("OPENROUTER_API_BASE") or DEFAULT_OPENROUTER_API_BASE).rstrip("/")
+        self.openrouter_model_preference = (os.getenv("OPENROUTER_MODEL") or "").strip()
         requested_mode = (os.getenv("DISCOVERY_SOURCE_MODE") or DEFAULT_DISCOVERY_SOURCE_MODE).strip().lower()
         if requested_mode not in DISCOVERY_SOURCE_MODES:
             LOGGER.warning(
@@ -73,6 +78,12 @@ class DiscoveryOracle:
         self._gemini_available_candidates: list[str] = []
         self._gemini_probe_report: list[Dict[str, Any]] = []
         self._gemini_candidate_index: Optional[int] = None
+        self._openrouter_model_id: Optional[str] = None
+        self._openrouter_candidates: list[str] = []
+        self._openrouter_available_candidates: list[str] = []
+        self._openrouter_probe_report: list[Dict[str, Any]] = []
+        self._openrouter_candidate_index: Optional[int] = None
+        self._openrouter_inventory_loaded = False
         self.ai_runtime = {
             "engine": "heuristic",
             "model": "heuristic-ai-v2",
@@ -98,21 +109,35 @@ class DiscoveryOracle:
         if self.gemini_api_key and genai is not None:
             self._initialize_gemini_runtime()
         elif not self.gemini_api_key:
-            LOGGER.warning("Gemini API key missing: fallback heuristic scoring will be used")
+            LOGGER.warning("Gemini API key missing.")
             self.ai_runtime = {
                 "engine": "heuristic",
                 "model": "heuristic-ai-v2",
-                "mode": "fallback_no_key",
+                "mode": "fallback_no_gemini_key",
             }
         else:
-            LOGGER.warning(
-                "google-generativeai package not installed: fallback heuristic scoring will be used"
-            )
+            LOGGER.warning("google-generativeai package not installed.")
             self.ai_runtime = {
                 "engine": "heuristic",
                 "model": "heuristic-ai-v2",
-                "mode": "fallback_missing_package",
+                "mode": "fallback_missing_gemini_package",
             }
+
+        if self._model is None:
+            self._initialize_openrouter_runtime()
+
+        if self._model is None and self._openrouter_model_id is None:
+            if self.ai_runtime.get("mode") not in {
+                "fallback_quota_exhausted",
+                "fallback_no_working_model",
+                "fallback_no_openrouter_key",
+                "fallback_openrouter_unavailable",
+            }:
+                self.ai_runtime = {
+                    "engine": "heuristic",
+                    "model": "heuristic-ai-v2",
+                    "mode": "fallback_no_external_ai",
+                }
         LOGGER.info("Discovery source mode configured: %s", self.discovery_source_mode)
 
     def _initialize_gemini_runtime(self) -> None:
@@ -414,6 +439,390 @@ class DiscoveryOracle:
             "reason": reason[:220],
         }
         LOGGER.warning("Gemini disabled | mode=%s reason=%s", mode, reason)
+
+    def _initialize_openrouter_runtime(self) -> None:
+        if self._openrouter_inventory_loaded and self._openrouter_model_id is not None:
+            return
+
+        self._openrouter_inventory_loaded = True
+        if requests is None:
+            self._disable_openrouter("fallback_openrouter_unavailable", "requests package unavailable")
+            return
+        if not self.openrouter_api_key:
+            self._disable_openrouter("fallback_no_openrouter_key", "OPENROUTER_API_KEY missing")
+            return
+
+        try:
+            model_payloads = self._fetch_openrouter_model_payloads()
+        except Exception as exc:  # noqa: BLE001
+            self._disable_openrouter("fallback_openrouter_unavailable", str(exc))
+            return
+        candidates = self._sort_openrouter_model_candidates(model_payloads, preferred_model=self.openrouter_model_preference)
+        self._openrouter_candidates = candidates
+        if not candidates:
+            self._disable_openrouter("fallback_no_openrouter_models", "Nessun modello OpenRouter free-tier text-capable.")
+            return
+
+        probe_report = self._probe_all_openrouter_candidates(candidates)
+        self._openrouter_probe_report = probe_report
+        available_models = [row["model"] for row in probe_report if row.get("available")]
+        self._openrouter_available_candidates = available_models
+        LOGGER.info(
+            "OpenRouter inventory complete | total=%s available=%s",
+            len(candidates),
+            len(available_models),
+        )
+
+        if available_models:
+            best_model = available_models[0]
+            best_idx = candidates.index(best_model)
+            self._activate_openrouter_model(
+                model_id=best_model,
+                index=best_idx,
+                mode="api_openrouter_inventory",
+                probe_report=probe_report,
+            )
+            return
+
+        if any(row.get("status") == "quota_exhausted_global" for row in probe_report):
+            self._disable_openrouter(
+                "fallback_openrouter_quota_exhausted",
+                "Quota OpenRouter free-tier non disponibile per i modelli candidati.",
+                probe_report=probe_report,
+            )
+            return
+
+        self._disable_openrouter(
+            "fallback_openrouter_no_working_model",
+            "Nessun modello OpenRouter free-tier ha superato il probe API.",
+            probe_report=probe_report,
+        )
+
+    def _fetch_openrouter_model_payloads(self) -> list[Dict[str, Any]]:
+        if requests is None:
+            return []
+
+        url = f"{self.openrouter_api_base}/models"
+        headers = self._openrouter_headers(include_json=False)
+        response = requests.get(url, headers=headers, timeout=40)
+        if response.status_code >= 400:
+            raise RuntimeError(f"OpenRouter model list error {response.status_code}: {response.text[:220]}")
+
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, list):
+            return [row for row in data if isinstance(row, dict)]
+        return []
+
+    @classmethod
+    def _sort_openrouter_model_candidates(
+        cls,
+        model_payloads: list[Dict[str, Any]],
+        *,
+        preferred_model: Optional[str] = None,
+    ) -> list[str]:
+        ranked_rows: list[tuple[int, str]] = []
+        for row in model_payloads:
+            model_id = str(row.get("id") or "").strip()
+            if not model_id:
+                continue
+            if not cls._is_openrouter_text_model(row):
+                continue
+            if not cls._is_openrouter_free_model(row):
+                continue
+            ranked_rows.append((cls._score_openrouter_model_payload(row), model_id))
+
+        ranked_rows.sort(key=lambda item: item[0], reverse=True)
+        ranked = [item[1] for item in ranked_rows]
+        preferred = str(preferred_model or "").strip()
+        if preferred and preferred in ranked:
+            ranked = [preferred] + [name for name in ranked if name != preferred]
+        return ranked
+
+    @classmethod
+    def _score_openrouter_model_payload(cls, payload: Dict[str, Any]) -> int:
+        model_id = str(payload.get("id") or "").lower()
+        score = 0
+
+        if "pro" in model_id:
+            score += 360
+        elif any(token in model_id for token in ("reason", "thinking", "r1")):
+            score += 320
+        elif "flash" in model_id:
+            score += 250
+        elif any(token in model_id for token in ("mini", "small", "nano")):
+            score += 170
+        else:
+            score += 130
+
+        if "preview" in model_id or "beta" in model_id or "exp" in model_id:
+            score -= 18
+
+        context_length = payload.get("context_length")
+        try:
+            context_int = int(context_length or 0)
+        except (TypeError, ValueError):
+            context_int = 0
+        score += min(120, context_int // 4096)
+        return score
+
+    @staticmethod
+    def _is_openrouter_text_model(payload: Dict[str, Any]) -> bool:
+        architecture = payload.get("architecture") if isinstance(payload, dict) else {}
+        if not isinstance(architecture, dict):
+            architecture = {}
+        modality = str(architecture.get("modality") or "").lower()
+        if modality:
+            left, _, right = modality.partition("->")
+            return ("text" in left) and ("text" in right)
+        model_id = str(payload.get("id") or "").lower()
+        return not any(token in model_id for token in ("image", "tts", "speech", "audio", "vision"))
+
+    @staticmethod
+    def _is_openrouter_free_model(payload: Dict[str, Any]) -> bool:
+        model_id = str(payload.get("id") or "").lower()
+        if model_id.endswith(":free") or ":free" in model_id:
+            return True
+        pricing = payload.get("pricing")
+        if not isinstance(pricing, dict):
+            return False
+
+        non_empty_values = []
+        for value in pricing.values():
+            text = str(value or "").strip()
+            if not text:
+                continue
+            non_empty_values.append(text)
+        if not non_empty_values:
+            return False
+
+        for text in non_empty_values:
+            try:
+                if float(text) > 0:
+                    return False
+            except ValueError:
+                return False
+        return True
+
+    def _probe_all_openrouter_candidates(self, candidates: list[str]) -> list[Dict[str, Any]]:
+        report: list[Dict[str, Any]] = []
+        global_quota_zero = False
+        for model_id in candidates:
+            if global_quota_zero:
+                report.append(
+                    {
+                        "model": model_id,
+                        "available": False,
+                        "status": "quota_exhausted_global",
+                        "reason": "Inherited global quota lock.",
+                    }
+                )
+                continue
+
+            ok, reason = self._probe_openrouter_model(model_id)
+            status = "available" if ok else self._classify_openrouter_probe_failure(reason)
+            report.append(
+                {
+                    "model": model_id,
+                    "available": ok,
+                    "status": status,
+                    "reason": reason[:220],
+                }
+            )
+            if ok:
+                continue
+            LOGGER.warning("OpenRouter model probe failed | model=%s status=%s reason=%s", model_id, status, reason)
+            if status == "quota_exhausted_global":
+                global_quota_zero = True
+        return report
+
+    def _probe_openrouter_model(self, model_id: str) -> tuple[bool, str]:
+        if requests is None:
+            return False, "requests unavailable"
+        try:
+            self._openrouter_chat_completion(
+                model_id=model_id,
+                messages=[{"role": "user", "content": "Rispondi con una sola parola: ok"}],
+                max_tokens=8,
+                temperature=0.0,
+            )
+            return True, "ok"
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+
+    @classmethod
+    def _classify_openrouter_probe_failure(cls, reason: str) -> str:
+        text = str(reason or "").lower()
+        if cls._is_global_quota_exhausted(text):
+            return "quota_exhausted_global"
+        if "quota" in text or "402" in text or "429" in text or "rate limit" in text:
+            return "quota_limited"
+        if any(token in text for token in ("not found", "not supported", "permission", "401", "403")):
+            return "unsupported_or_denied"
+        if "timeout" in text or "temporarily unavailable" in text or "502" in text or "503" in text:
+            return "transient_error"
+        return "probe_error"
+
+    def _activate_openrouter_model(
+        self,
+        *,
+        model_id: str,
+        index: int,
+        mode: str,
+        probe_report: Optional[list[Dict[str, Any]]] = None,
+    ) -> None:
+        self._openrouter_model_id = model_id
+        self._openrouter_candidate_index = index
+        self.ai_runtime = {
+            "engine": "openrouter",
+            "provider": "openrouter",
+            "model": model_id,
+            "mode": mode,
+            "candidate_index": index,
+            "candidate_count": len(self._openrouter_candidates),
+            "inventory_total": len(self._openrouter_candidates),
+            "inventory_available": len(self._openrouter_available_candidates),
+            "probe_report": (probe_report or self._openrouter_probe_report)[:8],
+        }
+        LOGGER.info(
+            "OpenRouter model activated | model=%s index=%s/%s mode=%s",
+            model_id,
+            index + 1,
+            max(1, len(self._openrouter_candidates)),
+            mode,
+        )
+
+    def _advance_openrouter_model(self, *, reason: str) -> bool:
+        if not self._openrouter_candidates:
+            return False
+        current = self._openrouter_model_id
+        fallback_pool = [name for name in (self._openrouter_available_candidates or self._openrouter_candidates) if name != current]
+        for model_id in fallback_pool:
+            ok, probe_reason = self._probe_openrouter_model(model_id)
+            if not ok:
+                LOGGER.warning(
+                    "OpenRouter candidate rejected during failover | model=%s reason=%s",
+                    model_id,
+                    probe_reason,
+                )
+                continue
+            idx = self._openrouter_candidates.index(model_id)
+            self._activate_openrouter_model(model_id=model_id, index=idx, mode="api_openrouter_failover")
+            LOGGER.warning("OpenRouter failover completed | previous_reason=%s new_model=%s", reason, model_id)
+            return True
+        return False
+
+    def _disable_openrouter(
+        self,
+        mode: str,
+        reason: str,
+        *,
+        probe_report: Optional[list[Dict[str, Any]]] = None,
+    ) -> None:
+        self._openrouter_model_id = None
+        self._openrouter_candidate_index = None
+        if self._model is None:
+            self.ai_runtime = {
+                "engine": "heuristic",
+                "model": "heuristic-ai-v2",
+                "mode": mode,
+                "reason": reason[:220],
+                "inventory_total": len(self._openrouter_candidates),
+                "inventory_available": len(self._openrouter_available_candidates),
+                "probe_report": (probe_report or self._openrouter_probe_report)[:8],
+            }
+        LOGGER.warning("OpenRouter disabled | mode=%s reason=%s", mode, reason)
+
+    @staticmethod
+    def _should_rotate_openrouter_model(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(
+            token in text
+            for token in (
+                "quota",
+                "rate limit",
+                "429",
+                "402",
+                "not found",
+                "not supported",
+                "permission",
+                "401",
+                "403",
+            )
+        )
+
+    def _openrouter_headers(self, *, include_json: bool = True) -> Dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {self.openrouter_api_key}",
+            "HTTP-Referer": "https://github.com/bruciato87/lego_hunter",
+            "X-Title": "Lego_Hunter",
+        }
+        if include_json:
+            headers["Content-Type"] = "application/json"
+        return headers
+
+    def _openrouter_chat_completion(
+        self,
+        *,
+        model_id: str,
+        messages: list[Dict[str, str]],
+        max_tokens: int,
+        temperature: float,
+    ) -> Dict[str, Any]:
+        if requests is None:
+            raise RuntimeError("requests unavailable")
+        if not self.openrouter_api_key:
+            raise RuntimeError("OPENROUTER_API_KEY missing")
+
+        url = f"{self.openrouter_api_base}/chat/completions"
+        payload = {
+            "model": model_id,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        response = requests.post(
+            url,
+            headers=self._openrouter_headers(include_json=True),
+            json=payload,
+            timeout=45,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"OpenRouter error {response.status_code}: {response.text[:260]}")
+        data = response.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("OpenRouter invalid response payload")
+        return data
+
+    def _openrouter_generate(self, prompt: str) -> str:
+        if not self._openrouter_model_id:
+            return "{}"
+
+        data = self._openrouter_chat_completion(
+            model_id=self._openrouter_model_id,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=420,
+            temperature=0.2,
+        )
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("OpenRouter response missing choices")
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if not isinstance(message, dict):
+            raise RuntimeError("OpenRouter response missing message")
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            chunks: list[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    txt = part.get("text")
+                    if txt:
+                        chunks.append(str(txt))
+            if chunks:
+                return " ".join(chunks).strip()
+        raise RuntimeError("OpenRouter response missing text content")
 
     @staticmethod
     def _should_rotate_gemini_model(exc: Exception) -> bool:
@@ -1254,40 +1663,65 @@ class DiscoveryOracle:
         return "Unknown"
 
     async def _get_ai_insight(self, candidate: Dict[str, Any]) -> AIInsight:
-        if self._model is None:
-            return self._heuristic_ai_fallback(candidate)
-
         prompt = self._build_gemini_prompt(candidate)
-        try:
-            text = await asyncio.to_thread(self._gemini_generate, prompt)
-            payload = self._extract_json(text)
-            score = int(payload.get("score", 50))
-            score = max(1, min(100, score))
-            summary = str(payload.get("summary") or "No summary")[:1200]
-            predicted_eol_date = payload.get("predicted_eol_date") or candidate.get("eol_date_prediction")
-            return AIInsight(score=score, summary=summary, predicted_eol_date=predicted_eol_date)
-        except Exception as exc:  # noqa: BLE001
-            if self._should_rotate_gemini_model(exc) and self._advance_gemini_model(reason=str(exc)):
-                try:
-                    text = await asyncio.to_thread(self._gemini_generate, prompt)
-                    payload = self._extract_json(text)
-                    score = int(payload.get("score", 50))
-                    score = max(1, min(100, score))
-                    summary = str(payload.get("summary") or "No summary")[:1200]
-                    predicted_eol_date = payload.get("predicted_eol_date") or candidate.get("eol_date_prediction")
-                    return AIInsight(score=score, summary=summary, predicted_eol_date=predicted_eol_date)
-                except Exception as exc_after_switch:  # noqa: BLE001
-                    self._disable_gemini("fallback_after_gemini_error", str(exc_after_switch))
-                    LOGGER.warning(
-                        "Gemini scoring failed after failover for %s: %s",
-                        candidate.get("set_id"),
-                        exc_after_switch,
-                    )
-            elif self._should_rotate_gemini_model(exc):
-                self._disable_gemini("fallback_after_gemini_error", str(exc))
-            else:
-                LOGGER.warning("Gemini scoring failed for %s: %s", candidate.get("set_id"), exc)
-            return self._heuristic_ai_fallback(candidate)
+        if self._model is not None:
+            try:
+                text = await asyncio.to_thread(self._gemini_generate, prompt)
+                payload = self._extract_json(text)
+                return self._payload_to_ai_insight(payload, candidate)
+            except Exception as exc:  # noqa: BLE001
+                if self._should_rotate_gemini_model(exc) and self._advance_gemini_model(reason=str(exc)):
+                    try:
+                        text = await asyncio.to_thread(self._gemini_generate, prompt)
+                        payload = self._extract_json(text)
+                        return self._payload_to_ai_insight(payload, candidate)
+                    except Exception as exc_after_switch:  # noqa: BLE001
+                        self._disable_gemini("fallback_after_gemini_error", str(exc_after_switch))
+                        LOGGER.warning(
+                            "Gemini scoring failed after failover for %s: %s",
+                            candidate.get("set_id"),
+                            exc_after_switch,
+                        )
+                elif self._should_rotate_gemini_model(exc):
+                    self._disable_gemini("fallback_after_gemini_error", str(exc))
+                else:
+                    LOGGER.warning("Gemini scoring failed for %s: %s", candidate.get("set_id"), exc)
+
+        if self._openrouter_model_id is None and not self._openrouter_inventory_loaded:
+            self._initialize_openrouter_runtime()
+
+        if self._openrouter_model_id is not None:
+            try:
+                text = await asyncio.to_thread(self._openrouter_generate, prompt)
+                payload = self._extract_json(text)
+                return self._payload_to_ai_insight(payload, candidate)
+            except Exception as exc:  # noqa: BLE001
+                if self._should_rotate_openrouter_model(exc) and self._advance_openrouter_model(reason=str(exc)):
+                    try:
+                        text = await asyncio.to_thread(self._openrouter_generate, prompt)
+                        payload = self._extract_json(text)
+                        return self._payload_to_ai_insight(payload, candidate)
+                    except Exception as exc_after_switch:  # noqa: BLE001
+                        self._disable_openrouter("fallback_after_openrouter_error", str(exc_after_switch))
+                        LOGGER.warning(
+                            "OpenRouter scoring failed after failover for %s: %s",
+                            candidate.get("set_id"),
+                            exc_after_switch,
+                        )
+                elif self._should_rotate_openrouter_model(exc):
+                    self._disable_openrouter("fallback_after_openrouter_error", str(exc))
+                else:
+                    LOGGER.warning("OpenRouter scoring failed for %s: %s", candidate.get("set_id"), exc)
+
+        return self._heuristic_ai_fallback(candidate)
+
+    @staticmethod
+    def _payload_to_ai_insight(payload: Dict[str, Any], candidate: Dict[str, Any]) -> AIInsight:
+        score = int(payload.get("score", 50))
+        score = max(1, min(100, score))
+        summary = str(payload.get("summary") or "No summary")[:1200]
+        predicted_eol_date = payload.get("predicted_eol_date") or candidate.get("eol_date_prediction")
+        return AIInsight(score=score, summary=summary, predicted_eol_date=predicted_eol_date)
 
     def _gemini_generate(self, prompt: str) -> str:
         if self._model is None:

@@ -292,6 +292,84 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    def test_openrouter_free_model_detection(self) -> None:
+        free_payload = {
+            "id": "openai/gpt-oss-20b:free",
+            "pricing": {"prompt": "0", "completion": "0"},
+            "architecture": {"modality": "text->text"},
+        }
+        paid_payload = {
+            "id": "openai/gpt-4.1",
+            "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+            "architecture": {"modality": "text->text"},
+        }
+        self.assertTrue(DiscoveryOracle._is_openrouter_free_model(free_payload))
+        self.assertFalse(DiscoveryOracle._is_openrouter_free_model(paid_payload))
+
+    def test_openrouter_candidate_ranking(self) -> None:
+        payloads = [
+            {
+                "id": "vendor/model-mini:free",
+                "pricing": {"prompt": "0", "completion": "0"},
+                "context_length": 32000,
+                "architecture": {"modality": "text->text"},
+            },
+            {
+                "id": "vendor/model-pro:free",
+                "pricing": {"prompt": "0", "completion": "0"},
+                "context_length": 128000,
+                "architecture": {"modality": "text->text"},
+            },
+        ]
+        ranked = DiscoveryOracle._sort_openrouter_model_candidates(payloads)
+        self.assertEqual(ranked[0], "vendor/model-pro:free")
+
+    def test_classify_openrouter_probe_failure(self) -> None:
+        self.assertEqual(
+            DiscoveryOracle._classify_openrouter_probe_failure(
+                "429 quota exceeded ... limit: 0"
+            ),
+            "quota_exhausted_global",
+        )
+        self.assertEqual(
+            DiscoveryOracle._classify_openrouter_probe_failure(
+                "429 rate limit"
+            ),
+            "quota_limited",
+        )
+        self.assertEqual(
+            DiscoveryOracle._classify_openrouter_probe_failure(
+                "404 model not found"
+            ),
+            "unsupported_or_denied",
+        )
+
+    async def test_get_ai_insight_uses_openrouter_when_available(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True) as init_or:
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        init_or.assert_called()
+        oracle._openrouter_model_id = "vendor/model-pro:free"
+        oracle._openrouter_inventory_loaded = True
+
+        candidate = {
+            "set_id": "75367",
+            "set_name": "LEGO Star Wars",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 129.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+        with patch.object(
+            oracle,
+            "_openrouter_generate",
+            return_value='{"score": 88, "summary": "Buon potenziale", "predicted_eol_date": "2026-11-01"}',
+        ):
+            insight = await oracle._get_ai_insight(candidate)
+
+        self.assertEqual(insight.score, 88)
+        self.assertEqual(insight.predicted_eol_date, "2026-11-01")
+
     def test_extract_json_from_wrapped_text(self) -> None:
         raw = "Risposta:\n{\"score\": 77, \"summary\": \"ok\"}\nfine"
         payload = DiscoveryOracle._extract_json(raw)
