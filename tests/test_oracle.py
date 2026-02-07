@@ -110,7 +110,7 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(banned)
         self.assertTrue(oracle._is_model_temporarily_banned("gemini", "models/gemini-2.0-flash"))
 
-    def test_openrouter_strict_probe_disables_optimistic_activation(self) -> None:
+    def test_openrouter_strict_probe_enables_best_effort_activation(self) -> None:
         repo = FakeRepo()
         with patch.object(DiscoveryOracle, "_initialize_gemini_runtime", autospec=True):
             oracle = DiscoveryOracle(repo, gemini_api_key="fake", openrouter_api_key="fake-or-key")
@@ -147,8 +147,8 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         ):
             oracle._initialize_openrouter_runtime()
 
-        self.assertIsNone(oracle._openrouter_model_id)
-        self.assertEqual(oracle.ai_runtime.get("mode"), "fallback_openrouter_no_working_model")
+        self.assertEqual(oracle._openrouter_model_id, "vendor/model-a:free")
+        self.assertEqual(oracle.ai_runtime.get("mode"), "api_openrouter_best_effort")
 
     async def test_discover_opportunities_filters_by_min_score(self) -> None:
         repo = FakeRepo()
@@ -897,8 +897,44 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
 
         self.assertTrue(insight.fallback_used)
         self.assertEqual(mocked_generate.call_count, 2)
-        self.assertIsNone(oracle._openrouter_model_id)
-        self.assertEqual(oracle.ai_runtime.get("mode"), "fallback_after_openrouter_error")
+        self.assertEqual(oracle._openrouter_model_id, "vendor/model-2:free")
+        self.assertNotEqual(oracle.ai_runtime.get("mode"), "fallback_after_openrouter_error")
+
+    async def test_openrouter_non_rate_error_does_not_disable_provider(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle._openrouter_model_id = "vendor/model-1:free"
+        oracle._openrouter_inventory_loaded = True
+        oracle._openrouter_candidates = ["vendor/model-1:free"]
+        oracle._openrouter_available_candidates = ["vendor/model-1:free"]
+        oracle.openrouter_opportunistic_enabled = True
+        oracle.openrouter_opportunistic_attempts = 2
+        oracle.openrouter_opportunistic_timeout_sec = 5.0
+
+        candidate = {
+            "set_id": "75367",
+            "set_name": "LEGO Star Wars",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 129.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+
+        with patch.object(
+            oracle,
+            "_openrouter_generate",
+            side_effect=RuntimeError("OpenRouter error 500: upstream crash"),
+        ), patch.object(
+            oracle,
+            "_advance_openrouter_model_locked",
+            new=AsyncMock(return_value=False),
+        ):
+            insight = await oracle._get_ai_insight(candidate)
+
+        self.assertTrue(insight.fallback_used)
+        self.assertEqual(oracle._openrouter_model_id, "vendor/model-1:free")
+        self.assertNotEqual(oracle.ai_runtime.get("mode"), "fallback_after_openrouter_error")
 
     async def test_openrouter_non_json_text_is_parsed_into_ai_insight(self) -> None:
         repo = FakeRepo()
