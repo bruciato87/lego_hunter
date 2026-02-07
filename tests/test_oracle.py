@@ -16,6 +16,7 @@ class FakeRepo:
         self.snapshots = []
         self.recent = {}
         self.theme_baselines = {}
+        self.recent_ai_insights = {}
 
     def upsert_opportunity(self, record):  # noqa: ANN001
         self.upserted.append(record)
@@ -47,6 +48,14 @@ class FakeRepo:
                 "std_ai_score": 0.0,
             },
         )
+
+    def get_recent_ai_insights(self, set_ids, max_age_hours=36.0):  # noqa: ANN001
+        _ = max_age_hours
+        return {
+            str(set_id): self.recent_ai_insights[str(set_id)]
+            for set_id in set_ids
+            if str(set_id) in self.recent_ai_insights
+        }
 
 
 class DummyOracle(DiscoveryOracle):
@@ -190,6 +199,21 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
 
         limit = oracle._effective_ai_shortlist_limit(41)
         self.assertEqual(limit, 5)
+
+    def test_effective_ai_shortlist_limit_keeps_floor_with_single_inventory(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_rank_max_candidates = 10
+        oracle.ai_dynamic_shortlist_enabled = True
+        oracle.ai_dynamic_shortlist_floor = 4
+        oracle.ai_dynamic_shortlist_multi_model_floor = 5
+        oracle.ai_dynamic_shortlist_per_model = 2
+        oracle.ai_dynamic_shortlist_bonus = 1
+        oracle.ai_runtime["engine"] = "openrouter"
+        oracle.ai_runtime["inventory_available"] = 1
+
+        limit = oracle._effective_ai_shortlist_limit(41)
+        self.assertEqual(limit, 4)
 
     def test_success_patterns_summary_uses_top_two_signals(self) -> None:
         repo = FakeRepo()
@@ -1259,6 +1283,53 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(int(first_report["diagnostics"]["ranking"].get("ai_cache_hits") or 0), 0)
         self.assertGreaterEqual(int(second_report["diagnostics"]["ranking"].get("ai_cache_hits") or 0), 1)
 
+    async def test_ai_persisted_cache_reuses_db_score_before_external_call(self) -> None:
+        repo = FakeRepo()
+        now = datetime.now(timezone.utc)
+        repo.recent["75367"] = [
+            {
+                "set_id": "75367",
+                "price": 129.0,
+                "platform": "vinted",
+                "recorded_at": (now - timedelta(days=idx)).isoformat(),
+            }
+            for idx in range(4)
+        ]
+        repo.recent_ai_insights["75367"] = {
+            "set_id": "75367",
+            "ai_investment_score": 74,
+            "ai_analysis_summary": "Cache DB recente",
+            "eol_date_prediction": "2026-12-01",
+            "metadata": {
+                "ai_raw_score": 86,
+                "ai_fallback_used": False,
+                "ai_confidence": "HIGH_CONFIDENCE",
+            },
+        }
+        candidates = [
+            {
+                "set_id": "75367",
+                "set_name": "LEGO Star Wars",
+                "theme": "Star Wars",
+                "source": "lego_proxy_reader",
+                "current_price": 129.99,
+                "eol_date_prediction": "2026-05-01",
+                "metadata": {},
+                "mock_score": 35,
+                "mock_fallback": False,
+            }
+        ]
+        oracle = DummyOracle(repo, candidates)
+        oracle.ai_rank_max_candidates = 1
+        oracle.ai_cache_ttl_sec = 3600.0
+        oracle.ai_persisted_cache_ttl_sec = 172800.0
+
+        report = await oracle.discover_with_diagnostics(persist=False, top_limit=5, fallback_limit=1)
+
+        self.assertEqual(oracle.ai_calls, 0)
+        self.assertGreaterEqual(int(report["diagnostics"]["ranking"].get("ai_persisted_cache_hits") or 0), 1)
+        self.assertGreaterEqual(int(report["diagnostics"]["ranking"].get("ai_cache_hits") or 0), 1)
+
     def test_extract_json_from_wrapped_text(self) -> None:
         raw = "Risposta:\n{\"score\": 77, \"summary\": \"ok\"}\nfine"
         payload = DiscoveryOracle._extract_json(raw)
@@ -1402,6 +1473,68 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(int(stats["ai_scored_count"]), 1)
         self.assertEqual(int(stats["ai_errors"]), 0)
         mocked_recovery.assert_awaited_once()
+
+    async def test_top_pick_rescue_attempts_external_for_unscored_top_pick(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.openrouter_api_key = "test-key"
+        oracle.ai_top_pick_rescue_enabled = True
+        oracle.ai_top_pick_rescue_count = 3
+        oracle.ai_top_pick_rescue_timeout_sec = 3.0
+
+        candidate = {
+            "set_id": "75367",
+            "set_name": "LEGO Star Wars",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 129.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+        prepared = [
+            {
+                "candidate": candidate,
+                "set_id": "75367",
+                "theme": "Star Wars",
+                "forecast": oracle.forecaster.forecast(candidate=candidate, history_rows=[], theme_baseline={}),
+                "history_30": [],
+                "prefilter_score": 85,
+                "prefilter_rank": 5,
+                "ai_shortlisted": False,
+            }
+        ]
+        ranked = [
+            {
+                "set_id": "75367",
+                "composite_score": 72,
+                "ai_fallback_used": True,
+            }
+        ]
+        ai_results = {}
+
+        with patch.object(
+            oracle,
+            "_get_ai_insight",
+            new=AsyncMock(
+                return_value=AIInsight(
+                    score=88,
+                    summary="rescued",
+                    predicted_eol_date="2026-10-01",
+                    fallback_used=False,
+                    confidence="HIGH_CONFIDENCE",
+                )
+            ),
+        ) as mocked_get:
+            stats = await oracle._rescue_top_pick_ai_scores(
+                prepared=prepared,
+                ranked=ranked,
+                ai_results=ai_results,
+            )
+
+        self.assertEqual(mocked_get.await_count, 1)
+        self.assertEqual(int(stats["ai_top_pick_rescue_attempts"]), 1)
+        self.assertEqual(int(stats["ai_top_pick_rescue_successes"]), 1)
+        self.assertIn("75367", ai_results)
+        self.assertFalse(ai_results["75367"].fallback_used)
 
     async def test_score_ai_shortlist_limits_openrouter_concurrency_with_single_model(self) -> None:
         repo = FakeRepo()

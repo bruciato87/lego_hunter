@@ -39,6 +39,13 @@ class ModelsRetryTests(unittest.TestCase):
 
         self.assertEqual(repo.search_opportunities("   "), [])
 
+    def test_get_recent_ai_insights_empty_set_ids_short_circuit(self) -> None:
+        repo = object.__new__(LegoHunterRepository)
+        repo.max_retries = 1
+        repo.retry_base_delay = 0.01
+
+        self.assertEqual(repo.get_recent_ai_insights([]), {})
+
 
 if __name__ == "__main__":
     unittest.main()

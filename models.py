@@ -298,6 +298,44 @@ class LegoHunterRepository:
         result = self._with_retry("get_recent_opportunities", lambda: query.execute())
         return result.data or []
 
+    def get_recent_ai_insights(
+        self,
+        set_ids: Iterable[str],
+        *,
+        max_age_hours: float = 36.0,
+    ) -> Dict[str, Dict[str, Any]]:
+        unique_ids = [str(item).strip() for item in set_ids if str(item).strip()]
+        if not unique_ids:
+            return {}
+
+        age_hours = max(1.0, float(max_age_hours))
+        since_ts = datetime.now(timezone.utc).timestamp() - (age_hours * 60.0 * 60.0)
+        since_iso = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
+        collected: list[Dict[str, Any]] = []
+
+        for chunk in self._chunks(unique_ids, chunk_size=80):
+            query = (
+                self.client.table("opportunity_radar")
+                .select(
+                    "set_id,source,ai_investment_score,ai_analysis_summary,"
+                    "eol_date_prediction,last_seen_at,metadata"
+                )
+                .in_("set_id", chunk)
+                .eq("is_archived", False)
+                .gte("last_seen_at", since_iso)
+                .order("last_seen_at", desc=True)
+            )
+            result = self._with_retry("get_recent_ai_insights", lambda: query.execute())
+            collected.extend(result.data or [])
+
+        latest_by_set: Dict[str, Dict[str, Any]] = {}
+        for row in collected:
+            set_id = str(row.get("set_id") or "").strip()
+            if not set_id or set_id in latest_by_set:
+                continue
+            latest_by_set[set_id] = row
+        return latest_by_set
+
     def get_market_history_for_sets(
         self,
         set_ids: Iterable[str],

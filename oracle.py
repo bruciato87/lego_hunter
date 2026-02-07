@@ -51,6 +51,7 @@ DEFAULT_OPENROUTER_JSON_REPAIR_PROBE_TIMEOUT_SEC = 4.0
 DEFAULT_AI_SCORING_CONCURRENCY = 4
 DEFAULT_AI_RANK_MAX_CANDIDATES = 12
 DEFAULT_AI_CACHE_TTL_SEC = 10800.0
+DEFAULT_AI_PERSISTED_CACHE_TTL_SEC = 129600.0
 DEFAULT_AI_CACHE_MAX_ITEMS = 4000
 DEFAULT_OPENROUTER_MALFORMED_LIMIT = 3
 DEFAULT_AI_SCORING_HARD_BUDGET_SEC = 60.0
@@ -78,8 +79,12 @@ DEFAULT_OPENROUTER_OPPORTUNISTIC_ATTEMPTS = 3
 DEFAULT_OPENROUTER_OPPORTUNISTIC_TIMEOUT_SEC = 8.0
 DEFAULT_AI_DYNAMIC_SHORTLIST_ENABLED = True
 DEFAULT_AI_DYNAMIC_SHORTLIST_FLOOR = 4
+DEFAULT_AI_DYNAMIC_SHORTLIST_MULTI_MODEL_FLOOR = 5
 DEFAULT_AI_DYNAMIC_SHORTLIST_PER_MODEL = 2
 DEFAULT_AI_DYNAMIC_SHORTLIST_BONUS = 1
+DEFAULT_AI_TOP_PICK_RESCUE_ENABLED = True
+DEFAULT_AI_TOP_PICK_RESCUE_COUNT = 3
+DEFAULT_AI_TOP_PICK_RESCUE_TIMEOUT_SEC = 9.0
 DEFAULT_HISTORY_WINDOW_DAYS = 180
 DEFAULT_BACKTEST_LOOKBACK_DAYS = 365
 DEFAULT_BACKTEST_HORIZON_DAYS = 180
@@ -350,6 +355,12 @@ class DiscoveryOracle:
             minimum=2,
             maximum=20,
         )
+        self.ai_dynamic_shortlist_multi_model_floor = self._safe_env_int(
+            "AI_DYNAMIC_SHORTLIST_MULTI_MODEL_FLOOR",
+            default=DEFAULT_AI_DYNAMIC_SHORTLIST_MULTI_MODEL_FLOOR,
+            minimum=3,
+            maximum=20,
+        )
         self.ai_dynamic_shortlist_per_model = self._safe_env_int(
             "AI_DYNAMIC_SHORTLIST_PER_MODEL",
             default=DEFAULT_AI_DYNAMIC_SHORTLIST_PER_MODEL,
@@ -367,6 +378,12 @@ class DiscoveryOracle:
             default=DEFAULT_AI_CACHE_TTL_SEC,
             minimum=0.0,
             maximum=86400.0,
+        )
+        self.ai_persisted_cache_ttl_sec = self._safe_env_float(
+            "AI_PERSISTED_CACHE_TTL_SEC",
+            default=DEFAULT_AI_PERSISTED_CACHE_TTL_SEC,
+            minimum=0.0,
+            maximum=172800.0,
         )
         self.ai_cache_max_items = self._safe_env_int(
             "AI_INSIGHT_CACHE_MAX_ITEMS",
@@ -441,6 +458,22 @@ class DiscoveryOracle:
             default=DEFAULT_AI_BATCH_TIMEOUT_SEC,
             minimum=6.0,
             maximum=60.0,
+        )
+        self.ai_top_pick_rescue_enabled = self._safe_env_bool(
+            "AI_TOP_PICK_RESCUE_ENABLED",
+            default=DEFAULT_AI_TOP_PICK_RESCUE_ENABLED,
+        )
+        self.ai_top_pick_rescue_count = self._safe_env_int(
+            "AI_TOP_PICK_RESCUE_COUNT",
+            default=DEFAULT_AI_TOP_PICK_RESCUE_COUNT,
+            minimum=1,
+            maximum=6,
+        )
+        self.ai_top_pick_rescue_timeout_sec = self._safe_env_float(
+            "AI_TOP_PICK_RESCUE_TIMEOUT_SEC",
+            default=DEFAULT_AI_TOP_PICK_RESCUE_TIMEOUT_SEC,
+            minimum=2.0,
+            maximum=20.0,
         )
         self.bootstrap_thresholds_enabled = self._safe_env_bool(
             "BOOTSTRAP_THRESHOLDS_ENABLED",
@@ -612,14 +645,16 @@ class DiscoveryOracle:
             self.strict_ai_probe_validation,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s per_model=%s bonus=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s floor_multi_model=%s per_model=%s bonus=%s cache_ttl_sec=%.0f persisted_cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f ai_top_pick_rescue_enabled=%s ai_top_pick_rescue_count=%s ai_top_pick_rescue_timeout_sec=%.1f openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
             self.ai_dynamic_shortlist_enabled,
             self.ai_dynamic_shortlist_floor,
+            self.ai_dynamic_shortlist_multi_model_floor,
             self.ai_dynamic_shortlist_per_model,
             self.ai_dynamic_shortlist_bonus,
             self.ai_cache_ttl_sec,
+            self.ai_persisted_cache_ttl_sec,
             self.ai_cache_max_items,
             self.openrouter_malformed_limit,
             self.ai_scoring_hard_budget_sec,
@@ -633,6 +668,9 @@ class DiscoveryOracle:
             self.ai_batch_min_candidates,
             self.ai_batch_max_candidates,
             self.ai_batch_timeout_sec,
+            self.ai_top_pick_rescue_enabled,
+            self.ai_top_pick_rescue_count,
+            self.ai_top_pick_rescue_timeout_sec,
             self.openrouter_json_repair_probe_timeout_sec,
             self.ai_model_ban_sec,
             self.ai_model_ban_failures,
@@ -2643,7 +2681,15 @@ class DiscoveryOracle:
                 "ai_batch_scored_count": 0,
                 "ai_cache_hits": 0,
                 "ai_cache_misses": 0,
+                "ai_persisted_cache_hits": 0,
                 "ai_errors": 0,
+                "ai_budget_exhausted": 0,
+                "ai_timeout_count": 0,
+                "ai_top_pick_rescue_attempts": 0,
+                "ai_top_pick_rescue_successes": 0,
+                "ai_top_pick_rescue_failures": 0,
+                "ai_top_pick_rescue_timeouts": 0,
+                "ai_top_pick_rescue_cache_hits": 0,
                 "quant_prep_sec": 0.0,
                 "ai_scoring_sec": 0.0,
                 "persistence_sec": 0.0,
@@ -2660,10 +2706,136 @@ class DiscoveryOracle:
 
         ai_started = time.monotonic()
         ai_results, ai_stats = await self._score_ai_shortlist(shortlist)
+
+        ranked, opportunities = self._build_ranked_payloads(
+            prepared=prepared,
+            ai_results=ai_results,
+            skipped_set_ids=skipped_set_ids,
+            shortlist_count=len(shortlist),
+        )
+
+        rescue_stats = {
+            "ai_top_pick_rescue_attempts": 0,
+            "ai_top_pick_rescue_successes": 0,
+            "ai_top_pick_rescue_failures": 0,
+            "ai_top_pick_rescue_timeouts": 0,
+            "ai_top_pick_rescue_cache_hits": 0,
+        }
+        if self.ai_top_pick_rescue_enabled and ranked:
+            rescue_stats = await self._rescue_top_pick_ai_scores(
+                prepared=prepared,
+                ranked=ranked,
+                ai_results=ai_results,
+            )
+            if int(rescue_stats.get("ai_top_pick_rescue_attempts") or 0) > 0:
+                ranked, opportunities = self._build_ranked_payloads(
+                    prepared=prepared,
+                    ai_results=ai_results,
+                    skipped_set_ids=skipped_set_ids,
+                    shortlist_count=len(shortlist),
+                )
         ai_duration = time.monotonic() - ai_started
 
+        if rerank_attempt == 0 and self._is_ai_score_collapse(ranked):
+            switched = False
+            if self._openrouter_model_id:
+                switched = self._advance_openrouter_model(reason="score_collapse_guard")
+            elif self._model is not None:
+                switched = self._advance_gemini_model(reason="score_collapse_guard")
+
+            if switched:
+                LOGGER.warning(
+                    "AI score collapse detected | candidates=%s spread=%s switching_model=%s rerank_attempt=%s",
+                    len(ranked),
+                    max(int(row.get("ai_raw_score") or 0) for row in ranked)
+                    - min(int(row.get("ai_raw_score") or 0) for row in ranked),
+                    self.ai_runtime.get("model"),
+                    rerank_attempt + 1,
+                )
+                return await self._rank_and_persist_candidates(
+                    source_candidates,
+                    persist=persist,
+                    rerank_attempt=rerank_attempt + 1,
+                )
+
+        persist_started = time.monotonic()
+        persisted_opportunities = 0
+        persisted_snapshots = 0
+        if persist:
+            for opportunity, candidate in opportunities:
+                try:
+                    self.repository.upsert_opportunity(opportunity)
+                    persisted_opportunities += 1
+                    if candidate.get("current_price") is not None:
+                        self.repository.insert_market_snapshot(
+                            MarketTimeSeriesRecord(
+                                set_id=candidate["set_id"],
+                                set_name=candidate["set_name"],
+                                platform="lego" if "lego" in candidate.get("source", "") else "amazon",
+                                listing_type="new",
+                                price=float(candidate["current_price"]),
+                                shipping_cost=0.0,
+                                listing_url=candidate.get("listing_url"),
+                                raw_payload=candidate,
+                            )
+                        )
+                        persisted_snapshots += 1
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Failed to persist opportunity %s: %s", candidate.get("set_id"), exc)
+        persist_duration = time.monotonic() - persist_started
+        total_duration = time.monotonic() - started
+        self._last_ranking_diagnostics = {
+            "input_candidates": len(source_candidates),
+            "prepared_candidates": len(prepared),
+            "ai_shortlist_count": len(shortlist),
+            "ai_prefilter_skipped_count": len(skipped),
+            "ai_scored_count": int(ai_stats.get("ai_scored_count", 0)),
+            "ai_batch_scored_count": int(ai_stats.get("ai_batch_scored_count", 0)),
+            "ai_cache_hits": int(ai_stats.get("ai_cache_hits", 0)),
+            "ai_cache_misses": int(ai_stats.get("ai_cache_misses", 0)),
+            "ai_persisted_cache_hits": int(ai_stats.get("ai_persisted_cache_hits", 0)),
+            "ai_errors": int(ai_stats.get("ai_errors", 0)),
+            "ai_budget_exhausted": int(ai_stats.get("ai_budget_exhausted", 0)),
+            "ai_timeout_count": int(ai_stats.get("ai_timeout_count", 0)),
+            "ai_top_pick_rescue_attempts": int(rescue_stats.get("ai_top_pick_rescue_attempts", 0)),
+            "ai_top_pick_rescue_successes": int(rescue_stats.get("ai_top_pick_rescue_successes", 0)),
+            "ai_top_pick_rescue_failures": int(rescue_stats.get("ai_top_pick_rescue_failures", 0)),
+            "ai_top_pick_rescue_timeouts": int(rescue_stats.get("ai_top_pick_rescue_timeouts", 0)),
+            "ai_top_pick_rescue_cache_hits": int(rescue_stats.get("ai_top_pick_rescue_cache_hits", 0)),
+            "quant_prep_sec": round(prep_duration, 2),
+            "ai_scoring_sec": round(ai_duration, 2),
+            "persistence_sec": round(persist_duration, 2),
+            "total_sec": round(total_duration, 2),
+        }
+        LOGGER.info(
+            "Ranking completed | candidates=%s shortlisted=%s ai_scored=%s cache_hits=%s persisted_cache_hits=%s rescue_attempts=%s rescue_successes=%s persisted_opportunities=%s persisted_snapshots=%s durations={prep:%.2fs ai:%.2fs persist:%.2fs total:%.2fs}",
+            len(source_candidates),
+            len(shortlist),
+            self._last_ranking_diagnostics["ai_scored_count"],
+            self._last_ranking_diagnostics["ai_cache_hits"],
+            self._last_ranking_diagnostics["ai_persisted_cache_hits"],
+            self._last_ranking_diagnostics["ai_top_pick_rescue_attempts"],
+            self._last_ranking_diagnostics["ai_top_pick_rescue_successes"],
+            persisted_opportunities,
+            persisted_snapshots,
+            prep_duration,
+            ai_duration,
+            persist_duration,
+            total_duration,
+        )
+        return ranked
+
+    def _build_ranked_payloads(
+        self,
+        *,
+        prepared: list[Dict[str, Any]],
+        ai_results: Dict[str, AIInsight],
+        skipped_set_ids: Dict[str, Dict[str, Any]],
+        shortlist_count: int,
+    ) -> tuple[list[Dict[str, Any]], list[tuple[OpportunityRadarRecord, Dict[str, Any]]]]:
         ranked: list[Dict[str, Any]] = []
         opportunities: list[tuple[OpportunityRadarRecord, Dict[str, Any]]] = []
+
         for row in prepared:
             candidate = row["candidate"]
             set_id = row["set_id"]
@@ -2685,7 +2857,7 @@ class DiscoveryOracle:
                         predicted_eol_date=ai.predicted_eol_date or candidate.get("eol_date_prediction"),
                         fallback_used=True,
                         confidence="LOW_CONFIDENCE",
-                        risk_note=f"AI non eseguita: pre-filter rank #{pre_rank} oltre top {len(shortlist)}.",
+                        risk_note=f"AI non eseguita: pre-filter rank #{pre_rank} oltre top {shortlist_count}.",
                     )
 
             pattern_eval = self._evaluate_success_patterns(candidate)
@@ -2775,85 +2947,105 @@ class DiscoveryOracle:
             ranked.append(payload)
             opportunities.append((opportunity, candidate))
 
-        if rerank_attempt == 0 and self._is_ai_score_collapse(ranked):
-            switched = False
-            if self._openrouter_model_id:
-                switched = self._advance_openrouter_model(reason="score_collapse_guard")
-            elif self._model is not None:
-                switched = self._advance_gemini_model(reason="score_collapse_guard")
+        return ranked, opportunities
 
-            if switched:
-                LOGGER.warning(
-                    "AI score collapse detected | candidates=%s spread=%s switching_model=%s rerank_attempt=%s",
-                    len(ranked),
-                    max(int(row.get("ai_raw_score") or 0) for row in ranked)
-                    - min(int(row.get("ai_raw_score") or 0) for row in ranked),
-                    self.ai_runtime.get("model"),
-                    rerank_attempt + 1,
-                )
-                return await self._rank_and_persist_candidates(
-                    source_candidates,
-                    persist=persist,
-                    rerank_attempt=rerank_attempt + 1,
-                )
+    def _external_ai_available(self) -> bool:
+        if self._model is not None:
+            return True
+        if self._openrouter_model_id is not None:
+            return True
+        return bool(self.openrouter_api_key)
 
-        persist_started = time.monotonic()
-        persisted_opportunities = 0
-        persisted_snapshots = 0
-        if persist:
-            for opportunity, candidate in opportunities:
-                try:
-                    self.repository.upsert_opportunity(opportunity)
-                    persisted_opportunities += 1
-                    if candidate.get("current_price") is not None:
-                        self.repository.insert_market_snapshot(
-                            MarketTimeSeriesRecord(
-                                set_id=candidate["set_id"],
-                                set_name=candidate["set_name"],
-                                platform="lego" if "lego" in candidate.get("source", "") else "amazon",
-                                listing_type="new",
-                                price=float(candidate["current_price"]),
-                                shipping_cost=0.0,
-                                listing_url=candidate.get("listing_url"),
-                                raw_payload=candidate,
-                            )
-                        )
-                        persisted_snapshots += 1
-                except Exception as exc:  # noqa: BLE001
-                    LOGGER.warning("Failed to persist opportunity %s: %s", candidate.get("set_id"), exc)
-        persist_duration = time.monotonic() - persist_started
-        total_duration = time.monotonic() - started
-        self._last_ranking_diagnostics = {
-            "input_candidates": len(source_candidates),
-            "prepared_candidates": len(prepared),
-            "ai_shortlist_count": len(shortlist),
-            "ai_prefilter_skipped_count": len(skipped),
-            "ai_scored_count": int(ai_stats.get("ai_scored_count", 0)),
-            "ai_batch_scored_count": int(ai_stats.get("ai_batch_scored_count", 0)),
-            "ai_cache_hits": int(ai_stats.get("ai_cache_hits", 0)),
-            "ai_cache_misses": int(ai_stats.get("ai_cache_misses", 0)),
-            "ai_errors": int(ai_stats.get("ai_errors", 0)),
-            "ai_budget_exhausted": int(ai_stats.get("ai_budget_exhausted", 0)),
-            "ai_timeout_count": int(ai_stats.get("ai_timeout_count", 0)),
-            "quant_prep_sec": round(prep_duration, 2),
-            "ai_scoring_sec": round(ai_duration, 2),
-            "persistence_sec": round(persist_duration, 2),
-            "total_sec": round(total_duration, 2),
+    async def _rescue_top_pick_ai_scores(
+        self,
+        *,
+        prepared: list[Dict[str, Any]],
+        ranked: list[Dict[str, Any]],
+        ai_results: Dict[str, AIInsight],
+    ) -> Dict[str, int]:
+        stats = {
+            "ai_top_pick_rescue_attempts": 0,
+            "ai_top_pick_rescue_successes": 0,
+            "ai_top_pick_rescue_failures": 0,
+            "ai_top_pick_rescue_timeouts": 0,
+            "ai_top_pick_rescue_cache_hits": 0,
         }
-        LOGGER.info(
-            "Ranking completed | candidates=%s shortlisted=%s ai_scored=%s cache_hits=%s persisted_opportunities=%s persisted_snapshots=%s durations={prep:%.2fs ai:%.2fs persist:%.2fs total:%.2fs}",
-            len(source_candidates),
-            len(shortlist),
-            self._last_ranking_diagnostics["ai_scored_count"],
-            self._last_ranking_diagnostics["ai_cache_hits"],
-            persisted_opportunities,
-            persisted_snapshots,
-            prep_duration,
-            ai_duration,
-            persist_duration,
-            total_duration,
-        )
-        return ranked
+        if not ranked:
+            return stats
+
+        top_k = max(1, int(self.ai_top_pick_rescue_count))
+        top_rows = ranked[:top_k]
+        prepared_by_set = {str(row.get("set_id")): row for row in prepared}
+        rescue_candidates: list[Dict[str, Any]] = []
+
+        for row in top_rows:
+            set_id = str(row.get("set_id") or "").strip()
+            if not set_id:
+                continue
+            current_ai = ai_results.get(set_id)
+            if current_ai is not None and not current_ai.fallback_used:
+                continue
+            prepared_row = prepared_by_set.get(set_id)
+            if prepared_row is None:
+                continue
+            rescue_candidates.append(prepared_row["candidate"])
+
+        if not rescue_candidates:
+            return stats
+
+        stats["ai_top_pick_rescue_cache_hits"] = self._prime_ai_cache_from_repository(rescue_candidates)
+        external_available = self._external_ai_available()
+
+        for candidate in rescue_candidates:
+            set_id = str(candidate.get("set_id") or "").strip()
+            if not set_id:
+                continue
+            cached = self._get_cached_ai_insight(candidate)
+            if cached is not None and not cached.fallback_used:
+                ai_results[set_id] = cached
+                continue
+            if not external_available:
+                continue
+
+            stats["ai_top_pick_rescue_attempts"] += 1
+            try:
+                insight = await asyncio.wait_for(
+                    self._get_ai_insight(candidate),
+                    timeout=float(self.ai_top_pick_rescue_timeout_sec),
+                )
+            except asyncio.TimeoutError:
+                stats["ai_top_pick_rescue_failures"] += 1
+                stats["ai_top_pick_rescue_timeouts"] += 1
+                LOGGER.warning(
+                    "Top pick AI rescue timeout | set_id=%s timeout_sec=%.1f",
+                    set_id,
+                    self.ai_top_pick_rescue_timeout_sec,
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001
+                stats["ai_top_pick_rescue_failures"] += 1
+                LOGGER.warning("Top pick AI rescue failed | set_id=%s error=%s", set_id, exc)
+                continue
+
+            ai_results[set_id] = insight
+            if insight.fallback_used:
+                stats["ai_top_pick_rescue_failures"] += 1
+                continue
+            self._set_cached_ai_insight(candidate, insight)
+            stats["ai_top_pick_rescue_successes"] += 1
+
+        if stats["ai_top_pick_rescue_attempts"] > 0:
+            LOGGER.info(
+                "Top pick AI rescue summary | top_k=%s candidates=%s attempts=%s successes=%s failures=%s timeouts=%s cache_hits=%s",
+                top_k,
+                len(rescue_candidates),
+                stats["ai_top_pick_rescue_attempts"],
+                stats["ai_top_pick_rescue_successes"],
+                stats["ai_top_pick_rescue_failures"],
+                stats["ai_top_pick_rescue_timeouts"],
+                stats["ai_top_pick_rescue_cache_hits"],
+            )
+        return stats
 
     def _prepare_quantitative_context(self, source_candidates: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
         set_ids = [str(row.get("set_id") or "").strip() for row in source_candidates if str(row.get("set_id") or "").strip()]
@@ -2960,11 +3152,14 @@ class DiscoveryOracle:
             or len(self._openrouter_available_candidates)
             or 0
         )
+        adaptive_floor = int(self.ai_dynamic_shortlist_floor)
+        if inventory_available >= 2:
+            adaptive_floor = max(adaptive_floor, int(self.ai_dynamic_shortlist_multi_model_floor))
         if inventory_available <= 0:
-            return min(base_limit, max(2, int(self.ai_dynamic_shortlist_floor)))
+            return min(base_limit, max(2, adaptive_floor))
 
         dynamic_limit = int(self.ai_dynamic_shortlist_bonus) + (inventory_available * int(self.ai_dynamic_shortlist_per_model))
-        dynamic_limit = max(int(self.ai_dynamic_shortlist_floor), dynamic_limit)
+        dynamic_limit = max(adaptive_floor, dynamic_limit)
         effective = min(base_limit, max(2, dynamic_limit))
         if effective < base_limit:
             LOGGER.info(
@@ -3007,6 +3202,7 @@ class DiscoveryOracle:
             "ai_scored_count": 0,
             "ai_cache_hits": 0,
             "ai_cache_misses": 0,
+            "ai_persisted_cache_hits": 0,
             "ai_errors": 0,
             "ai_budget_exhausted": 0,
             "ai_timeout_count": 0,
@@ -3014,6 +3210,10 @@ class DiscoveryOracle:
         }
         if not shortlist:
             return {}, stats
+
+        stats["ai_persisted_cache_hits"] = self._prime_ai_cache_from_repository(
+            [entry.get("candidate") or {} for entry in shortlist],
+        )
 
         effective_concurrency = max(1, int(self.ai_scoring_concurrency))
         if str(self.ai_runtime.get("engine") or "") == "openrouter":
@@ -3262,11 +3462,12 @@ class DiscoveryOracle:
 
         elapsed = time.monotonic() - started
         LOGGER.info(
-            "AI shortlist scoring summary | candidates=%s scored=%s batch_scored=%s cache_hits=%s cache_misses=%s errors=%s timeouts=%s budget_exhausted=%s concurrency=%s elapsed=%.2fs budget=%.2fs",
+            "AI shortlist scoring summary | candidates=%s scored=%s batch_scored=%s cache_hits=%s persisted_cache_hits=%s cache_misses=%s errors=%s timeouts=%s budget_exhausted=%s concurrency=%s elapsed=%.2fs budget=%.2fs",
             len(shortlist),
             stats["ai_scored_count"],
             stats["ai_batch_scored_count"],
             stats["ai_cache_hits"],
+            stats["ai_persisted_cache_hits"],
             stats["ai_cache_misses"],
             stats["ai_errors"],
             stats["ai_timeout_count"],
@@ -3564,6 +3765,91 @@ class DiscoveryOracle:
             fallback_used=bool(insight.fallback_used),
             confidence=str(insight.confidence),
             risk_note=insight.risk_note,
+        )
+
+    def _prime_ai_cache_from_repository(self, candidates: list[Dict[str, Any]]) -> int:
+        if self.ai_cache_ttl_sec <= 0:
+            return 0
+        if self.ai_persisted_cache_ttl_sec <= 0:
+            return 0
+        if not candidates:
+            return 0
+
+        now_ts = time.time()
+        candidate_by_set: Dict[str, Dict[str, Any]] = {}
+        fetch_set_ids: list[str] = []
+        seen: set[str] = set()
+
+        for candidate in candidates:
+            set_id = str(candidate.get("set_id") or "").strip()
+            if not set_id or set_id in seen:
+                continue
+            seen.add(set_id)
+            candidate_by_set[set_id] = candidate
+            if self._get_cached_ai_insight(candidate) is None:
+                fetch_set_ids.append(set_id)
+
+        if not fetch_set_ids:
+            return 0
+
+        try:
+            cached_rows = self.repository.get_recent_ai_insights(
+                fetch_set_ids,
+                max_age_hours=max(1.0, self.ai_persisted_cache_ttl_sec / 3600.0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Persisted AI cache preload failed: %s", exc)
+            return 0
+
+        primed = 0
+        for set_id, row in cached_rows.items():
+            candidate = candidate_by_set.get(str(set_id))
+            if candidate is None:
+                continue
+            insight = self._insight_from_persisted_row(row, candidate)
+            if insight is None:
+                continue
+            key = self._ai_cache_key(candidate)
+            if not key:
+                continue
+            self._ai_insight_cache[key] = (
+                now_ts + min(self.ai_cache_ttl_sec, self.ai_persisted_cache_ttl_sec),
+                self._clone_ai_insight(insight),
+            )
+            primed += 1
+        return primed
+
+    @staticmethod
+    def _insight_from_persisted_row(row: Dict[str, Any], candidate: Dict[str, Any]) -> Optional[AIInsight]:
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if bool(metadata.get("ai_fallback_used")):
+            return None
+
+        raw_score = metadata.get("ai_raw_score")
+        if raw_score is None:
+            raw_score = row.get("ai_investment_score")
+        try:
+            score = int(float(raw_score))
+        except (TypeError, ValueError):
+            return None
+        score = max(1, min(100, score))
+
+        summary = str(row.get("ai_analysis_summary") or "").strip()
+        if not summary:
+            summary = "Score AI riusato da storico recente."
+        predicted = (
+            row.get("eol_date_prediction")
+            or metadata.get("predicted_eol_date")
+            or candidate.get("eol_date_prediction")
+        )
+        confidence = str(metadata.get("ai_confidence") or "HIGH_CONFIDENCE")
+        return AIInsight(
+            score=score,
+            summary=summary,
+            predicted_eol_date=predicted,
+            fallback_used=False,
+            confidence=confidence,
+            risk_note=None,
         )
 
     def _get_cached_ai_insight(self, candidate: Dict[str, Any]) -> Optional[AIInsight]:
