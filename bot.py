@@ -6,6 +6,7 @@ import html
 import logging
 import os
 from typing import Any, Optional
+from urllib.parse import quote_plus
 
 from telegram import Bot, BotCommand, Update
 from telegram.constants import ParseMode
@@ -39,17 +40,21 @@ class LegoHunterTelegramBot:
         self.fiscal_guardian = fiscal_guardian
         self.allowed_chat_id = str(allowed_chat_id) if allowed_chat_id else None
 
-    async def register_commands(self, app: Application) -> None:
-        commands = [
-            BotCommand("scova", "Discovery completa: trova set LEGO promettenti"),
-            BotCommand("radar", "Mostra top opportunita' scoperte"),
-            BotCommand("cerca", "Cerca nel radar: /cerca 75367"),
-            BotCommand("offerte", "Confronta prezzo ufficiale vs secondario"),
-            BotCommand("collezione", "Valore attuale portfolio LEGO"),
-            BotCommand("vendi", "Segnali uscita con ROI netto > 30%"),
-            BotCommand("help", "Lista comandi disponibili"),
+    @staticmethod
+    def supported_commands() -> list[BotCommand]:
+        return [
+            BotCommand("start", "Attiva il bot e mostra guida rapida"),
+            BotCommand("scova", "Scopre i migliori set da monitorare/acquistare"),
+            BotCommand("radar", "Mostra le opportunita' piu' forti in radar"),
+            BotCommand("cerca", "Cerca un set nel radar: /cerca 75367"),
+            BotCommand("offerte", "Confronta prezzo primario vs secondario"),
+            BotCommand("collezione", "Valore attuale portfolio e ROI latente"),
+            BotCommand("vendi", "Segnali vendita con ROI netto > 30%"),
+            BotCommand("help", "Guida completa ai comandi"),
         ]
-        await app.bot.set_my_commands(commands)
+
+    async def register_commands(self, app: Application) -> None:
+        await app.bot.set_my_commands(self.supported_commands())
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update):
@@ -62,13 +67,23 @@ class LegoHunterTelegramBot:
         if not self._is_authorized(update):
             return
         await update.message.reply_text(
-            "Comandi disponibili:\n"
-            "/scova - Discovery automatica e top picks\n"
-            "/radar - Opportunita' attuali dal Data Moat\n"
-            "/cerca <testo> - Cerca set (ID, nome, tema)\n"
-            "/offerte - Verifica sconti Vinted/Subito\n"
-            "/collezione - Valore e ROI latente dei set posseduti\n"
-            "/vendi - Candidati vendita con ROI netto > 30% (DAC7-safe)",
+            "🧱 LEGO HUNTER - Guida comandi\n\n"
+            "Comandi principali:\n"
+            "/scova - Discovery completa (LEGO + Amazon + ranking AI) e Top Picks del ciclo.\n"
+            "/radar - Mostra le opportunita' gia' in Opportunity Radar, ordinate per score.\n"
+            "/cerca <id|nome|tema> - Cerca set nel radar (es. /cerca 75367).\n"
+            "/offerte - Verifica se sul secondario trovi prezzi migliori del primario.\n"
+            "/collezione - Riepilogo portfolio: capitale investito, valore stimato, ROI latente.\n"
+            "/vendi - Segnali vendita con ROI netto > 30% (bloccati automaticamente se DAC7 a rischio).\n\n"
+            "Alias compatibilita':\n"
+            "/hunt -> /scova\n"
+            "/portfolio -> /collezione\n"
+            "/sell_signal -> /vendi\n\n"
+            "Esempi rapidi:\n"
+            "/cerca millennium falcon\n"
+            "/cerca 10332\n"
+            "/offerte\n"
+            "/help",
         )
 
     async def cmd_scova(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -312,6 +327,39 @@ class LegoHunterTelegramBot:
         return f"€{amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
     @staticmethod
+    def _extract_listing_url(row: dict[str, Any]) -> Optional[str]:
+        direct_url = str(row.get("listing_url") or "").strip()
+        if direct_url.startswith("http://") or direct_url.startswith("https://"):
+            return direct_url
+
+        metadata = row.get("metadata")
+        if isinstance(metadata, dict):
+            meta_url = str(metadata.get("listing_url") or "").strip()
+            if meta_url.startswith("http://") or meta_url.startswith("https://"):
+                return meta_url
+
+        return None
+
+    @staticmethod
+    def _format_pick_link(row: dict[str, Any]) -> str:
+        set_id = str(row.get("set_id") or "").strip()
+        listing_url = LegoHunterTelegramBot._extract_listing_url(row)
+
+        if listing_url:
+            safe_url = html.escape(listing_url, quote=True)
+            lower_url = listing_url.lower()
+            if "lego.com" in lower_url:
+                return f'🔗 <a href="{safe_url}">Apri su LEGO</a>'
+            return f'🔗 <a href="{safe_url}">Apri sorgente</a>'
+
+        if set_id:
+            lego_search_url = f"https://www.lego.com/it-it/search?q={quote_plus(set_id)}"
+            safe_url = html.escape(lego_search_url, quote=True)
+            return f'🔎 <a href="{safe_url}">Cerca su LEGO</a>'
+
+        return "🔎 Link non disponibile"
+
+    @staticmethod
     def _format_discovery_report(report: dict[str, Any], *, top_limit: int = 3) -> list[str]:
         selected = list(report.get("selected") or [])[:top_limit]
         diagnostics = report.get("diagnostics") or {}
@@ -342,6 +390,7 @@ class LegoHunterTelegramBot:
                     f"AI {ai_score}/100 | Demand {demand_score}/100 | Prezzo {price} | EOL {eol}"
                 )
                 lines.append(f"Fonte: {source} | Segnale: {strength}")
+                lines.append(LegoHunterTelegramBot._format_pick_link(row))
                 if strength == "LOW_CONFIDENCE":
                     risk_note = str(row.get("risk_note") or "Conferma manuale consigliata.")
                     lines.append(f"Nota: {html.escape(risk_note)}")
@@ -435,6 +484,9 @@ async def run_scheduled_cycle(
     bot = Bot(token=token)
     LOGGER.info("Scheduled cycle started | chat_id_set=%s", bool(chat_id))
     try:
+        await bot.set_my_commands(LegoHunterTelegramBot.supported_commands())
+        LOGGER.info("Scheduled cycle commands synced with Telegram")
+
         report = await oracle.discover_with_diagnostics(
             persist=True,
             top_limit=12,

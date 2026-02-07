@@ -116,6 +116,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/scova", text)
         self.assertIn("/offerte", text)
         self.assertIn("/collezione", text)
+        self.assertIn("Alias compatibilita'", text)
+        self.assertIn("/hunt -> /scova", text)
+        self.assertIn("Esempi rapidi", text)
 
     async def test_cerca_returns_results(self) -> None:
         manager = LegoHunterTelegramBot(
@@ -176,6 +179,71 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Pipeline fonti", joined)
         self.assertIn("external_first", joined)
         self.assertIn("external_proxy", joined)
+
+    def test_format_discovery_report_adds_clickable_lego_link(self) -> None:
+        report = {
+            "selected": [
+                {
+                    "set_id": "10332",
+                    "set_name": "Piazza della citta medievale",
+                    "source": "lego_proxy_reader",
+                    "ai_investment_score": 82,
+                    "market_demand_score": 76,
+                    "current_price": 229.99,
+                    "eol_date_prediction": "2026-06-01",
+                    "signal_strength": "HIGH_CONFIDENCE",
+                    "metadata": {
+                        "listing_url": "https://www.lego.com/it-it/product/medieval-town-square-10332",
+                    },
+                }
+            ],
+            "diagnostics": {
+                "fallback_used": False,
+                "source_raw_counts": {},
+                "dedup_candidates": 1,
+                "threshold": 60,
+                "above_threshold_count": 1,
+                "max_ai_score": 82,
+                "source_strategy": "external_first",
+                "selected_source": "external_proxy",
+                "ai_runtime": {"engine": "openrouter", "model": "x/y:free", "mode": "api"},
+            },
+        }
+        lines = LegoHunterTelegramBot._format_discovery_report(report, top_limit=3)
+        joined = "\n".join(lines)
+        self.assertIn("Apri su LEGO", joined)
+        self.assertIn('href="https://www.lego.com/it-it/product/medieval-town-square-10332"', joined)
+
+    def test_format_discovery_report_adds_lego_search_link_when_listing_missing(self) -> None:
+        report = {
+            "selected": [
+                {
+                    "set_id": "75367",
+                    "set_name": "Venator",
+                    "source": "amazon_proxy_reader",
+                    "ai_investment_score": 70,
+                    "market_demand_score": 61,
+                    "current_price": 649.99,
+                    "eol_date_prediction": "2026-12-01",
+                    "signal_strength": "HIGH_CONFIDENCE",
+                }
+            ],
+            "diagnostics": {
+                "fallback_used": False,
+                "source_raw_counts": {},
+                "dedup_candidates": 1,
+                "threshold": 60,
+                "above_threshold_count": 1,
+                "max_ai_score": 70,
+                "source_strategy": "external_first",
+                "selected_source": "external_proxy",
+                "ai_runtime": {"engine": "openrouter", "model": "x/y:free", "mode": "api"},
+            },
+        }
+        lines = LegoHunterTelegramBot._format_discovery_report(report, top_limit=3)
+        joined = "\n".join(lines)
+        self.assertIn("Cerca su LEGO", joined)
+        self.assertIn('href="https://www.lego.com/it-it/search?q=75367"', joined)
 
 
 if __name__ == "__main__":
