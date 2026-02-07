@@ -1302,13 +1302,14 @@ class DiscoveryOracle:
         return data
 
     def _openrouter_generate(self, prompt: str) -> str:
-        if not self._openrouter_model_id:
-            return "{}"
+        model_id = str(self._openrouter_model_id or "").strip()
+        if not model_id:
+            raise RuntimeError("OpenRouter model not active")
 
         max_attempts = 2
         for attempt in range(1, max_attempts + 1):
             data = self._openrouter_chat_completion(
-                model_id=self._openrouter_model_id,
+                model_id=model_id,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=220,
                 temperature=0.2,
@@ -1320,7 +1321,7 @@ class DiscoveryOracle:
                     delay = 0.45 * attempt
                     LOGGER.warning(
                         "OpenRouter malformed response | model=%s attempt=%s/%s retry_in=%.2fs reason=%s",
-                        self._openrouter_model_id,
+                        model_id,
                         attempt,
                         max_attempts,
                         delay,
@@ -2012,6 +2013,9 @@ class DiscoveryOracle:
                 return set_id, cached, True, None
 
             async with semaphore:
+                runtime_mode = str(self.ai_runtime.get("mode") or "")
+                if runtime_mode in {"fallback_openrouter_malformed_payload", "fallback_after_openrouter_error"}:
+                    return set_id, self._heuristic_ai_fallback(candidate), False, None
                 try:
                     ai = await self._get_ai_insight(candidate)
                     return set_id, ai, False, None
