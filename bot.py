@@ -462,6 +462,12 @@ class LegoHunterTelegramBot:
         selected = list(report.get("selected") or [])[:top_limit]
         diagnostics = report.get("diagnostics") or {}
         ai_runtime = diagnostics.get("ai_runtime") or {}
+        bootstrap_enabled = bool(diagnostics.get("bootstrap_thresholds_enabled"))
+        bootstrap_min_history_points = int(diagnostics.get("bootstrap_min_history_points") or 0)
+        bootstrap_min_probability_pct = (
+            float(diagnostics.get("bootstrap_min_probability_high_confidence") or 0.0) * 100.0
+        )
+        bootstrap_min_confidence = int(diagnostics.get("bootstrap_min_confidence_score_high_confidence") or 0)
 
         lines: list[str] = []
         if diagnostics.get("fallback_used"):
@@ -513,6 +519,15 @@ class LegoHunterTelegramBot:
                     lines.append(f"Pattern: {html.escape(pattern_summary)}")
                 lines.append(f"Fonte: {source} | Segnale: {strength}")
                 lines.append(LegoHunterTelegramBot._format_pick_link(row))
+                if strength == "HIGH_CONFIDENCE" and bootstrap_enabled:
+                    data_points = int(row.get("forecast_data_points") or metadata.get("forecast_data_points") or 0)
+                    if bootstrap_min_history_points > 0 and 0 < data_points < bootstrap_min_history_points:
+                        lines.append(
+                            "Nota: HIGH_CONFIDENCE in bootstrap "
+                            f"(data points {data_points} < {bootstrap_min_history_points}; "
+                            f"soglie bootstrap Prob>={bootstrap_min_probability_pct:.0f}% "
+                            f"e Conf>={bootstrap_min_confidence})."
+                        )
                 if strength == "LOW_CONFIDENCE":
                     risk_note = str(row.get("risk_note") or "Conferma manuale consigliata.")
                     lines.append(f"Nota: {html.escape(risk_note)}")
@@ -552,6 +567,15 @@ class LegoHunterTelegramBot:
             f"Max Score: {int(diagnostics.get('max_composite_score', 0))} | "
             f"Max Prob12m: {float(diagnostics.get('max_probability_upside_12m', 0.0)):.1f}%"
         )
+        if bootstrap_enabled:
+            bootstrap_rows_count = int(diagnostics.get("bootstrap_rows_count") or 0)
+            bootstrap_status = "attivo" if bootstrap_rows_count > 0 else "abilitato (non attivo nel ciclo)"
+            lines.append(
+                f"🧪 Bootstrap soglie: {bootstrap_status} | "
+                f"Min Prob {bootstrap_min_probability_pct:.0f}% | "
+                f"Min Conf {bootstrap_min_confidence} | "
+                f"Set bootstrap: {bootstrap_rows_count}"
+            )
 
         threshold_profile = diagnostics.get("threshold_profile")
         if isinstance(threshold_profile, dict):
