@@ -114,6 +114,139 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(rows[0]["discount_vs_primary_pct"], 20.0, places=2)
         self.assertEqual(len(repo.snapshots), 1)
 
+    async def test_source_collection_prefers_external_proxy(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None)
+        external_rows = [
+            {
+                "set_id": "10332",
+                "set_name": "Piazza della citta medievale",
+                "theme": "Icons",
+                "source": "lego_proxy_reader",
+                "current_price": 229.99,
+                "eol_date_prediction": "2026-05-01",
+                "listing_url": "https://www.lego.com/it-it/product/medieval-town-square-10332",
+            }
+        ]
+
+        with patch.object(
+            oracle,
+            "_collect_external_proxy_candidates",
+            return_value=(
+                external_rows,
+                {
+                    "source_raw_counts": {"lego_proxy_reader": 1, "amazon_proxy_reader": 0},
+                    "errors": [],
+                    "signals": {"lego_proxy_status_ok": True},
+                },
+            ),
+        ), patch.object(
+            oracle,
+            "_collect_playwright_candidates",
+            new=AsyncMock(
+                return_value=(
+                    [],
+                    {
+                        "source_raw_counts": {"lego_retiring": 0, "amazon_bestsellers": 0},
+                        "errors": [],
+                        "signals": {},
+                    },
+                )
+            ),
+        ), patch.object(
+            oracle,
+            "_collect_http_fallback_candidates",
+            return_value=(
+                [],
+                {
+                    "source_raw_counts": {"lego_http_fallback": 0, "amazon_http_fallback": 0},
+                    "errors": [],
+                    "signals": {},
+                },
+            ),
+        ):
+            rows, diagnostics = await oracle._collect_source_candidates_with_diagnostics()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source"], "lego_proxy_reader")
+        self.assertEqual(diagnostics.get("selected_source"), "external_proxy")
+        self.assertEqual(diagnostics.get("source_strategy"), "external_first")
+        self.assertFalse(diagnostics.get("fallback_source_used"))
+
+    async def test_source_collection_falls_back_to_playwright(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None)
+        playwright_rows = [
+            {
+                "set_id": "75367",
+                "set_name": "Venator-Class Republic Attack Cruiser",
+                "theme": "Star Wars",
+                "source": "lego_retiring",
+                "current_price": 649.99,
+                "eol_date_prediction": "2026-12-01",
+                "listing_url": "https://www.lego.com/it-it/product/venator-class-republic-attack-cruiser-75367",
+            }
+        ]
+
+        with patch.object(
+            oracle,
+            "_collect_external_proxy_candidates",
+            return_value=(
+                [],
+                {
+                    "source_raw_counts": {"lego_proxy_reader": 0, "amazon_proxy_reader": 0},
+                    "errors": [],
+                    "signals": {"lego_proxy_blocked": True},
+                },
+            ),
+        ), patch.object(
+            oracle,
+            "_collect_playwright_candidates",
+            new=AsyncMock(
+                return_value=(
+                    playwright_rows,
+                    {
+                        "source_raw_counts": {"lego_retiring": 1, "amazon_bestsellers": 0},
+                        "errors": [],
+                        "signals": {},
+                    },
+                )
+            ),
+        ), patch.object(
+            oracle,
+            "_collect_http_fallback_candidates",
+            return_value=(
+                [],
+                {
+                    "source_raw_counts": {"lego_http_fallback": 0, "amazon_http_fallback": 0},
+                    "errors": [],
+                    "signals": {},
+                },
+            ),
+        ):
+            rows, diagnostics = await oracle._collect_source_candidates_with_diagnostics()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source"], "lego_retiring")
+        self.assertTrue(diagnostics.get("fallback_source_used"))
+        self.assertEqual(diagnostics.get("selected_source"), "playwright")
+
+    def test_parse_lego_proxy_markdown(self) -> None:
+        markdown = """
+### [Piazza della citta medievale](https://www.lego.com/it-it/product/medieval-town-square-10332)
+
+229,99€
+
+### [Castello di Hogwarts](https://www.lego.com/it-it/product/hogwarts-castle-dueling-club-76441)
+
+24,99€
+"""
+        rows = DiscoveryOracle._parse_lego_proxy_markdown(markdown, limit=10)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["set_id"], "10332")
+        self.assertEqual(rows[1]["set_id"], "76441")
+        self.assertEqual(rows[0]["current_price"], 229.99)
+
     def test_extract_json_from_wrapped_text(self) -> None:
         raw = "Risposta:\n{\"score\": 77, \"summary\": \"ok\"}\nfine"
         payload = DiscoveryOracle._extract_json(raw)

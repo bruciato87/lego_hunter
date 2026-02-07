@@ -28,6 +28,10 @@ LOGGER = logging.getLogger(__name__)
 JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
+MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
+
+DISCOVERY_SOURCE_MODES = {"external_first", "playwright_first", "external_only"}
+DEFAULT_DISCOVERY_SOURCE_MODE = "external_first"
 
 
 @dataclass
@@ -52,6 +56,15 @@ class DiscoveryOracle:
         self.min_ai_score = min_ai_score
         self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
         self.gemini_model = gemini_model
+        requested_mode = (os.getenv("DISCOVERY_SOURCE_MODE") or DEFAULT_DISCOVERY_SOURCE_MODE).strip().lower()
+        if requested_mode not in DISCOVERY_SOURCE_MODES:
+            LOGGER.warning(
+                "Invalid DISCOVERY_SOURCE_MODE='%s'. Falling back to '%s'.",
+                requested_mode,
+                DEFAULT_DISCOVERY_SOURCE_MODE,
+            )
+            requested_mode = DEFAULT_DISCOVERY_SOURCE_MODE
+        self.discovery_source_mode = requested_mode
 
         self._model = None
         self.ai_runtime = {
@@ -60,9 +73,18 @@ class DiscoveryOracle:
             "mode": "fallback",
         }
         self._last_source_diagnostics: Dict[str, Any] = {
-            "source_raw_counts": {"lego_retiring": 0, "amazon_bestsellers": 0},
+            "source_strategy": self.discovery_source_mode,
+            "source_raw_counts": {
+                "lego_proxy_reader": 0,
+                "amazon_proxy_reader": 0,
+                "lego_retiring": 0,
+                "amazon_bestsellers": 0,
+                "lego_http_fallback": 0,
+                "amazon_http_fallback": 0,
+            },
             "source_dedup_counts": {},
             "source_failures": [],
+            "source_signals": {},
             "dedup_candidates": 0,
             "anti_bot_alert": False,
             "anti_bot_message": None,
@@ -92,6 +114,7 @@ class DiscoveryOracle:
                     "model": "heuristic-v1",
                     "mode": "fallback_missing_package",
                 }
+        LOGGER.info("Discovery source mode configured: %s", self.discovery_source_mode)
 
     async def discover_opportunities(
         self,
@@ -163,9 +186,11 @@ class DiscoveryOracle:
 
         diagnostics = {
             "threshold": self.min_ai_score,
+            "source_strategy": source_diagnostics.get("source_strategy"),
             "source_raw_counts": source_diagnostics["source_raw_counts"],
             "source_dedup_counts": source_diagnostics["source_dedup_counts"],
             "source_failures": source_diagnostics["source_failures"],
+            "source_signals": source_diagnostics.get("source_signals", {}),
             "dedup_candidates": source_diagnostics["dedup_candidates"],
             "ranked_candidates": len(ranked),
             "above_threshold_count": len(above_threshold),
@@ -344,101 +369,109 @@ class DiscoveryOracle:
         return candidates
 
     async def _collect_source_candidates_with_diagnostics(self) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
-        async with LegoRetiringScraper() as lego_scraper, AmazonBestsellerScraper() as amazon_scraper:
-            lego_task = lego_scraper.fetch_retiring_sets(limit=50)
-            amazon_task = amazon_scraper.fetch_bestsellers(limit=50)
-            lego_data, amazon_data = await asyncio.gather(lego_task, amazon_task, return_exceptions=True)
+        if self.discovery_source_mode == "playwright_first":
+            source_order = ("playwright", "external_proxy", "http_fallback")
+        elif self.discovery_source_mode == "external_only":
+            source_order = ("external_proxy",)
+        else:
+            source_order = ("external_proxy", "playwright", "http_fallback")
 
-        candidates: list[Dict[str, Any]] = []
-        source_raw_counts: Dict[str, int] = {"lego_retiring": 0, "amazon_bestsellers": 0}
+        source_raw_counts: Dict[str, int] = {
+            "lego_proxy_reader": 0,
+            "amazon_proxy_reader": 0,
+            "lego_retiring": 0,
+            "amazon_bestsellers": 0,
+            "lego_http_fallback": 0,
+            "amazon_http_fallback": 0,
+        }
         source_failures: list[str] = []
-
-        if isinstance(lego_data, Exception):
-            LOGGER.warning("Lego source failed: %s", lego_data)
-            source_failures.append(f"lego_retiring: {lego_data}")
-        else:
-            source_raw_counts["lego_retiring"] = len(lego_data)
-            candidates.extend(lego_data)
-
-        if isinstance(amazon_data, Exception):
-            LOGGER.warning("Amazon source failed: %s", amazon_data)
-            source_failures.append(f"amazon_bestsellers: {amazon_data}")
-        else:
-            source_raw_counts["amazon_bestsellers"] = len(amazon_data)
-            candidates.extend(amazon_data)
-
-        dedup: Dict[str, Dict[str, Any]] = {}
-        for row in candidates:
-            set_id = str(row.get("set_id") or "").strip()
-            if not set_id:
-                continue
-
-            current = dedup.get(set_id)
-            if current is None:
-                dedup[set_id] = row
-                continue
-
-            # Prefer official LEGO source when both exist.
-            if current.get("source") != "lego_retiring" and row.get("source") == "lego_retiring":
-                dedup[set_id] = row
-
-        dedup_values = list(dedup.values())
-        fallback_source_used = False
+        source_signals: Dict[str, Any] = {}
         fallback_notes: list[str] = []
-        root_cause_hint = "primary_scrapers_ok"
-        fallback_meta: Dict[str, Any] = {}
+        fallback_source_used = False
+        selected_source = None
+        dedup_values: list[Dict[str, Any]] = []
+        root_cause_hint = "no_candidates"
+
+        for idx, source_name in enumerate(source_order):
+            if source_name == "external_proxy":
+                candidates, meta = await asyncio.to_thread(self._collect_external_proxy_candidates)
+            elif source_name == "playwright":
+                candidates, meta = await self._collect_playwright_candidates()
+            else:
+                candidates, meta = await asyncio.to_thread(self._collect_http_fallback_candidates)
+
+            self._merge_source_meta(
+                source_name=source_name,
+                source_raw_counts=source_raw_counts,
+                source_failures=source_failures,
+                source_signals=source_signals,
+                meta=meta,
+            )
+            LOGGER.info(
+                "Discovery source '%s' completed | raw=%s errors=%s signals=%s candidates=%s",
+                source_name,
+                meta.get("source_raw_counts"),
+                meta.get("errors"),
+                meta.get("signals"),
+                len(candidates),
+            )
+
+            if not candidates:
+                fallback_notes.append(f"{source_name} returned 0 candidates")
+                continue
+
+            dedup_values = self._dedup_candidates(candidates)
+            if dedup_values:
+                selected_source = source_name
+                root_cause_hint = f"{source_name}_success"
+                if idx > 0:
+                    fallback_source_used = True
+                    fallback_notes.append(
+                        f"{source_name} activated after '{source_order[0]}' returned 0 candidates"
+                    )
+                break
+
+            fallback_notes.append(f"{source_name} produced candidates but none were usable after dedup")
 
         if not dedup_values:
-            fallback_source_used = True
-            LOGGER.warning("Primary scrapers produced 0 dedup candidates; trying HTTP fallback")
-            fallback_candidates, fallback_meta = await asyncio.to_thread(self._collect_http_fallback_candidates)
-            LOGGER.info(
-                "HTTP fallback result | counts=%s errors=%s signals=%s candidates=%s",
-                fallback_meta.get("source_raw_counts"),
-                fallback_meta.get("errors"),
-                fallback_meta.get("signals"),
-                len(fallback_candidates),
-            )
-            if fallback_candidates:
-                LOGGER.warning(
-                    "Primary scrapers returned 0 candidates; activating HTTP fallback source with %s candidates",
-                    len(fallback_candidates),
-                )
-                dedup_values = fallback_candidates
-                root_cause_hint = "playwright_extraction_issue_or_dynamic_dom_shift"
-                for key, value in (fallback_meta.get("source_raw_counts") or {}).items():
-                    source_raw_counts[key] = value
-                for err in fallback_meta.get("errors") or []:
-                    source_failures.append(f"http_fallback: {err}")
+            block_flags = [
+                key
+                for key, value in source_signals.items()
+                if value and self._is_blocking_signal_key(key)
+            ]
+            if block_flags:
+                root_cause_hint = "anti_bot_or_robot_challenge_detected"
+            elif source_failures:
+                root_cause_hint = "source_errors_or_timeouts"
             else:
-                fallback_notes.append("HTTP fallback returned 0 candidates")
-                signals = fallback_meta.get("signals") or {}
-                if signals.get("lego_robot_markers") or signals.get("amazon_robot_markers"):
-                    root_cause_hint = "anti_bot_or_robot_challenge_detected"
-                else:
-                    root_cause_hint = "dom_shift_or_empty_upstream_payload"
-                for err in fallback_meta.get("errors") or []:
-                    source_failures.append(f"http_fallback: {err}")
+                root_cause_hint = "dom_shift_or_empty_upstream_payload"
+
         source_dedup_counts: Dict[str, int] = {}
         for row in dedup_values:
             source = str(row.get("source") or "unknown")
             source_dedup_counts[source] = source_dedup_counts.get(source, 0) + 1
 
-        anti_bot_alert = (
-            source_raw_counts["lego_retiring"] == 0
-            and source_raw_counts["amazon_bestsellers"] == 0
-            and not source_failures
+        anti_bot_alert = bool(
+            not dedup_values
+            and any(
+                value and self._is_blocking_signal_key(key)
+                for key, value in source_signals.items()
+            )
         )
         anti_bot_message = (
-            "Entrambe le fonti discovery hanno restituito 0 risultati: possibile anti-bot o cambio DOM."
+            "Discovery bloccata da anti-bot/challenge: fonti cloud primarie senza risultati utili."
             if anti_bot_alert
             else None
         )
 
         diagnostics = {
+            "source_strategy": self.discovery_source_mode,
+            "source_order": list(source_order),
+            "selected_source": selected_source,
             "source_raw_counts": source_raw_counts,
             "source_dedup_counts": source_dedup_counts,
             "source_failures": source_failures,
+            "source_signals": source_signals,
             "dedup_candidates": len(dedup_values),
             "anti_bot_alert": anti_bot_alert,
             "anti_bot_message": anti_bot_message,
@@ -447,13 +480,172 @@ class DiscoveryOracle:
             "root_cause_hint": root_cause_hint,
         }
         LOGGER.info(
-            "Source collection completed | raw=%s dedup_counts=%s dedup_total=%s failures=%s",
+            "Source collection completed | strategy=%s selected=%s raw=%s dedup_counts=%s dedup_total=%s failures=%s root=%s",
+            self.discovery_source_mode,
+            selected_source,
             source_raw_counts,
             source_dedup_counts,
             len(dedup_values),
             source_failures,
+            root_cause_hint,
         )
         return dedup_values, diagnostics
+
+    async def _collect_playwright_candidates(self) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
+        source_raw_counts: Dict[str, int] = {"lego_retiring": 0, "amazon_bestsellers": 0}
+        errors: list[str] = []
+        candidates: list[Dict[str, Any]] = []
+
+        try:
+            async with LegoRetiringScraper() as lego_scraper, AmazonBestsellerScraper() as amazon_scraper:
+                lego_task = lego_scraper.fetch_retiring_sets(limit=50)
+                amazon_task = amazon_scraper.fetch_bestsellers(limit=50)
+                lego_data, amazon_data = await asyncio.gather(lego_task, amazon_task, return_exceptions=True)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"playwright_bootstrap_failed: {exc}")
+            return [], {
+                "source_raw_counts": source_raw_counts,
+                "errors": errors,
+                "signals": {},
+            }
+
+        if isinstance(lego_data, Exception):
+            LOGGER.warning("Lego source failed: %s", lego_data)
+            errors.append(f"lego_retiring: {lego_data}")
+        else:
+            source_raw_counts["lego_retiring"] = len(lego_data)
+            candidates.extend(lego_data)
+
+        if isinstance(amazon_data, Exception):
+            LOGGER.warning("Amazon source failed: %s", amazon_data)
+            errors.append(f"amazon_bestsellers: {amazon_data}")
+        else:
+            source_raw_counts["amazon_bestsellers"] = len(amazon_data)
+            candidates.extend(amazon_data)
+
+        return candidates, {
+            "source_raw_counts": source_raw_counts,
+            "errors": errors,
+            "signals": {},
+        }
+
+    def _collect_external_proxy_candidates(self) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
+        if requests is None:
+            return [], {
+                "source_raw_counts": {},
+                "errors": ["requests package unavailable"],
+                "signals": {},
+            }
+
+        raw_counts: Dict[str, int] = {}
+        errors: list[str] = []
+        signals: Dict[str, Any] = {}
+        candidates: list[Dict[str, Any]] = []
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+        }
+
+        try:
+            lego_reader_url = "https://r.jina.ai/http://https://www.lego.com/it-it/categories/retiring-soon"
+            lego_response = requests.get(lego_reader_url, headers=headers, timeout=40)
+            lego_md = lego_response.text
+            lego_lower = lego_md.lower()
+            signals["lego_proxy_status_ok"] = lego_response.ok
+            signals["lego_proxy_blocked"] = any(
+                marker in lego_lower
+                for marker in ("captcha", "cloudflare", "access denied", "robot check", "are you human")
+            )
+            signals["lego_proxy_product_link_count"] = len(re.findall(r"/product/", lego_md, re.IGNORECASE))
+            lego_rows = self._parse_lego_proxy_markdown(lego_md, limit=60)
+            raw_counts["lego_proxy_reader"] = len(lego_rows)
+            candidates.extend(lego_rows)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"lego_proxy_failed: {exc}")
+
+        try:
+            amazon_reader_url = "https://r.jina.ai/http://https://www.amazon.it/gp/bestsellers/toys/635019031"
+            amazon_response = requests.get(amazon_reader_url, headers=headers, timeout=40)
+            amazon_md = amazon_response.text
+            amazon_lower = amazon_md.lower()
+            signals["amazon_proxy_status_ok"] = amazon_response.ok
+            signals["amazon_proxy_blocked"] = any(
+                marker in amazon_lower
+                for marker in ("captcha", "robot check", "access denied", "are you a robot")
+            )
+            signals["amazon_proxy_cookie_wall"] = "cookies and advertising choices" in amazon_lower
+            signals["amazon_proxy_dp_link_count"] = len(
+                re.findall(r"/(?:dp|gp/product)/", amazon_md, re.IGNORECASE)
+            )
+            amazon_rows = self._parse_amazon_proxy_markdown(amazon_md, limit=60)
+            raw_counts["amazon_proxy_reader"] = len(amazon_rows)
+            candidates.extend(amazon_rows)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"amazon_proxy_failed: {exc}")
+
+        return self._dedup_candidates(candidates), {
+            "source_raw_counts": raw_counts,
+            "errors": errors,
+            "signals": signals,
+        }
+
+    @staticmethod
+    def _merge_source_meta(
+        *,
+        source_name: str,
+        source_raw_counts: Dict[str, int],
+        source_failures: list[str],
+        source_signals: Dict[str, Any],
+        meta: Dict[str, Any],
+    ) -> None:
+        for key, value in (meta.get("source_raw_counts") or {}).items():
+            source_raw_counts[key] = int(value or 0)
+        for err in meta.get("errors") or []:
+            source_failures.append(f"{source_name}: {err}")
+        for key, value in (meta.get("signals") or {}).items():
+            source_signals[key] = value
+
+    @classmethod
+    def _dedup_candidates(cls, candidates: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        dedup: Dict[str, Dict[str, Any]] = {}
+        for row in candidates:
+            set_id = str(row.get("set_id") or "").strip()
+            if not set_id:
+                continue
+            current = dedup.get(set_id)
+            if current is None:
+                dedup[set_id] = row
+                continue
+
+            current_rank = cls._source_priority(current.get("source"))
+            incoming_rank = cls._source_priority(row.get("source"))
+            if incoming_rank > current_rank:
+                dedup[set_id] = row
+                continue
+            if incoming_rank == current_rank and current.get("current_price") is None and row.get("current_price") is not None:
+                dedup[set_id] = row
+
+        return list(dedup.values())
+
+    @staticmethod
+    def _source_priority(source: Any) -> int:
+        order = {
+            "lego_proxy_reader": 120,
+            "lego_retiring": 110,
+            "lego_http_fallback": 90,
+            "amazon_proxy_reader": 80,
+            "amazon_bestsellers": 70,
+            "amazon_http_fallback": 60,
+        }
+        return order.get(str(source or "unknown"), 10)
+
+    @staticmethod
+    def _is_blocking_signal_key(signal_key: str) -> bool:
+        lowered = (signal_key or "").lower()
+        return any(token in lowered for token in ("robot", "captcha", "blocked", "cookie_wall"))
 
     def _collect_http_fallback_candidates(self) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
         if requests is None:
@@ -595,6 +787,82 @@ class DiscoveryOracle:
                 break
         return rows
 
+    @classmethod
+    def _parse_lego_proxy_markdown(cls, markdown_text: str, *, limit: int) -> list[Dict[str, Any]]:
+        rows: list[Dict[str, Any]] = []
+        headline_pattern = re.compile(
+            r"###\s+\[(?P<name>[^\]]+)\]\((?P<url>https?://www\.lego\.com[^\)]*/product/[^\)]*)\)",
+            re.IGNORECASE,
+        )
+        matches = list(headline_pattern.finditer(markdown_text))
+        for idx, match in enumerate(matches):
+            name = cls._cleanup_html_text(match.group("name"))
+            url = match.group("url")
+            set_id = cls._extract_set_id(url, name)
+            if not set_id:
+                continue
+
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else min(len(markdown_text), match.end() + 500)
+            snippet = markdown_text[match.end() : end]
+            price = cls._extract_price_from_text(snippet)
+            rows.append(
+                {
+                    "set_id": set_id,
+                    "set_name": name,
+                    "theme": cls._guess_theme_from_name(name),
+                    "source": "lego_proxy_reader",
+                    "current_price": price,
+                    "eol_date_prediction": (date.today() + timedelta(days=75)).isoformat(),
+                    "listing_url": url,
+                    "metadata": {"proxy_reader": True},
+                }
+            )
+            if len(rows) >= limit:
+                break
+        return rows
+
+    @classmethod
+    def _parse_amazon_proxy_markdown(cls, markdown_text: str, *, limit: int) -> list[Dict[str, Any]]:
+        rows: list[Dict[str, Any]] = []
+        matches = list(MARKDOWN_LINK_RE.finditer(markdown_text))
+        seen_urls: set[str] = set()
+
+        for idx, match in enumerate(matches):
+            name = cls._cleanup_html_text(match.group(1))
+            url = match.group(2)
+            lowered_url = url.lower()
+            if "amazon.it" not in lowered_url:
+                continue
+            if "/dp/" not in lowered_url and "/gp/product/" not in lowered_url:
+                continue
+            if "lego" not in name.lower():
+                continue
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            set_id = cls._extract_set_id(name, url)
+            if not set_id:
+                continue
+
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else min(len(markdown_text), match.end() + 300)
+            snippet = markdown_text[match.start() : end]
+            rows.append(
+                {
+                    "set_id": set_id,
+                    "set_name": name,
+                    "theme": cls._guess_theme_from_name(name),
+                    "source": "amazon_proxy_reader",
+                    "current_price": cls._extract_price_from_text(snippet),
+                    "eol_date_prediction": None,
+                    "listing_url": url,
+                    "metadata": {"proxy_reader": True},
+                }
+            )
+            if len(rows) >= limit:
+                break
+        return rows
+
     @staticmethod
     def _cleanup_html_text(raw: str) -> str:
         text = TAG_RE.sub(" ", raw or "")
@@ -703,7 +971,7 @@ class DiscoveryOracle:
         price = float(candidate.get("current_price") or 0.0)
 
         base = 55
-        if source == "lego_retiring":
+        if source in {"lego_retiring", "lego_proxy_reader", "lego_http_fallback"}:
             base += 18
         if any(key in name.lower() for key in ("star wars", "icons", "technic", "modular")):
             base += 12
@@ -732,7 +1000,8 @@ class DiscoveryOracle:
             recent = []
 
         liquidity_factor = min(35, len(recent) * 3)
-        source_bonus = 20 if candidate.get("source") == "lego_retiring" else 8
+        source = str(candidate.get("source") or "")
+        source_bonus = 20 if source in {"lego_retiring", "lego_proxy_reader", "lego_http_fallback"} else 8
         final_score = int((ai_score * 0.65) + liquidity_factor + source_bonus)
         return max(1, min(100, final_score))
 

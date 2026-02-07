@@ -350,15 +350,26 @@ class LegoHunterTelegramBot:
             lines.append("🟠 Nessun candidato utile in questo ciclo.")
 
         source_raw = diagnostics.get("source_raw_counts") or {}
+        source_strategy = str(diagnostics.get("source_strategy") or "n/d")
+        selected_source = str(diagnostics.get("selected_source") or "none")
         lines.append("<b>Diagnostica Discovery</b>")
         ai_engine = str(ai_runtime.get("engine") or "unknown")
         ai_model = str(ai_runtime.get("model") or "unknown")
         ai_mode = str(ai_runtime.get("mode") or "unknown")
         lines.append(f"🤖 IA: {html.escape(ai_engine)} | modello: <code>{html.escape(ai_model)}</code> | mode: {html.escape(ai_mode)}")
         lines.append(
-            "Lego Retiring: "
-            f"{int(source_raw.get('lego_retiring', 0))} | "
-            f"Amazon: {int(source_raw.get('amazon_bestsellers', 0))} | "
+            f"🧭 Pipeline fonti: <code>{html.escape(source_strategy)}</code> | attiva: <code>{html.escape(selected_source)}</code>"
+        )
+        lines.append(
+            "Proxy LEGO/Amazon: "
+            f"{int(source_raw.get('lego_proxy_reader', 0))}/"
+            f"{int(source_raw.get('amazon_proxy_reader', 0))} | "
+            "Playwright LEGO/Amazon: "
+            f"{int(source_raw.get('lego_retiring', 0))}/"
+            f"{int(source_raw.get('amazon_bestsellers', 0))} | "
+            "HTTP fallback LEGO/Amazon: "
+            f"{int(source_raw.get('lego_http_fallback', 0))}/"
+            f"{int(source_raw.get('amazon_http_fallback', 0))} | "
             f"Dedup: {int(diagnostics.get('dedup_candidates', 0))}"
         )
         lines.append(
@@ -431,7 +442,9 @@ async def run_scheduled_cycle(
         )
         diagnostics = report.get("diagnostics") or {}
         LOGGER.info(
-            "Scheduled discovery diagnostics | raw=%s dedup=%s ranked=%s above_threshold=%s score_fallback=%s source_fallback=%s anti_bot=%s ai=%s",
+            "Scheduled discovery diagnostics | strategy=%s selected_source=%s raw=%s dedup=%s ranked=%s above_threshold=%s score_fallback=%s source_fallback=%s anti_bot=%s ai=%s",
+            diagnostics.get("source_strategy"),
+            diagnostics.get("selected_source"),
             diagnostics.get("source_raw_counts"),
             diagnostics.get("dedup_candidates"),
             diagnostics.get("ranked_candidates"),

@@ -149,6 +149,34 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(update.message.replies)
         self.assertIn("sospesi", update.message.replies[-1].lower())
 
+    def test_format_discovery_report_shows_source_pipeline(self) -> None:
+        report = {
+            "selected": [],
+            "diagnostics": {
+                "fallback_used": True,
+                "source_raw_counts": {
+                    "lego_proxy_reader": 3,
+                    "amazon_proxy_reader": 0,
+                    "lego_retiring": 0,
+                    "amazon_bestsellers": 0,
+                    "lego_http_fallback": 0,
+                    "amazon_http_fallback": 0,
+                },
+                "dedup_candidates": 3,
+                "threshold": 60,
+                "above_threshold_count": 0,
+                "max_ai_score": 58,
+                "source_strategy": "external_first",
+                "selected_source": "external_proxy",
+                "ai_runtime": {"engine": "gemini", "model": "gemini-1.5-flash", "mode": "api"},
+            },
+        }
+        lines = LegoHunterTelegramBot._format_discovery_report(report, top_limit=3)
+        joined = "\n".join(lines)
+        self.assertIn("Pipeline fonti", joined)
+        self.assertIn("external_first", joined)
+        self.assertIn("external_proxy", joined)
+
 
 if __name__ == "__main__":
     unittest.main()

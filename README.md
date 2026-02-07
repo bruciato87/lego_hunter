@@ -3,7 +3,9 @@
 Bot Telegram autonomo per discovery e monitoraggio opportunita LEGO con data moat su Supabase.
 
 ## Funzioni principali
-- Discovery ogni 6 ore (Lego Retiring Soon + Amazon Bestsellers)
+- Discovery ogni ora (pipeline cloud-first)
+- Sorgente primaria discovery: reader esterno cloud (`external_first`)
+- Fallback automatici: Playwright, poi HTTP parser
 - Ranking AI con Gemini (fallback euristico se API non disponibile)
 - Validazione secondario (Vinted/Subito)
 - Guardia fiscale DAC7 (blocco segnali vendita vicino soglia)
@@ -33,6 +35,7 @@ python bot.py --mode scheduled
 - `TELEGRAM_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `GEMINI_API_KEY`
+- `DISCOVERY_SOURCE_MODE` (opzionale, default `external_first`; valori: `external_first`, `playwright_first`, `external_only`)
 
 ## Database
 Eseguire lo script SQL:
