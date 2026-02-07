@@ -13,7 +13,7 @@ from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 try:
     import google.generativeai as genai
@@ -2976,7 +2976,10 @@ class DiscoveryOracle:
             errors.append(f"lego_proxy_failed: {exc}")
 
         try:
-            amazon_reader_url = "https://r.jina.ai/http://https://www.amazon.it/gp/bestsellers/toys/635019031"
+            amazon_reader_url = (
+                "https://r.jina.ai/http://https://www.amazon.it/"
+                "s?i=toys&k=lego+set&rh=p_89%3ALEGO"
+            )
             amazon_response = requests.get(amazon_reader_url, headers=headers, timeout=40)
             amazon_md = amazon_response.text
             amazon_lower = amazon_md.lower()
@@ -2989,6 +2992,7 @@ class DiscoveryOracle:
             signals["amazon_proxy_dp_link_count"] = len(
                 re.findall(r"/(?:dp|gp/product)/", amazon_md, re.IGNORECASE)
             )
+            signals["amazon_proxy_lego_keyword_count"] = len(re.findall(r"\blego\b", amazon_md, re.IGNORECASE))
             amazon_rows = self._parse_amazon_proxy_markdown(amazon_md, limit=60)
             raw_counts["amazon_proxy_reader"] = len(amazon_rows)
             candidates.extend(amazon_rows)
@@ -3247,45 +3251,151 @@ class DiscoveryOracle:
 
     @classmethod
     def _parse_amazon_proxy_markdown(cls, markdown_text: str, *, limit: int) -> list[Dict[str, Any]]:
-        rows: list[Dict[str, Any]] = []
-        matches = list(MARKDOWN_LINK_RE.finditer(markdown_text))
-        seen_urls: set[str] = set()
+        rows_by_set_id: Dict[str, Dict[str, Any]] = {}
+        dp_link_re = re.compile(
+            r"\((https?://www\.amazon\.[^\s)]+/(?:dp|gp/product)/[^\s)]+)\)",
+            re.IGNORECASE,
+        )
+        matches = list(dp_link_re.finditer(markdown_text))
 
         for idx, match in enumerate(matches):
-            name = cls._cleanup_html_text(match.group(1))
-            url = match.group(2)
+            url = match.group(1)
+            canonical_url = cls._canonical_amazon_product_url(url)
             lowered_url = url.lower()
-            if "amazon.it" not in lowered_url:
+            if "amazon." not in lowered_url:
                 continue
             if "/dp/" not in lowered_url and "/gp/product/" not in lowered_url:
                 continue
-            if "lego" not in name.lower():
-                continue
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
 
-            set_id = cls._extract_set_id(name, url)
+            context_start = max(0, match.start() - 1800)
+            context_end = matches[idx + 1].start() if idx + 1 < len(matches) else min(
+                len(markdown_text), match.end() + 500
+            )
+            snippet = markdown_text[context_start:context_end]
+            price_window_start = max(0, match.start() - 80)
+            price_window_end = min(len(markdown_text), match.end() + 700)
+            price_snippet = markdown_text[price_window_start:price_window_end]
+            name = cls._extract_amazon_proxy_name(snippet, url)
+            is_lego = any(
+                "lego" in (text or "").lower()
+                for text in (name, snippet, url)
+            )
+            if not is_lego:
+                continue
+
+            set_id = cls._extract_amazon_proxy_set_id(name, snippet)
             if not set_id:
                 continue
 
-            end = matches[idx + 1].start() if idx + 1 < len(matches) else min(len(markdown_text), match.end() + 300)
-            snippet = markdown_text[match.start() : end]
-            rows.append(
-                {
-                    "set_id": set_id,
-                    "set_name": name,
-                    "theme": cls._guess_theme_from_name(name),
-                    "source": "amazon_proxy_reader",
-                    "current_price": cls._extract_price_from_text(snippet),
-                    "eol_date_prediction": None,
-                    "listing_url": url,
-                    "metadata": {"proxy_reader": True},
-                }
-            )
-            if len(rows) >= limit:
+            current_price = cls._extract_price_from_text(price_snippet)
+            row = {
+                "set_id": set_id,
+                "set_name": name,
+                "theme": cls._guess_theme_from_name(name),
+                "source": "amazon_proxy_reader",
+                "current_price": current_price,
+                "eol_date_prediction": None,
+                "listing_url": canonical_url,
+                "metadata": {"proxy_reader": True},
+            }
+            existing = rows_by_set_id.get(set_id)
+            if existing is None:
+                rows_by_set_id[set_id] = row
+            else:
+                existing_price = existing.get("current_price")
+                if existing_price is None and current_price is not None:
+                    rows_by_set_id[set_id] = row
+                elif (
+                    current_price is not None
+                    and isinstance(existing_price, (int, float))
+                    and current_price < float(existing_price)
+                ):
+                    rows_by_set_id[set_id] = row
+
+            if len(rows_by_set_id) >= limit:
                 break
-        return rows
+        return list(rows_by_set_id.values())
+
+    @staticmethod
+    def _extract_amazon_proxy_set_id(name: str, snippet: str) -> Optional[str]:
+        title_match = re.search(r"\b(\d{4,5})\b", name or "")
+        if title_match:
+            return title_match.group(1)
+
+        for pattern in (
+            r"-\s*(\d{4,5})\s*-{2,}",
+            r"\b(?:set|model|kit)\s*(\d{4,5})\b",
+        ):
+            match = re.search(pattern, snippet or "", re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
+
+    @staticmethod
+    def _canonical_amazon_product_url(url: str) -> str:
+        parsed = urlparse(url)
+        asin_match = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})", parsed.path, re.IGNORECASE)
+        if asin_match:
+            return f"{parsed.scheme}://{parsed.netloc}/dp/{asin_match.group(1)}"
+        return url.split("?", 1)[0]
+
+    @classmethod
+    def _extract_amazon_proxy_name(cls, snippet: str, url: str) -> str:
+        candidate_re = re.compile(r"\[([^\]\n]{8,360})\]")
+        candidates: list[tuple[int, str]] = []
+
+        for raw in candidate_re.findall(snippet):
+            candidate = cls._cleanup_html_text(raw)
+            if not candidate:
+                continue
+            if not re.search(r"[A-Za-z]", candidate):
+                continue
+            if cls._is_noise_amazon_candidate(candidate):
+                continue
+
+            lowered = candidate.lower()
+            score = 0
+            if "lego" in lowered:
+                score += 4
+            if re.search(r"\b\d{4,6}\b", candidate):
+                score += 3
+            if len(candidate) >= 24:
+                score += 1
+            candidates.append((score, candidate))
+
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+            return candidates[0][1]
+
+        parsed = urlparse(url)
+        parts = [part for part in parsed.path.split("/") if part]
+        slug = ""
+        for idx, part in enumerate(parts):
+            lowered = part.lower()
+            if lowered in {"dp", "gp"} and idx > 0:
+                slug = parts[idx - 1]
+                if slug.lower() in {"en", "it", "-", "product"} and idx > 1:
+                    slug = parts[idx - 2]
+                break
+        fallback = cls._cleanup_html_text(slug.replace("-", " "))
+        return fallback or "LEGO product"
+
+    @staticmethod
+    def _is_noise_amazon_candidate(text: str) -> bool:
+        lowered = (text or "").strip().lower()
+        if len(lowered) < 8:
+            return True
+        if lowered.startswith(("![image ", "image ", "price, product page", "see options", "learn about these results")):
+            return True
+        if lowered.startswith(("cookies and advertising choices", "add to basket", "best seller")):
+            return True
+        if any(token in lowered for token in ("rrp:", "new offers", "used & new offers", "delivery ", "bought in past month")):
+            return True
+        if "out of 5 stars" in lowered:
+            return True
+        if re.fullmatch(r"[\d\s.,%+()kKmM]+", lowered):
+            return True
+        return False
 
     @staticmethod
     def _cleanup_html_text(raw: str) -> str:

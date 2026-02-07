@@ -567,6 +567,22 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["current_price"], 229.99)
         self.assertNotEqual(rows[0]["eol_date_prediction"], rows[1]["eol_date_prediction"])
 
+    def test_parse_amazon_proxy_markdown_from_context_links(self) -> None:
+        markdown = """
+[![Image 4: LEGO Super Mario Game Boy Building Set for Adults - 72046](https://m.media-amazon.com/images/I/81rGqE218zL._AC_UL320_.jpg)](https://www.amazon.it/-/en/LEGO-Super-Mario-Building-Adults/dp/B0DWDGVHM6/ref=sr_1_1)
+
+LEGO
+----
+[Super Mario Game Boy Building Set for Adults - Nintendo Display Model - 72046 -----------------------------------------------------------------------]
+4.6[_4.6 out of 5 stars_](javascript:void(0))[(2.1K)](https://www.amazon.it/-/en/LEGO-Super-Mario-Building-Adults/dp/B0DWDGVHM6/ref=sr_1_1?dib=abc)
+Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mario-Building-Adults/dp/B0DWDGVHM6/ref=sr_1_1_so_TOY_BUILDING_BLOCK)
+"""
+        rows = DiscoveryOracle._parse_amazon_proxy_markdown(markdown, limit=10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["set_id"], "72046")
+        self.assertEqual(rows[0]["listing_url"], "https://www.amazon.it/dp/B0DWDGVHM6")
+        self.assertAlmostEqual(rows[0]["current_price"], 47.51, places=2)
+
     def test_estimate_market_demand_is_not_flat_or_always_100(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
