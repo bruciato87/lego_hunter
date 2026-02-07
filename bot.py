@@ -483,7 +483,7 @@ class LegoHunterTelegramBot:
                 )
                 target_line = f"Target {int(months_to_target)} mesi" if months_to_target is not None else "Target n/d"
                 lines.append(
-                    f"Prob Upside 12m {prob_12m:.1f}% | ROI atteso 12m {roi_12m:+.1f}% | {target_line} | Conf {confidence_score}/100"
+                    f"Prob Upside 12m {prob_12m:.1f}% | ROI atteso 12m {roi_12m:+.1f}% | {target_line} | EOL {eol} | Conf {confidence_score}/100"
                 )
                 lines.append(f"Fonte: {source} | Segnale: {strength}")
                 lines.append(LegoHunterTelegramBot._format_pick_link(row))
