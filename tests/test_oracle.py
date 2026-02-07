@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
@@ -1402,6 +1403,53 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(int(stats["ai_errors"]), 0)
         self.assertEqual(mocked_batch.call_count, 1)
 
+    async def test_score_ai_shortlist_batch_uses_json_repair_when_non_json(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle._openrouter_model_id = "vendor/model-pro:free"
+        oracle.ai_runtime = {
+            "engine": "openrouter",
+            "provider": "openrouter",
+            "model": "vendor/model-pro:free",
+            "mode": "api_openrouter_inventory",
+            "inventory_available": 1,
+        }
+
+        entries = [
+            {
+                "set_id": "75367",
+                "candidate": {
+                    "set_id": "75367",
+                    "set_name": "Set 75367",
+                    "theme": "Star Wars",
+                    "source": "lego_proxy_reader",
+                    "current_price": 99.99,
+                    "eol_date_prediction": "2026-12-01",
+                },
+            }
+        ]
+
+        repaired = {
+            "75367": AIInsight(
+                score=84,
+                summary="repair ok",
+                predicted_eol_date="2026-12-01",
+                fallback_used=False,
+            )
+        }
+        with patch.object(oracle, "_openrouter_generate", return_value="not-json"), patch.object(
+            oracle,
+            "_repair_openrouter_non_json_batch_output",
+            new=AsyncMock(return_value=repaired),
+        ) as mocked_repair:
+            results, error = await oracle._score_ai_shortlist_batch(entries, deadline=time.monotonic() + 10.0)
+
+        self.assertIsNone(error)
+        self.assertEqual(set(results.keys()), {"75367"})
+        self.assertEqual(results["75367"].score, 84)
+        mocked_repair.assert_awaited_once()
+
     def test_compute_fast_fail_timeouts_reduces_timeout_when_budget_is_tight(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
@@ -1435,6 +1483,59 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(set(insights.keys()), {"75367", "76281"})
         self.assertEqual(insights["75367"].score, 90)
         self.assertEqual(insights["76281"].score, 75)
+
+    def test_bootstrap_thresholds_can_promote_high_confidence_when_history_is_short(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.bootstrap_thresholds_enabled = True
+        oracle.bootstrap_min_history_points = 45
+        oracle.bootstrap_min_upside_probability = 0.52
+        oracle.bootstrap_min_confidence_score = 50
+        oracle.min_upside_probability = 0.60
+        oracle.min_confidence_score = 68
+        oracle.min_composite_score = 60
+
+        short_history_row = {
+            "set_id": "77051",
+            "ai_fallback_used": False,
+            "composite_score": 71,
+            "forecast_probability_upside_12m": 55.6,
+            "confidence_score": 52,
+            "forecast_data_points": 20,
+        }
+        long_history_row = {
+            "set_id": "77051",
+            "ai_fallback_used": False,
+            "composite_score": 71,
+            "forecast_probability_upside_12m": 55.6,
+            "confidence_score": 52,
+            "forecast_data_points": 120,
+        }
+
+        self.assertTrue(oracle._is_high_confidence_pick(short_history_row))
+        self.assertFalse(oracle._is_high_confidence_pick(long_history_row))
+
+    def test_low_confidence_note_mentions_bootstrap_when_active(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.bootstrap_thresholds_enabled = True
+        oracle.bootstrap_min_history_points = 45
+        oracle.bootstrap_min_upside_probability = 0.52
+        oracle.bootstrap_min_confidence_score = 50
+        oracle.min_upside_probability = 0.60
+        oracle.min_confidence_score = 68
+
+        row = {
+            "set_id": "77051",
+            "ai_fallback_used": False,
+            "forecast_probability_upside_12m": 50.0,
+            "confidence_score": 45,
+            "forecast_data_points": 20,
+        }
+        note = oracle._build_low_confidence_note(row)
+        self.assertIn("Bootstrap soglie attivo", note)
+        self.assertIn("50.0% < 52%", note)
+        self.assertIn("45 < 50", note)
 
     def test_format_exception_for_log_timeout_has_message(self) -> None:
         err_type, err_message = DiscoveryOracle._format_exception_for_log(asyncio.TimeoutError())

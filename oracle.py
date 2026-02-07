@@ -64,6 +64,10 @@ DEFAULT_AI_BATCH_SCORING_ENABLED = True
 DEFAULT_AI_BATCH_MIN_CANDIDATES = 3
 DEFAULT_AI_BATCH_MAX_CANDIDATES = 12
 DEFAULT_AI_BATCH_TIMEOUT_SEC = 26.0
+DEFAULT_BOOTSTRAP_THRESHOLDS_ENABLED = False
+DEFAULT_BOOTSTRAP_MIN_HISTORY_POINTS = 45
+DEFAULT_BOOTSTRAP_MIN_UPSIDE_PROBABILITY = 0.52
+DEFAULT_BOOTSTRAP_MIN_CONFIDENCE_SCORE = 50
 DEFAULT_AI_MODEL_BAN_SEC = 1800.0
 DEFAULT_AI_MODEL_BAN_FAILURES = 2
 DEFAULT_AI_MODEL_FAILURE_PENALTY = 22
@@ -309,6 +313,28 @@ class DiscoveryOracle:
             minimum=6.0,
             maximum=60.0,
         )
+        self.bootstrap_thresholds_enabled = self._safe_env_bool(
+            "BOOTSTRAP_THRESHOLDS_ENABLED",
+            default=DEFAULT_BOOTSTRAP_THRESHOLDS_ENABLED,
+        )
+        self.bootstrap_min_history_points = self._safe_env_int(
+            "BOOTSTRAP_MIN_HISTORY_POINTS",
+            default=DEFAULT_BOOTSTRAP_MIN_HISTORY_POINTS,
+            minimum=5,
+            maximum=365,
+        )
+        self.bootstrap_min_upside_probability = self._safe_env_float(
+            "BOOTSTRAP_MIN_UPSIDE_PROBABILITY",
+            default=DEFAULT_BOOTSTRAP_MIN_UPSIDE_PROBABILITY,
+            minimum=0.05,
+            maximum=0.99,
+        )
+        self.bootstrap_min_confidence_score = self._safe_env_int(
+            "BOOTSTRAP_MIN_CONFIDENCE_SCORE",
+            default=DEFAULT_BOOTSTRAP_MIN_CONFIDENCE_SCORE,
+            minimum=1,
+            maximum=100,
+        )
         self.openrouter_opportunistic_enabled = self._safe_env_bool(
             "OPENROUTER_OPPORTUNISTIC_ENABLED",
             default=DEFAULT_OPENROUTER_OPPORTUNISTIC_ENABLED,
@@ -482,12 +508,16 @@ class DiscoveryOracle:
             self.openrouter_opportunistic_timeout_sec,
         )
         LOGGER.info(
-            "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f",
+            "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f bootstrap_enabled=%s bootstrap_min_history=%s bootstrap_min_prob=%.2f bootstrap_min_confidence=%s",
             self.min_composite_score,
             self.min_upside_probability,
             self.min_confidence_score,
             self.history_window_days,
             self.target_roi_pct,
+            self.bootstrap_thresholds_enabled,
+            self.bootstrap_min_history_points,
+            self.bootstrap_min_upside_probability,
+            self.bootstrap_min_confidence_score,
         )
         LOGGER.info(
             "Backtest tuning | enabled=%s lookback_days=%s horizon_days=%s min_selected=%s profile=%s",
@@ -1789,6 +1819,21 @@ class DiscoveryOracle:
             f"{clipped}"
         )
 
+    @staticmethod
+    def _build_openrouter_batch_json_repair_prompt(raw_text: str, candidates: list[Dict[str, Any]]) -> str:
+        clipped = str(raw_text or "").strip()[:3500]
+        lines = [
+            "Trasforma il testo seguente in JSON valido, senza alcun testo extra.",
+            'Output SOLO JSON con schema: {"results":[{"set_id":"...", "score":1-100, "summary":"max 2 frasi", "predicted_eol_date":"YYYY-MM-DD o null"}]}',
+            "Mantieni solo i set_id presenti nella lista.",
+            "SET CONSENTITI:",
+        ]
+        for row in candidates:
+            lines.append(f"- {row.get('set_id')} | {row.get('set_name')} | tema={row.get('theme')} | prezzo={row.get('current_price')}")
+        lines.append("Testo da convertire:")
+        lines.append(clipped)
+        return "\n".join(lines)
+
     def _resolve_openrouter_json_repair_model(self, *, current_model: str) -> str:
         pool: list[str] = []
         preferred = str(self.openrouter_json_repair_model_preference or "").strip()
@@ -1879,6 +1924,59 @@ class DiscoveryOracle:
                 "OpenRouter JSON repair failed | model=%s set_id=%s error=%s",
                 repair_model,
                 candidate.get("set_id"),
+                str(exc)[:220],
+            )
+            return None
+
+    async def _repair_openrouter_non_json_batch_output(
+        self,
+        *,
+        raw_text: str,
+        candidates: list[Dict[str, Any]],
+        timeout_sec: float,
+    ) -> Optional[Dict[str, AIInsight]]:
+        model_id = str(self._openrouter_model_id or "").strip()
+        if not model_id or not candidates:
+            return None
+
+        repair_prompt = self._build_openrouter_batch_json_repair_prompt(raw_text, candidates)
+        repair_timeout = max(4.0, min(10.0, float(timeout_sec)))
+        repair_model = await asyncio.to_thread(
+            self._resolve_openrouter_json_repair_model,
+            current_model=model_id,
+        )
+        if repair_model != model_id:
+            LOGGER.info(
+                "OpenRouter batch JSON repair switching model | from=%s to=%s candidates=%s",
+                model_id,
+                repair_model,
+                len(candidates),
+            )
+        try:
+            repaired_text = await asyncio.to_thread(
+                self._openrouter_generate,
+                repair_prompt,
+                request_timeout=repair_timeout,
+                model_id_override=repair_model,
+            )
+            payload = self._extract_json(repaired_text)
+            insights = self._batch_payload_to_ai_insights(payload, candidates)
+            if not insights:
+                raise RuntimeError("batch_json_repair_no_valid_rows")
+            self._record_model_success("openrouter", repair_model, phase="batch_json_repair")
+            LOGGER.info(
+                "OpenRouter batch non-JSON repaired to JSON | model=%s candidates=%s scored=%s",
+                repair_model,
+                len(candidates),
+                len(insights),
+            )
+            return insights
+        except Exception as exc:  # noqa: BLE001
+            self._record_model_failure("openrouter", repair_model, str(exc), phase="batch_json_repair")
+            LOGGER.warning(
+                "OpenRouter batch JSON repair failed | model=%s candidates=%s error=%s",
+                repair_model,
+                len(candidates),
                 str(exc)[:220],
             )
             return None
@@ -2294,11 +2392,22 @@ class DiscoveryOracle:
                 for row in ranked[:fallback_limit]
             ]
 
+        bootstrap_rows_count = sum(
+            1
+            for row in ranked
+            if self._effective_high_confidence_thresholds(row)[2]
+        )
+
         diagnostics = {
             "threshold": self.min_composite_score,
             "ai_threshold": self.min_ai_score,
             "min_probability_high_confidence": self.min_upside_probability,
             "min_confidence_score_high_confidence": self.min_confidence_score,
+            "bootstrap_thresholds_enabled": self.bootstrap_thresholds_enabled,
+            "bootstrap_min_history_points": self.bootstrap_min_history_points,
+            "bootstrap_min_probability_high_confidence": self.bootstrap_min_upside_probability,
+            "bootstrap_min_confidence_score_high_confidence": self.bootstrap_min_confidence_score,
+            "bootstrap_rows_count": bootstrap_rows_count,
             "threshold_profile": dict(self.threshold_profile),
             "source_strategy": source_diagnostics.get("source_strategy"),
             "source_order": source_diagnostics.get("source_order", []),
@@ -3031,6 +3140,18 @@ class DiscoveryOracle:
                 return {}, str(exc)
 
         if self._openrouter_model_id is not None:
+            async def _insights_from_openrouter_text(raw_text: str) -> Dict[str, AIInsight]:
+                try:
+                    payload = self._extract_json(raw_text)
+                    return self._batch_payload_to_ai_insights(payload, candidates)
+                except Exception:
+                    repaired = await self._repair_openrouter_non_json_batch_output(
+                        raw_text=raw_text,
+                        candidates=candidates,
+                        timeout_sec=timeout_sec,
+                    )
+                    return repaired or {}
+
             current_model = str(self._openrouter_model_id or "")
             try:
                 text = await asyncio.to_thread(
@@ -3038,8 +3159,7 @@ class DiscoveryOracle:
                     prompt,
                     request_timeout=timeout_sec,
                 )
-                payload = self._extract_json(text)
-                insights = self._batch_payload_to_ai_insights(payload, candidates)
+                insights = await _insights_from_openrouter_text(text)
                 if insights:
                     self._record_model_success("openrouter", current_model, phase="batch_scoring")
                     LOGGER.info(
@@ -3061,8 +3181,7 @@ class DiscoveryOracle:
                             prompt,
                             request_timeout=timeout_sec,
                         )
-                        payload = self._extract_json(text)
-                        insights = self._batch_payload_to_ai_insights(payload, candidates)
+                        insights = await _insights_from_openrouter_text(text)
                         if insights:
                             self._record_model_success("openrouter", rotated_model, phase="batch_scoring_after_failover")
                             LOGGER.info(
@@ -4411,16 +4530,53 @@ class DiscoveryOracle:
         )
         return max(1, min(100, int(round(composite))))
 
+    def _row_forecast_data_points(self, row: Dict[str, Any]) -> int:
+        top_level = row.get("forecast_data_points")
+        if top_level is not None:
+            try:
+                return max(0, int(top_level))
+            except (TypeError, ValueError):
+                pass
+        meta = row.get("metadata")
+        if isinstance(meta, dict):
+            raw = meta.get("forecast_data_points")
+            try:
+                return max(0, int(raw or 0))
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    def _effective_high_confidence_thresholds(
+        self,
+        row: Dict[str, Any],
+    ) -> tuple[float, int, bool, int]:
+        probability_threshold = float(self.min_upside_probability)
+        confidence_threshold = int(self.min_confidence_score)
+        data_points = self._row_forecast_data_points(row)
+        bootstrap_active = False
+
+        if (
+            self.bootstrap_thresholds_enabled
+            and data_points > 0
+            and data_points < int(self.bootstrap_min_history_points)
+        ):
+            probability_threshold = min(probability_threshold, float(self.bootstrap_min_upside_probability))
+            confidence_threshold = min(confidence_threshold, int(self.bootstrap_min_confidence_score))
+            bootstrap_active = True
+
+        return probability_threshold, confidence_threshold, bootstrap_active, data_points
+
     def _is_high_confidence_pick(self, row: Dict[str, Any]) -> bool:
         if row.get("ai_fallback_used"):
             return False
         probability_pct = float(row.get("forecast_probability_upside_12m") or 0.0)
         confidence_score = int(row.get("confidence_score") or 0)
         composite_score = int(row.get("composite_score") or row.get("ai_investment_score") or 0)
+        probability_threshold, confidence_threshold, _bootstrap_active, _points = self._effective_high_confidence_thresholds(row)
         return (
             composite_score >= self.min_composite_score
-            and probability_pct >= (self.min_upside_probability * 100.0)
-            and confidence_score >= self.min_confidence_score
+            and probability_pct >= (probability_threshold * 100.0)
+            and confidence_score >= confidence_threshold
         )
 
     def _build_low_confidence_note(self, row: Dict[str, Any]) -> str:
@@ -4433,16 +4589,22 @@ class DiscoveryOracle:
 
         reasons: list[str] = []
         probability_pct = float(row.get("forecast_probability_upside_12m") or 0.0)
-        min_probability_pct = float(self.min_upside_probability) * 100.0
+        probability_threshold, confidence_threshold, bootstrap_active, data_points = self._effective_high_confidence_thresholds(row)
+        min_probability_pct = probability_threshold * 100.0
         if probability_pct < min_probability_pct:
             reasons.append(
                 f"Probabilita upside 12m sotto soglia ({probability_pct:.1f}% < {min_probability_pct:.0f}%)"
             )
 
         confidence_score = int(row.get("confidence_score") or 0)
-        if confidence_score < self.min_confidence_score:
+        if confidence_score < confidence_threshold:
             reasons.append(
-                f"Confidenza dati sotto soglia ({confidence_score} < {self.min_confidence_score})"
+                f"Confidenza dati sotto soglia ({confidence_score} < {confidence_threshold})"
+            )
+
+        if bootstrap_active:
+            reasons.append(
+                f"Bootstrap soglie attivo (data points {data_points} < {self.bootstrap_min_history_points})"
             )
 
         if reasons:
