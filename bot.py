@@ -5,12 +5,12 @@ import asyncio
 import html
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import quote_plus
 
 from telegram import Bot, BotCommand, Update
 from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from fiscal import FiscalGuardian
@@ -24,6 +24,55 @@ logging.basicConfig(
 LOGGER = logging.getLogger("lego_hunter.bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+async def _telegram_call_with_retry(
+    *,
+    operation_name: str,
+    fn: Callable[[], Awaitable[Any]],
+    max_attempts: int = 3,
+    non_fatal: bool = False,
+    base_delay_seconds: float = 1.5,
+) -> Optional[Any]:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await fn()
+        except RetryAfter as exc:
+            retry_seconds = max(1.0, float(getattr(exc, "retry_after", 1.0)))
+            LOGGER.warning(
+                "Telegram flood-control on %s (attempt %s/%s). Retry in %.1fs",
+                operation_name,
+                attempt,
+                max_attempts,
+                retry_seconds,
+            )
+            if attempt >= max_attempts:
+                if non_fatal:
+                    LOGGER.warning("Non-fatal Telegram operation failed after retries: %s", operation_name)
+                    return None
+                raise
+            await asyncio.sleep(retry_seconds)
+        except (TimedOut, NetworkError) as exc:
+            retry_seconds = base_delay_seconds * (2 ** (attempt - 1))
+            LOGGER.warning(
+                "Telegram transient error on %s (attempt %s/%s): %s. Retrying in %.1fs",
+                operation_name,
+                attempt,
+                max_attempts,
+                exc,
+                retry_seconds,
+            )
+            if attempt >= max_attempts:
+                if non_fatal:
+                    LOGGER.warning("Non-fatal Telegram operation failed after retries: %s", operation_name)
+                    return None
+                raise
+            await asyncio.sleep(retry_seconds)
+        except TelegramError:
+            if non_fatal:
+                LOGGER.exception("Non-fatal Telegram operation failed: %s", operation_name)
+                return None
+            raise
 
 
 class LegoHunterTelegramBot:
@@ -538,8 +587,13 @@ async def run_scheduled_cycle(
     bot = Bot(token=token)
     LOGGER.info("Scheduled cycle started | chat_id_set=%s", bool(chat_id))
     try:
-        await bot.set_my_commands(LegoHunterTelegramBot.supported_commands())
-        LOGGER.info("Scheduled cycle commands synced with Telegram")
+        await _telegram_call_with_retry(
+            operation_name="bot.set_my_commands",
+            fn=lambda: bot.set_my_commands(LegoHunterTelegramBot.supported_commands()),
+            max_attempts=3,
+            non_fatal=True,
+        )
+        LOGGER.info("Scheduled cycle command sync attempted")
 
         report = await oracle.discover_with_diagnostics(
             persist=True,
@@ -561,7 +615,7 @@ async def run_scheduled_cycle(
             diagnostics.get("ai_runtime"),
         )
         lines = [
-            "<b>🧱 LEGO HUNTER</b> <i>Update automatico (ogni ora)</i>",
+            "<b>🧱 LEGO HUNTER</b> <i>Update automatico (ogni 3 ore)</i>",
             "",
         ]
         lines.extend(LegoHunterTelegramBot._format_discovery_report(report, top_limit=3))
@@ -584,11 +638,16 @@ async def run_scheduled_cycle(
             len(payload),
             len(holdings),
         )
-        await bot.send_message(
-            chat_id=chat_id,
-            text=payload,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+        await _telegram_call_with_retry(
+            operation_name="bot.send_message",
+            fn=lambda: bot.send_message(
+                chat_id=chat_id,
+                text=payload,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            ),
+            max_attempts=4,
+            non_fatal=False,
         )
         LOGGER.info("Scheduled Telegram report sent successfully")
     except RetryAfter as exc:

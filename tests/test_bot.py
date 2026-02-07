@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import AsyncMock, patch
 
-from bot import LegoHunterTelegramBot
+from telegram.error import TimedOut
+
+from bot import LegoHunterTelegramBot, run_scheduled_cycle
 
 
 class DummyMessage:
@@ -90,6 +93,29 @@ class FakeOracle:
                 "discount_vs_primary_pct": 15.0,
             }
         ]
+
+    async def discover_with_diagnostics(self, persist=True, top_limit=12, fallback_limit=3):  # noqa: ANN001
+        return {
+            "selected": [],
+            "diagnostics": {
+                "fallback_used": True,
+                "source_raw_counts": {
+                    "lego_proxy_reader": 0,
+                    "amazon_proxy_reader": 0,
+                    "lego_retiring": 0,
+                    "amazon_bestsellers": 0,
+                    "lego_http_fallback": 0,
+                    "amazon_http_fallback": 0,
+                },
+                "dedup_candidates": 0,
+                "threshold": 60,
+                "above_threshold_count": 0,
+                "max_ai_score": 0,
+                "source_strategy": "external_first",
+                "selected_source": "external_proxy",
+                "ai_runtime": {"engine": "openrouter", "model": "x/y:free", "mode": "api"},
+            },
+        }
 
 
 class FakeFiscal:
@@ -244,6 +270,26 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         joined = "\n".join(lines)
         self.assertIn("Cerca su LEGO", joined)
         self.assertIn('href="https://www.lego.com/it-it/search?q=75367"', joined)
+
+    async def test_scheduled_cycle_continues_when_command_sync_times_out(self) -> None:
+        bot_mock = AsyncMock()
+        bot_mock.set_my_commands = AsyncMock(side_effect=TimedOut("timed out"))
+        bot_mock.send_message = AsyncMock(return_value={"ok": True})
+        bot_mock.shutdown = AsyncMock(return_value=None)
+
+        with patch("bot.Bot", return_value=bot_mock), patch("bot.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            await run_scheduled_cycle(
+                token="token",
+                chat_id="123",
+                oracle=FakeOracle(),
+                repository=FakeRepo(),
+                fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+            )
+
+        self.assertGreaterEqual(bot_mock.set_my_commands.await_count, 3)
+        self.assertEqual(bot_mock.send_message.await_count, 1)
+        self.assertEqual(bot_mock.shutdown.await_count, 1)
+        self.assertGreaterEqual(sleep_mock.await_count, 2)
 
 
 if __name__ == "__main__":
