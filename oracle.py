@@ -49,7 +49,7 @@ class DiscoveryOracle:
         repository: LegoHunterRepository,
         *,
         gemini_api_key: Optional[str] = None,
-        gemini_model: str = "gemini-1.5-flash",
+        gemini_model: str = "gemini-2.0-flash",
         min_ai_score: int = 60,
     ) -> None:
         self.repository = repository
@@ -187,6 +187,8 @@ class DiscoveryOracle:
         diagnostics = {
             "threshold": self.min_ai_score,
             "source_strategy": source_diagnostics.get("source_strategy"),
+            "source_order": source_diagnostics.get("source_order", []),
+            "selected_source": source_diagnostics.get("selected_source"),
             "source_raw_counts": source_diagnostics["source_raw_counts"],
             "source_dedup_counts": source_diagnostics["source_dedup_counts"],
             "source_failures": source_diagnostics["source_failures"],
@@ -934,7 +936,17 @@ class DiscoveryOracle:
             predicted_eol_date = payload.get("predicted_eol_date") or candidate.get("eol_date_prediction")
             return AIInsight(score=score, summary=summary, predicted_eol_date=predicted_eol_date)
         except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Gemini scoring failed for %s: %s", candidate.get("set_id"), exc)
+            err_text = str(exc).lower()
+            if any(token in err_text for token in ("not found", "not supported", "permission denied", "quota")):
+                self._model = None
+                self.ai_runtime = {
+                    "engine": "heuristic",
+                    "model": "heuristic-v1",
+                    "mode": "fallback_after_gemini_error",
+                }
+                LOGGER.warning("Gemini disabled after API error; fallback heuristic enabled: %s", exc)
+            else:
+                LOGGER.warning("Gemini scoring failed for %s: %s", candidate.get("set_id"), exc)
             return self._heuristic_ai_fallback(candidate)
 
     def _gemini_generate(self, prompt: str) -> str:
