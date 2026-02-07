@@ -428,7 +428,12 @@ class LegoHunterTelegramBot:
 
         lines: list[str] = []
         if diagnostics.get("fallback_used"):
-            lines.append("⚠️ Nessun set sopra soglia: mostro i migliori <b>LOW_CONFIDENCE</b>.")
+            above_threshold_count = int(diagnostics.get("above_threshold_count") or 0)
+            high_conf_count = int(diagnostics.get("above_threshold_high_confidence_count") or 0)
+            if above_threshold_count > 0 and high_conf_count == 0:
+                lines.append("⚠️ Nessun set <b>HIGH_CONFIDENCE</b> nel ciclo: mostro i migliori <b>LOW_CONFIDENCE</b>.")
+            else:
+                lines.append("⚠️ Nessun set sopra soglia composita nel ciclo: mostro i migliori <b>LOW_CONFIDENCE</b>.")
         else:
             lines.append("✅ Opportunita' sopra soglia trovate.")
 

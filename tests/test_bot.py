@@ -269,7 +269,38 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         lines = LegoHunterTelegramBot._format_discovery_report(report, top_limit=3)
         joined = "\n".join(lines)
         self.assertIn("Cerca su LEGO", joined)
-        self.assertIn('href="https://www.lego.com/it-it/search?q=75367"', joined)
+
+    def test_format_discovery_report_explains_when_only_low_confidence_above_threshold(self) -> None:
+        report = {
+            "selected": [
+                {
+                    "set_id": "76281",
+                    "set_name": "X-Jet di X-Men",
+                    "source": "lego_proxy_reader",
+                    "signal_strength": "LOW_CONFIDENCE",
+                    "ai_investment_score": 64,
+                }
+            ],
+            "diagnostics": {
+                "fallback_used": True,
+                "above_threshold_count": 9,
+                "above_threshold_high_confidence_count": 0,
+                "source_raw_counts": {},
+                "dedup_candidates": 41,
+                "threshold": 60,
+                "max_ai_score": 79,
+                "source_strategy": "external_first",
+                "selected_source": "external_proxy",
+                "ai_runtime": {"engine": "openrouter", "model": "x/y:free", "mode": "api"},
+            },
+        }
+
+        lines = LegoHunterTelegramBot._format_discovery_report(report, top_limit=3)
+        joined = "\n".join(lines)
+
+        self.assertIn("Nessun set <b>HIGH_CONFIDENCE</b>", joined)
+        self.assertIn("LOW_CONFIDENCE", joined)
+        self.assertIn('href="https://www.lego.com/it-it/search?q=76281"', joined)
 
     async def test_scheduled_cycle_continues_when_command_sync_times_out(self) -> None:
         bot_mock = AsyncMock()

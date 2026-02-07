@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
@@ -1103,6 +1104,46 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
     def test_ai_score_collapse_detection_false_with_wide_spread(self) -> None:
         ranked = [{"ai_investment_score": score} for score in [35, 42, 55, 61, 73, 67, 58, 49]]
         self.assertFalse(DiscoveryOracle._is_ai_score_collapse(ranked))
+
+    async def test_score_ai_shortlist_retries_timeout_then_succeeds(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_scoring_item_timeout_sec = 0.05
+        oracle.ai_scoring_timeout_retries = 1
+        oracle.ai_scoring_retry_timeout_sec = 0.05
+        oracle.ai_scoring_hard_budget_sec = 2.0
+
+        candidate = {
+            "set_id": "75367",
+            "set_name": "LEGO Star Wars",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 129.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+        shortlist = [{"set_id": "75367", "candidate": candidate}]
+        call_counter = {"value": 0}
+
+        async def fake_insight(_candidate):  # noqa: ANN001
+            call_counter["value"] += 1
+            if call_counter["value"] == 1:
+                await asyncio.sleep(0.2)
+            return AIInsight(score=84, summary="ok", predicted_eol_date="2026-10-01")
+
+        with patch.object(oracle, "_get_ai_insight", new=AsyncMock(side_effect=fake_insight)):
+            results, stats = await oracle._score_ai_shortlist(shortlist)
+
+        self.assertEqual(call_counter["value"], 2)
+        self.assertFalse(results["75367"].fallback_used)
+        self.assertEqual(int(stats["ai_scored_count"]), 1)
+        self.assertEqual(int(stats["ai_errors"]), 0)
+        self.assertEqual(int(stats["ai_timeout_count"]), 0)
+
+    def test_format_exception_for_log_timeout_has_message(self) -> None:
+        err_type, err_message = DiscoveryOracle._format_exception_for_log(asyncio.TimeoutError())
+        self.assertEqual(err_type, "TimeoutError")
+        self.assertTrue(err_message)
+        self.assertIn("timeout", err_message.lower())
 
 
 if __name__ == "__main__":

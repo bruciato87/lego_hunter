@@ -54,6 +54,8 @@ DEFAULT_AI_CACHE_MAX_ITEMS = 4000
 DEFAULT_OPENROUTER_MALFORMED_LIMIT = 3
 DEFAULT_AI_SCORING_HARD_BUDGET_SEC = 60.0
 DEFAULT_AI_SCORING_ITEM_TIMEOUT_SEC = 18.0
+DEFAULT_AI_SCORING_TIMEOUT_RETRIES = 1
+DEFAULT_AI_SCORING_RETRY_TIMEOUT_SEC = 7.0
 DEFAULT_AI_MODEL_BAN_SEC = 1800.0
 DEFAULT_AI_MODEL_BAN_FAILURES = 2
 DEFAULT_AI_MODEL_FAILURE_PENALTY = 22
@@ -242,6 +244,18 @@ class DiscoveryOracle:
             minimum=4.0,
             maximum=120.0,
         )
+        self.ai_scoring_timeout_retries = self._safe_env_int(
+            "AI_SCORING_TIMEOUT_RETRIES",
+            default=DEFAULT_AI_SCORING_TIMEOUT_RETRIES,
+            minimum=0,
+            maximum=2,
+        )
+        self.ai_scoring_retry_timeout_sec = self._safe_env_float(
+            "AI_SCORING_RETRY_TIMEOUT_SEC",
+            default=DEFAULT_AI_SCORING_RETRY_TIMEOUT_SEC,
+            minimum=2.0,
+            maximum=60.0,
+        )
         self.openrouter_opportunistic_enabled = self._safe_env_bool(
             "OPENROUTER_OPPORTUNISTIC_ENABLED",
             default=DEFAULT_OPENROUTER_OPPORTUNISTIC_ENABLED,
@@ -384,7 +398,7 @@ class DiscoveryOracle:
             self.strict_ai_probe_validation,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
             self.ai_cache_ttl_sec,
@@ -392,6 +406,8 @@ class DiscoveryOracle:
             self.openrouter_malformed_limit,
             self.ai_scoring_hard_budget_sec,
             self.ai_scoring_item_timeout_sec,
+            self.ai_scoring_timeout_retries,
+            self.ai_scoring_retry_timeout_sec,
             self.ai_model_ban_sec,
             self.ai_model_ban_failures,
             self.openrouter_opportunistic_enabled,
@@ -2467,16 +2483,49 @@ class DiscoveryOracle:
                 runtime_mode = str(self.ai_runtime.get("mode") or "")
                 if runtime_mode in {"fallback_openrouter_malformed_payload", "fallback_after_openrouter_error"}:
                     return set_id, self._heuristic_ai_fallback(candidate), False, None
-                try:
-                    ai = await asyncio.wait_for(
-                        self._get_ai_insight(candidate),
-                        timeout=self.ai_scoring_item_timeout_sec,
-                    )
-                    return set_id, ai, False, None
-                except asyncio.TimeoutError as exc:
-                    return set_id, self._heuristic_ai_fallback(candidate), False, exc
-                except Exception as exc:  # noqa: BLE001
-                    return set_id, self._heuristic_ai_fallback(candidate), False, exc
+
+                retries = max(0, int(self.ai_scoring_timeout_retries))
+                first_timeout = float(self.ai_scoring_item_timeout_sec)
+                retry_timeout = min(first_timeout, float(self.ai_scoring_retry_timeout_sec))
+                attempt_timeouts = [first_timeout] + [retry_timeout] * retries
+                total_attempts = len(attempt_timeouts)
+
+                for attempt_idx, attempt_timeout in enumerate(attempt_timeouts, start=1):
+                    try:
+                        ai = await asyncio.wait_for(
+                            self._get_ai_insight(candidate),
+                            timeout=attempt_timeout,
+                        )
+                        return set_id, ai, False, None
+                    except asyncio.TimeoutError:
+                        if attempt_idx < total_attempts:
+                            LOGGER.warning(
+                                "AI scoring timeout | set_id=%s source=%s attempt=%s/%s timeout_sec=%.1f engine=%s model=%s mode=%s",
+                                set_id,
+                                candidate.get("source"),
+                                attempt_idx,
+                                total_attempts,
+                                attempt_timeout,
+                                self.ai_runtime.get("engine"),
+                                self.ai_runtime.get("model"),
+                                self.ai_runtime.get("mode"),
+                            )
+                            if self._openrouter_model_id is not None:
+                                await self._advance_openrouter_model_locked(
+                                    reason=f"scoring_timeout:{set_id}:attempt_{attempt_idx}",
+                                )
+                            continue
+                        timeout_err = asyncio.TimeoutError(
+                            f"timeout after {attempt_timeout:.1f}s (attempt {attempt_idx}/{total_attempts})"
+                        )
+                        return set_id, self._heuristic_ai_fallback(candidate), False, timeout_err
+                    except Exception as exc:  # noqa: BLE001
+                        return set_id, self._heuristic_ai_fallback(candidate), False, exc
+
+                timeout_err = asyncio.TimeoutError(
+                    f"timeout after retries ({total_attempts} attempts)"
+                )
+                return set_id, self._heuristic_ai_fallback(candidate), False, timeout_err
 
         tasks_by_set = {
             str(entry["set_id"]): asyncio.create_task(worker(entry))
@@ -2546,7 +2595,17 @@ class DiscoveryOracle:
                     stats["ai_timeout_count"] += 1
                 if err is not None:
                     stats["ai_errors"] += 1
-                    LOGGER.warning("AI scoring worker failed | set_id=%s error=%s", set_id, err)
+                    err_type, err_message = self._format_exception_for_log(err)
+                    LOGGER.warning(
+                        "AI scoring worker failed | set_id=%s source=%s engine=%s model=%s mode=%s error_type=%s error=%s",
+                        set_id,
+                        candidate.get("source"),
+                        self.ai_runtime.get("engine"),
+                        self.ai_runtime.get("model"),
+                        self.ai_runtime.get("mode"),
+                        err_type,
+                        err_message,
+                    )
                 results[set_id] = ai
 
         # Safety net: ensure every shortlisted candidate has a score.
@@ -2580,6 +2639,17 @@ class DiscoveryOracle:
             self.ai_scoring_hard_budget_sec,
         )
         return results, stats
+
+    @staticmethod
+    def _format_exception_for_log(exc: Exception) -> tuple[str, str]:
+        err_type = type(exc).__name__
+        message = str(exc or "").strip()
+        if not message:
+            if isinstance(exc, asyncio.TimeoutError):
+                message = "timeout (empty exception message)"
+            else:
+                message = repr(exc).strip() or "<no_error_message>"
+        return err_type, message
 
     def _load_history_by_set(self, set_ids: list[str]) -> Dict[str, list[Dict[str, Any]]]:
         grouped: Dict[str, list[Dict[str, Any]]] = {set_id: [] for set_id in set_ids}
