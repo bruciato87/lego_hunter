@@ -52,6 +52,9 @@ class AIInsight:
     score: int
     summary: str
     predicted_eol_date: Optional[str] = None
+    fallback_used: bool = False
+    confidence: str = "HIGH_CONFIDENCE"
+    risk_note: Optional[str] = None
 
 
 class DiscoveryOracle:
@@ -1196,17 +1199,29 @@ class DiscoveryOracle:
 
         ranked.sort(key=lambda row: (row["ai_investment_score"], row["market_demand_score"]), reverse=True)
         above_threshold = [row for row in ranked if row["ai_investment_score"] >= self.min_ai_score]
+        above_threshold_high_conf = [row for row in above_threshold if not row.get("ai_fallback_used")]
+        above_threshold_low_conf = [row for row in above_threshold if row.get("ai_fallback_used")]
 
         selected: list[Dict[str, Any]]
         fallback_used = False
 
-        if above_threshold:
+        if above_threshold_high_conf:
             selected = [
                 {
                     **row,
                     "signal_strength": "HIGH_CONFIDENCE",
                 }
-                for row in above_threshold[:top_limit]
+                for row in above_threshold_high_conf[:top_limit]
+            ]
+        elif above_threshold_low_conf:
+            fallback_used = True
+            selected = [
+                {
+                    **row,
+                    "signal_strength": "LOW_CONFIDENCE",
+                    "risk_note": row.get("risk_note") or "Score AI non affidabile nel ciclo corrente.",
+                }
+                for row in above_threshold_low_conf[:fallback_limit]
             ]
         else:
             fallback_used = bool(ranked)
@@ -1231,6 +1246,9 @@ class DiscoveryOracle:
             "dedup_candidates": source_diagnostics["dedup_candidates"],
             "ranked_candidates": len(ranked),
             "above_threshold_count": len(above_threshold),
+            "above_threshold_high_confidence_count": len(above_threshold_high_conf),
+            "above_threshold_low_confidence_count": len(above_threshold_low_conf),
+            "fallback_scored_count": sum(1 for row in ranked if row.get("ai_fallback_used")),
             "below_threshold_count": len(ranked) - len(above_threshold),
             "max_ai_score": max((row["ai_investment_score"] for row in ranked), default=0),
             "fallback_used": fallback_used,
@@ -1304,12 +1322,19 @@ class DiscoveryOracle:
                 metadata={
                     "listing_url": candidate.get("listing_url"),
                     "source_metadata": candidate.get("metadata", {}),
+                    "ai_fallback_used": bool(ai.fallback_used),
+                    "ai_confidence": str(ai.confidence or "HIGH_CONFIDENCE"),
+                    "ai_risk_note": ai.risk_note,
                 },
             )
 
             payload = opportunity.__dict__.copy()
             payload["market_demand_score"] = demand
             payload["ai_investment_score"] = ai.score
+            payload["ai_fallback_used"] = bool(ai.fallback_used)
+            payload["ai_confidence"] = str(ai.confidence or "HIGH_CONFIDENCE")
+            if ai.risk_note:
+                payload["risk_note"] = ai.risk_note
             ranked.append(payload)
             opportunities.append((opportunity, candidate))
 
@@ -2057,7 +2082,14 @@ class DiscoveryOracle:
         score = max(1, min(100, score))
         summary = str(payload.get("summary") or "No summary")[:1200]
         predicted_eol_date = payload.get("predicted_eol_date") or candidate.get("eol_date_prediction")
-        return AIInsight(score=score, summary=summary, predicted_eol_date=predicted_eol_date)
+        return AIInsight(
+            score=score,
+            summary=summary,
+            predicted_eol_date=predicted_eol_date,
+            fallback_used=False,
+            confidence="HIGH_CONFIDENCE",
+            risk_note=None,
+        )
 
     def _gemini_generate(self, prompt: str) -> str:
         if self._model is None:
@@ -2120,6 +2152,9 @@ class DiscoveryOracle:
                 "prima dell'acquisto definitivo."
             ),
             predicted_eol_date=eol,
+            fallback_used=True,
+            confidence="LOW_CONFIDENCE",
+            risk_note="Ranking calcolato con fallback euristico (risposta AI non valida o non disponibile).",
         )
 
     def _estimate_market_demand(self, candidate: Dict[str, Any], ai_score: int) -> int:

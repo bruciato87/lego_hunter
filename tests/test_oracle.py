@@ -34,10 +34,14 @@ class DummyOracle(DiscoveryOracle):
         return self._candidates
 
     async def _get_ai_insight(self, candidate):  # noqa: ANN001
+        mock_fallback = bool(candidate.get("mock_fallback", False))
         return AIInsight(
             score=int(candidate.get("mock_score", 50)),
             summary="mock summary",
             predicted_eol_date=candidate.get("eol_date_prediction"),
+            fallback_used=mock_fallback,
+            confidence="LOW_CONFIDENCE" if mock_fallback else "HIGH_CONFIDENCE",
+            risk_note="mock fallback risk" if mock_fallback else None,
         )
 
 
@@ -113,6 +117,74 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["secondary_platform"], "vinted")
         self.assertAlmostEqual(rows[0]["discount_vs_primary_pct"], 20.0, places=2)
         self.assertEqual(len(repo.snapshots), 1)
+
+    async def test_discovery_excludes_fallback_scores_from_high_confidence_picks(self) -> None:
+        repo = FakeRepo()
+        candidates = [
+            {
+                "set_id": "40747",
+                "set_name": "Narcisi",
+                "theme": "Icons",
+                "source": "lego_proxy_reader",
+                "current_price": 14.99,
+                "eol_date_prediction": "2026-04-23",
+                "metadata": {},
+                "mock_score": 73,
+                "mock_fallback": True,
+            },
+            {
+                "set_id": "10332",
+                "set_name": "Piazza Medievale",
+                "theme": "Icons",
+                "source": "lego_proxy_reader",
+                "current_price": 229.99,
+                "eol_date_prediction": "2026-06-01",
+                "metadata": {},
+                "mock_score": 72,
+                "mock_fallback": False,
+            },
+        ]
+        oracle = DummyOracle(repo, candidates)
+
+        report = await oracle.discover_with_diagnostics(persist=False, top_limit=10, fallback_limit=3)
+        selected = report["selected"]
+        diagnostics = report["diagnostics"]
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["set_id"], "10332")
+        self.assertEqual(selected[0]["signal_strength"], "HIGH_CONFIDENCE")
+        self.assertEqual(diagnostics["above_threshold_count"], 2)
+        self.assertEqual(diagnostics["above_threshold_high_confidence_count"], 1)
+        self.assertEqual(diagnostics["above_threshold_low_confidence_count"], 1)
+
+    async def test_discovery_marks_only_fallback_scores_as_low_confidence(self) -> None:
+        repo = FakeRepo()
+        candidates = [
+            {
+                "set_id": "40747",
+                "set_name": "Narcisi",
+                "theme": "Icons",
+                "source": "lego_proxy_reader",
+                "current_price": 14.99,
+                "eol_date_prediction": "2026-04-23",
+                "metadata": {},
+                "mock_score": 73,
+                "mock_fallback": True,
+            }
+        ]
+        oracle = DummyOracle(repo, candidates)
+
+        report = await oracle.discover_with_diagnostics(persist=False, top_limit=10, fallback_limit=3)
+        selected = report["selected"]
+        diagnostics = report["diagnostics"]
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["signal_strength"], "LOW_CONFIDENCE")
+        self.assertIn("fallback", str(selected[0].get("risk_note", "")).lower())
+        self.assertTrue(diagnostics["fallback_used"])
+        self.assertEqual(diagnostics["above_threshold_count"], 1)
+        self.assertEqual(diagnostics["above_threshold_high_confidence_count"], 0)
+        self.assertEqual(diagnostics["above_threshold_low_confidence_count"], 1)
 
     async def test_source_collection_prefers_external_proxy(self) -> None:
         repo = FakeRepo()
