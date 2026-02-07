@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 from oracle import AIInsight, DiscoveryOracle
@@ -12,6 +13,7 @@ class FakeRepo:
         self.upserted = []
         self.snapshots = []
         self.recent = {}
+        self.theme_baselines = {}
 
     def upsert_opportunity(self, record):  # noqa: ANN001
         self.upserted.append(record)
@@ -23,6 +25,17 @@ class FakeRepo:
 
     def get_recent_market_prices(self, set_id, days=30, platform=None):  # noqa: ANN001
         return self.recent.get(set_id, [])
+
+    def get_theme_radar_baseline(self, theme, days=180, limit=120):  # noqa: ANN001
+        return self.theme_baselines.get(
+            theme,
+            {
+                "sample_size": 0.0,
+                "avg_ai_score": 0.0,
+                "avg_market_demand": 0.0,
+                "std_ai_score": 0.0,
+            },
+        )
 
 
 class DummyOracle(DiscoveryOracle):
@@ -48,7 +61,21 @@ class DummyOracle(DiscoveryOracle):
 class OracleTests(unittest.IsolatedAsyncioTestCase):
     async def test_discover_opportunities_filters_by_min_score(self) -> None:
         repo = FakeRepo()
-        repo.recent["75367"] = [{"price": 110}] * 4
+        now = datetime.now(timezone.utc)
+        repo.recent["75367"] = [
+            {
+                "price": 110 + idx,
+                "platform": "vinted" if idx % 2 == 0 else "subito",
+                "recorded_at": (now - timedelta(days=idx)).isoformat(),
+            }
+            for idx in range(10)
+        ]
+        repo.theme_baselines["Star Wars"] = {
+            "sample_size": 32.0,
+            "avg_ai_score": 76.0,
+            "avg_market_demand": 82.0,
+            "std_ai_score": 6.0,
+        }
 
         candidates = [
             {
@@ -118,8 +145,98 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(rows[0]["discount_vs_primary_pct"], 20.0, places=2)
         self.assertEqual(len(repo.snapshots), 1)
 
+    async def test_ranking_payload_contains_composite_and_forecast_metrics(self) -> None:
+        repo = FakeRepo()
+        now = datetime.now(timezone.utc)
+        repo.recent["75367"] = [
+            {
+                "price": 120 + (idx % 4),
+                "platform": "vinted" if idx % 2 == 0 else "subito",
+                "recorded_at": (now - timedelta(days=idx)).isoformat(),
+            }
+            for idx in range(25)
+        ]
+        repo.theme_baselines["Star Wars"] = {
+            "sample_size": 28.0,
+            "avg_ai_score": 74.0,
+            "avg_market_demand": 80.0,
+            "std_ai_score": 7.0,
+        }
+
+        candidates = [
+            {
+                "set_id": "75367",
+                "set_name": "LEGO Star Wars",
+                "theme": "Star Wars",
+                "source": "lego_proxy_reader",
+                "current_price": 129.99,
+                "eol_date_prediction": "2026-05-01",
+                "metadata": {},
+                "mock_score": 82,
+            }
+        ]
+        oracle = DummyOracle(repo, candidates)
+
+        report = await oracle.discover_with_diagnostics(persist=False, top_limit=10, fallback_limit=3)
+        row = report["ranked"][0]
+
+        self.assertIn("composite_score", row)
+        self.assertIn("forecast_score", row)
+        self.assertIn("forecast_probability_upside_12m", row)
+        self.assertIn("confidence_score", row)
+        self.assertIn("expected_roi_12m_pct", row)
+        self.assertGreaterEqual(int(row["composite_score"]), 1)
+        self.assertLessEqual(int(row["composite_score"]), 100)
+
+    async def test_non_fallback_can_be_low_confidence_with_weak_quant_data(self) -> None:
+        repo = FakeRepo()
+        candidates = [
+            {
+                "set_id": "60316",
+                "set_name": "LEGO City",
+                "theme": "City",
+                "source": "amazon_bestsellers",
+                "current_price": 35.0,
+                "eol_date_prediction": None,
+                "metadata": {},
+                "mock_score": 75,
+                "mock_fallback": False,
+            }
+        ]
+        oracle = DummyOracle(repo, candidates)
+
+        report = await oracle.discover_with_diagnostics(persist=False, top_limit=10, fallback_limit=3)
+        selected = report["selected"]
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["signal_strength"], "LOW_CONFIDENCE")
+        self.assertFalse(bool(selected[0].get("ai_fallback_used")))
+
     async def test_discovery_excludes_fallback_scores_from_high_confidence_picks(self) -> None:
         repo = FakeRepo()
+        now = datetime.now(timezone.utc)
+        repo.recent["10332"] = [
+            {
+                "price": 210.0 + (idx % 5),
+                "platform": "vinted" if idx % 2 == 0 else "subito",
+                "recorded_at": (now - timedelta(days=idx)).isoformat(),
+            }
+            for idx in range(35)
+        ]
+        repo.recent["40747"] = [
+            {
+                "price": 16.5 + ((idx % 3) * 0.2),
+                "platform": "vinted",
+                "recorded_at": (now - timedelta(days=idx)).isoformat(),
+            }
+            for idx in range(28)
+        ]
+        repo.theme_baselines["Icons"] = {
+            "sample_size": 40.0,
+            "avg_ai_score": 78.0,
+            "avg_market_demand": 84.0,
+            "std_ai_score": 5.0,
+        }
         candidates = [
             {
                 "set_id": "40747",
@@ -156,9 +273,20 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diagnostics["above_threshold_count"], 2)
         self.assertEqual(diagnostics["above_threshold_high_confidence_count"], 1)
         self.assertEqual(diagnostics["above_threshold_low_confidence_count"], 1)
+        self.assertGreaterEqual(float(selected[0].get("forecast_probability_upside_12m") or 0.0), 60.0)
+        self.assertGreaterEqual(int(selected[0].get("confidence_score") or 0), 68)
 
     async def test_discovery_marks_only_fallback_scores_as_low_confidence(self) -> None:
         repo = FakeRepo()
+        now = datetime.now(timezone.utc)
+        repo.recent["40747"] = [
+            {
+                "price": 14.0 + (idx % 3) * 0.5,
+                "platform": "vinted",
+                "recorded_at": (now - timedelta(days=idx)).isoformat(),
+            }
+            for idx in range(12)
+        ]
         candidates = [
             {
                 "set_id": "40747",

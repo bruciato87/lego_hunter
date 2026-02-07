@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import statistics
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
@@ -270,6 +271,55 @@ class LegoHunterRepository:
             lambda: query.order("recorded_at", desc=True).execute(),
         )
         return result.data or []
+
+    def get_theme_radar_baseline(
+        self,
+        theme: str,
+        *,
+        days: int = 180,
+        limit: int = 120,
+    ) -> Dict[str, float]:
+        safe_theme = str(theme or "").strip()
+        if not safe_theme:
+            return {
+                "sample_size": 0.0,
+                "avg_ai_score": 0.0,
+                "avg_market_demand": 0.0,
+                "std_ai_score": 0.0,
+            }
+
+        since = datetime.now(timezone.utc).timestamp() - (days * 24 * 60 * 60)
+        since_iso = datetime.fromtimestamp(since, tz=timezone.utc).isoformat()
+        query = (
+            self.client.table("opportunity_radar")
+            .select("ai_investment_score,market_demand_score,last_seen_at")
+            .eq("is_archived", False)
+            .ilike("theme", safe_theme)
+            .gte("last_seen_at", since_iso)
+            .order("last_seen_at", desc=True)
+            .limit(limit)
+        )
+
+        result = self._with_retry("get_theme_radar_baseline", lambda: query.execute())
+        rows = result.data or []
+        if not rows:
+            return {
+                "sample_size": 0.0,
+                "avg_ai_score": 0.0,
+                "avg_market_demand": 0.0,
+                "std_ai_score": 0.0,
+            }
+
+        ai_scores = [float(row.get("ai_investment_score") or 0.0) for row in rows]
+        demand_scores = [float(row.get("market_demand_score") or 0.0) for row in rows]
+        std_ai_score = statistics.pstdev(ai_scores) if len(ai_scores) > 1 else 0.0
+
+        return {
+            "sample_size": float(len(rows)),
+            "avg_ai_score": float(statistics.fmean(ai_scores)),
+            "avg_market_demand": float(statistics.fmean(demand_scores)),
+            "std_ai_score": float(std_ai_score),
+        }
 
     def insert_fiscal_log(self, record: FiscalLogRecord) -> Dict[str, Any]:
         payload = asdict(record)

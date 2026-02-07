@@ -75,6 +75,9 @@ class LegoHunterTelegramBot:
             "/offerte - Verifica se sul secondario trovi prezzi migliori del primario.\n"
             "/collezione - Riepilogo portfolio: capitale investito, valore stimato, ROI latente.\n"
             "/vendi - Segnali vendita con ROI netto > 30% (bloccati automaticamente se DAC7 a rischio).\n\n"
+            "Come leggere i segnali:\n"
+            "Score = composito (AI + Quant + Demand).\n"
+            "HIGH_CONFIDENCE = score sopra soglia + probabilita' upside 12m + confidenza dati alta + AI non in fallback.\n\n"
             "Alias compatibilita':\n"
             "/hunt -> /scova\n"
             "/portfolio -> /collezione\n"
@@ -134,9 +137,14 @@ class LegoHunterTelegramBot:
 
         lines = ["Radar opportunita' LEGO:"]
         for idx, row in enumerate(rows, start=1):
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            composite = int(row.get("composite_score") or row.get("ai_investment_score") or metadata.get("composite_score") or 0)
+            ai_raw = int(row.get("ai_raw_score") or metadata.get("ai_raw_score") or row.get("ai_investment_score") or 0)
+            quant = int(row.get("forecast_score") or metadata.get("forecast_score") or 0)
             lines.append(
                 f"{idx}. {row.get('set_name')} ({row.get('set_id')}) - "
-                f"AI {row.get('ai_investment_score')}/100 | Demand {row.get('market_demand_score')}/100"
+                f"Score {composite}/100 | AI {ai_raw}/100 | Quant {quant}/100 | "
+                f"Demand {row.get('market_demand_score')}/100"
             )
         await update.message.reply_text("\n".join(lines))
 
@@ -161,9 +169,13 @@ class LegoHunterTelegramBot:
 
         lines = [f"Risultati per '{query}':"]
         for row in rows:
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            composite = int(row.get("composite_score") or row.get("ai_investment_score") or metadata.get("composite_score") or 0)
+            ai_raw = int(row.get("ai_raw_score") or metadata.get("ai_raw_score") or row.get("ai_investment_score") or 0)
+            quant = int(row.get("forecast_score") or metadata.get("forecast_score") or 0)
             lines.append(
                 f"- {row.get('set_name')} ({row.get('set_id')}) | Theme: {row.get('theme') or 'n/d'} | "
-                f"AI {row.get('ai_investment_score')}/100"
+                f"Score {composite}/100 (AI {ai_raw}/100 | Quant {quant}/100)"
             )
         await update.message.reply_text("\n".join(lines))
 
@@ -380,14 +392,29 @@ class LegoHunterTelegramBot:
                 set_name = html.escape(str(row.get("set_name") or "n/d"))
                 set_id = html.escape(str(row.get("set_id") or "n/d"))
                 source = html.escape(str(row.get("source") or "unknown"))
-                ai_score = int(row.get("ai_investment_score") or 0)
+                metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                composite = int(row.get("composite_score") or row.get("ai_investment_score") or metadata.get("composite_score") or 0)
+                ai_score = int(row.get("ai_raw_score") or metadata.get("ai_raw_score") or row.get("ai_investment_score") or 0)
+                quant_score = int(row.get("forecast_score") or metadata.get("forecast_score") or 0)
+                prob_12m = float(
+                    row.get("forecast_probability_upside_12m")
+                    or metadata.get("forecast_probability_upside_12m")
+                    or 0.0
+                )
+                roi_12m = float(row.get("expected_roi_12m_pct") or metadata.get("expected_roi_12m_pct") or 0.0)
+                months_to_target = row.get("estimated_months_to_target") or metadata.get("forecast_estimated_months_to_target")
+                confidence_score = int(row.get("confidence_score") or metadata.get("forecast_confidence_score") or 0)
                 demand_score = int(row.get("market_demand_score") or 0)
                 price = LegoHunterTelegramBot._fmt_eur(row.get("current_price"))
                 eol = html.escape(str(row.get("eol_date_prediction") or "n/d"))
 
                 lines.append(f"{badge} <b>{idx}) {set_name}</b> ({set_id})")
                 lines.append(
-                    f"AI {ai_score}/100 | Demand {demand_score}/100 | Prezzo {price} | EOL {eol}"
+                    f"Score {composite}/100 | AI {ai_score}/100 | Quant {quant_score}/100 | Demand {demand_score}/100"
+                )
+                target_line = f"Target {int(months_to_target)} mesi" if months_to_target is not None else "Target n/d"
+                lines.append(
+                    f"Prob Upside 12m {prob_12m:.1f}% | ROI atteso 12m {roi_12m:+.1f}% | {target_line} | Conf {confidence_score}/100"
                 )
                 lines.append(f"Fonte: {source} | Segnale: {strength}")
                 lines.append(LegoHunterTelegramBot._format_pick_link(row))
@@ -422,9 +449,11 @@ class LegoHunterTelegramBot:
             f"Dedup: {int(diagnostics.get('dedup_candidates', 0))}"
         )
         lines.append(
-            f"Soglia AI: {int(diagnostics.get('threshold', 0))} | "
+            f"Soglia composita: {int(diagnostics.get('threshold', 0))} | "
             f"Sopra soglia: {int(diagnostics.get('above_threshold_count', 0))} | "
-            f"Max AI: {int(diagnostics.get('max_ai_score', 0))}"
+            f"Max AI: {int(diagnostics.get('max_ai_score', 0))} | "
+            f"Max Score: {int(diagnostics.get('max_composite_score', 0))} | "
+            f"Max Prob12m: {float(diagnostics.get('max_probability_upside_12m', 0.0)):.1f}%"
         )
 
         if diagnostics.get("fallback_source_used"):

@@ -25,6 +25,7 @@ try:
 except Exception:  # noqa: BLE001
     requests = None
 
+from forecast import ForecastInsight, InvestmentForecaster
 from models import LegoHunterRepository, MarketTimeSeriesRecord, OpportunityRadarRecord
 from scrapers import AmazonBestsellerScraper, LegoRetiringScraper, SecondaryMarketValidator
 
@@ -45,6 +46,7 @@ DEFAULT_AI_PROBE_BUDGET_SEC = 90.0
 DEFAULT_AI_PROBE_TIMEOUT_SEC = 12.0
 DEFAULT_AI_GENERATION_TIMEOUT_SEC = 20.0
 DEFAULT_OPENROUTER_MODELS_TIMEOUT_SEC = 15.0
+DEFAULT_HISTORY_WINDOW_DAYS = 180
 
 
 @dataclass
@@ -71,6 +73,37 @@ class DiscoveryOracle:
     ) -> None:
         self.repository = repository
         self.min_ai_score = min_ai_score
+        self.min_composite_score = self._safe_env_int(
+            "MIN_COMPOSITE_SCORE",
+            default=min_ai_score,
+            minimum=1,
+            maximum=100,
+        )
+        self.min_upside_probability = self._safe_env_float(
+            "MIN_UPSIDE_PROBABILITY",
+            default=0.60,
+            minimum=0.05,
+            maximum=0.99,
+        )
+        self.min_confidence_score = self._safe_env_int(
+            "MIN_CONFIDENCE_SCORE",
+            default=68,
+            minimum=1,
+            maximum=100,
+        )
+        self.history_window_days = self._safe_env_int(
+            "HISTORY_WINDOW_DAYS",
+            default=DEFAULT_HISTORY_WINDOW_DAYS,
+            minimum=30,
+            maximum=365,
+        )
+        self.target_roi_pct = self._safe_env_float(
+            "TARGET_ROI_PCT",
+            default=30.0,
+            minimum=5.0,
+            maximum=150.0,
+        )
+        self.forecaster = InvestmentForecaster(target_roi_pct=self.target_roi_pct)
         self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
         self.gemini_model = self._normalize_model_name(os.getenv("GEMINI_MODEL") or gemini_model)
         self.openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
@@ -201,6 +234,14 @@ class DiscoveryOracle:
             self.ai_probe_budget_sec,
             self.ai_probe_timeout_sec,
             self.ai_generation_timeout_sec,
+        )
+        LOGGER.info(
+            "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f",
+            self.min_composite_score,
+            self.min_upside_probability,
+            self.min_confidence_score,
+            self.history_window_days,
+            self.target_roi_pct,
         )
         LOGGER.info("Discovery source mode configured: %s", self.discovery_source_mode)
 
@@ -1197,10 +1238,21 @@ class DiscoveryOracle:
         )
         ranked = await self._rank_and_persist_candidates(source_candidates, persist=persist)
 
-        ranked.sort(key=lambda row: (row["ai_investment_score"], row["market_demand_score"]), reverse=True)
-        above_threshold = [row for row in ranked if row["ai_investment_score"] >= self.min_ai_score]
-        above_threshold_high_conf = [row for row in above_threshold if not row.get("ai_fallback_used")]
-        above_threshold_low_conf = [row for row in above_threshold if row.get("ai_fallback_used")]
+        ranked.sort(
+            key=lambda row: (
+                int(row.get("composite_score") or row.get("ai_investment_score") or 0),
+                int(row.get("forecast_score") or 0),
+                int(row.get("market_demand_score") or 0),
+            ),
+            reverse=True,
+        )
+        above_threshold = [
+            row
+            for row in ranked
+            if int(row.get("composite_score") or row.get("ai_investment_score") or 0) >= self.min_composite_score
+        ]
+        above_threshold_high_conf = [row for row in above_threshold if self._is_high_confidence_pick(row)]
+        above_threshold_low_conf = [row for row in above_threshold if not self._is_high_confidence_pick(row)]
 
         selected: list[Dict[str, Any]]
         fallback_used = False
@@ -1229,13 +1281,16 @@ class DiscoveryOracle:
                 {
                     **row,
                     "signal_strength": "LOW_CONFIDENCE",
-                    "risk_note": f"Nessun set sopra soglia {self.min_ai_score}.",
+                    "risk_note": f"Nessun set sopra soglia composita {self.min_composite_score}.",
                 }
                 for row in ranked[:fallback_limit]
             ]
 
         diagnostics = {
-            "threshold": self.min_ai_score,
+            "threshold": self.min_composite_score,
+            "ai_threshold": self.min_ai_score,
+            "min_probability_high_confidence": self.min_upside_probability,
+            "min_confidence_score_high_confidence": self.min_confidence_score,
             "source_strategy": source_diagnostics.get("source_strategy"),
             "source_order": source_diagnostics.get("source_order", []),
             "selected_source": source_diagnostics.get("selected_source"),
@@ -1250,7 +1305,23 @@ class DiscoveryOracle:
             "above_threshold_low_confidence_count": len(above_threshold_low_conf),
             "fallback_scored_count": sum(1 for row in ranked if row.get("ai_fallback_used")),
             "below_threshold_count": len(ranked) - len(above_threshold),
-            "max_ai_score": max((row["ai_investment_score"] for row in ranked), default=0),
+            "max_ai_score": max(
+                (
+                    int(
+                        row.get("ai_raw_score")
+                        or row.get("metadata", {}).get("ai_raw_score")
+                        or row.get("ai_investment_score")
+                        or 0
+                    )
+                    for row in ranked
+                ),
+                default=0,
+            ),
+            "max_composite_score": max((int(row.get("composite_score") or 0) for row in ranked), default=0),
+            "max_probability_upside_12m": max(
+                (float(row.get("forecast_probability_upside_12m") or 0.0) for row in ranked),
+                default=0.0,
+            ),
             "fallback_used": fallback_used,
             "fallback_source_used": source_diagnostics.get("fallback_source_used"),
             "fallback_notes": source_diagnostics.get("fallback_notes"),
@@ -1265,8 +1336,11 @@ class DiscoveryOracle:
                 {
                     "set_id": row.get("set_id"),
                     "source": row.get("source"),
-                    "ai": row.get("ai_investment_score"),
+                    "composite": row.get("composite_score"),
+                    "ai": row.get("ai_raw_score"),
+                    "quant": row.get("forecast_score"),
                     "demand": row.get("market_demand_score"),
+                    "prob12m": row.get("forecast_probability_upside_12m"),
                 }
                 for row in ranked[:3]
             ]
@@ -1274,11 +1348,14 @@ class DiscoveryOracle:
             top_debug = []
 
         LOGGER.info(
-            "Discovery summary | ranked=%s above_threshold=%s fallback_used=%s max_ai=%s ai=%s top=%s",
+            "Discovery summary | ranked=%s above_threshold=%s high_conf=%s fallback_used=%s max_ai=%s max_composite=%s max_prob=%.1f ai=%s top=%s",
             diagnostics["ranked_candidates"],
             diagnostics["above_threshold_count"],
+            diagnostics["above_threshold_high_confidence_count"],
             diagnostics["fallback_used"],
             diagnostics["max_ai_score"],
+            diagnostics["max_composite_score"],
+            diagnostics["max_probability_upside_12m"],
             diagnostics["ai_runtime"],
             top_debug,
         )
@@ -1305,18 +1382,53 @@ class DiscoveryOracle:
 
         ranked: list[Dict[str, Any]] = []
         opportunities: list[tuple[OpportunityRadarRecord, Dict[str, Any]]] = []
+        theme_baseline_cache: Dict[str, Dict[str, float]] = {}
         for candidate in source_candidates:
             ai = await self._get_ai_insight(candidate)
-            demand = self._estimate_market_demand(candidate, ai.score)
+            set_id = str(candidate.get("set_id") or "").strip()
+            theme = str(candidate.get("theme") or "Unknown")
+
+            try:
+                history = self.repository.get_recent_market_prices(set_id, days=self.history_window_days)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("History fetch failed for %s: %s", set_id, exc)
+                history = []
+
+            if theme in theme_baseline_cache:
+                theme_baseline = theme_baseline_cache[theme]
+            else:
+                try:
+                    theme_baseline = self.repository.get_theme_radar_baseline(
+                        theme,
+                        days=self.history_window_days,
+                        limit=120,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Theme baseline fetch failed for theme=%s: %s", theme, exc)
+                    theme_baseline = {}
+                theme_baseline_cache[theme] = theme_baseline
+
+            forecast = self.forecaster.forecast(
+                candidate=candidate,
+                history_rows=history,
+                theme_baseline=theme_baseline,
+            )
+            demand = self._estimate_market_demand(candidate, ai.score, forecast=forecast)
+            composite_score = self._calculate_composite_score(
+                ai_score=ai.score,
+                demand_score=demand,
+                forecast_score=forecast.forecast_score,
+                ai_fallback_used=bool(ai.fallback_used),
+            )
 
             opportunity = OpportunityRadarRecord(
-                set_id=candidate["set_id"],
+                set_id=set_id,
                 set_name=candidate["set_name"],
-                theme=candidate.get("theme"),
+                theme=theme,
                 source=candidate.get("source", "unknown"),
                 eol_date_prediction=ai.predicted_eol_date or candidate.get("eol_date_prediction"),
                 market_demand_score=demand,
-                ai_investment_score=ai.score,
+                ai_investment_score=composite_score,
                 ai_analysis_summary=ai.summary,
                 current_price=candidate.get("current_price"),
                 metadata={
@@ -1325,14 +1437,36 @@ class DiscoveryOracle:
                     "ai_fallback_used": bool(ai.fallback_used),
                     "ai_confidence": str(ai.confidence or "HIGH_CONFIDENCE"),
                     "ai_risk_note": ai.risk_note,
+                    "ai_raw_score": int(ai.score),
+                    "forecast_score": int(forecast.forecast_score),
+                    "forecast_probability_upside_12m": round(float(forecast.probability_upside_12m) * 100.0, 2),
+                    "expected_roi_12m_pct": round(float(forecast.expected_roi_12m_pct), 2),
+                    "forecast_interval_low_pct": round(float(forecast.interval_low_pct), 2),
+                    "forecast_interval_high_pct": round(float(forecast.interval_high_pct), 2),
+                    "forecast_confidence_score": int(forecast.confidence_score),
+                    "forecast_data_points": int(forecast.data_points),
+                    "forecast_target_roi_pct": round(float(forecast.target_roi_pct), 2),
+                    "forecast_estimated_months_to_target": forecast.estimated_months_to_target,
+                    "forecast_rationale": forecast.rationale,
+                    "composite_score": int(composite_score),
                 },
             )
 
             payload = opportunity.__dict__.copy()
             payload["market_demand_score"] = demand
-            payload["ai_investment_score"] = ai.score
+            payload["ai_investment_score"] = composite_score
+            payload["ai_raw_score"] = ai.score
+            payload["forecast_score"] = forecast.forecast_score
+            payload["forecast_probability_upside_12m"] = round(float(forecast.probability_upside_12m) * 100.0, 2)
+            payload["expected_roi_12m_pct"] = round(float(forecast.expected_roi_12m_pct), 2)
+            payload["forecast_interval_low_pct"] = round(float(forecast.interval_low_pct), 2)
+            payload["forecast_interval_high_pct"] = round(float(forecast.interval_high_pct), 2)
+            payload["confidence_score"] = int(forecast.confidence_score)
+            payload["estimated_months_to_target"] = forecast.estimated_months_to_target
+            payload["composite_score"] = composite_score
             payload["ai_fallback_used"] = bool(ai.fallback_used)
             payload["ai_confidence"] = str(ai.confidence or "HIGH_CONFIDENCE")
+            payload["forecast_rationale"] = forecast.rationale
             if ai.risk_note:
                 payload["risk_note"] = ai.risk_note
             ranked.append(payload)
@@ -1349,8 +1483,8 @@ class DiscoveryOracle:
                 LOGGER.warning(
                     "AI score collapse detected | candidates=%s spread=%s switching_model=%s rerank_attempt=%s",
                     len(ranked),
-                    max(int(row.get("ai_investment_score") or 0) for row in ranked)
-                    - min(int(row.get("ai_investment_score") or 0) for row in ranked),
+                    max(int(row.get("ai_raw_score") or 0) for row in ranked)
+                    - min(int(row.get("ai_raw_score") or 0) for row in ranked),
                     self.ai_runtime.get("model"),
                     rerank_attempt + 1,
                 )
@@ -1396,7 +1530,7 @@ class DiscoveryOracle:
         if len(ranked) < 6:
             return False
 
-        scores = [int(row.get("ai_investment_score") or 0) for row in ranked]
+        scores = [int(row.get("ai_raw_score") or row.get("ai_investment_score") or 0) for row in ranked]
         spread = max(scores) - min(scores)
         if spread > 8:
             return False
@@ -2157,7 +2291,49 @@ class DiscoveryOracle:
             risk_note="Ranking calcolato con fallback euristico (risposta AI non valida o non disponibile).",
         )
 
-    def _estimate_market_demand(self, candidate: Dict[str, Any], ai_score: int) -> int:
+    def _calculate_composite_score(
+        self,
+        *,
+        ai_score: int,
+        demand_score: int,
+        forecast_score: int,
+        ai_fallback_used: bool,
+    ) -> int:
+        if ai_fallback_used:
+            ai_weight = 0.15
+            demand_weight = 0.25
+            quant_weight = 0.60
+        else:
+            ai_weight = 0.42
+            demand_weight = 0.23
+            quant_weight = 0.35
+
+        composite = (
+            ai_weight * float(ai_score)
+            + demand_weight * float(demand_score)
+            + quant_weight * float(forecast_score)
+        )
+        return max(1, min(100, int(round(composite))))
+
+    def _is_high_confidence_pick(self, row: Dict[str, Any]) -> bool:
+        if row.get("ai_fallback_used"):
+            return False
+        probability_pct = float(row.get("forecast_probability_upside_12m") or 0.0)
+        confidence_score = int(row.get("confidence_score") or 0)
+        composite_score = int(row.get("composite_score") or row.get("ai_investment_score") or 0)
+        return (
+            composite_score >= self.min_composite_score
+            and probability_pct >= (self.min_upside_probability * 100.0)
+            and confidence_score >= self.min_confidence_score
+        )
+
+    def _estimate_market_demand(
+        self,
+        candidate: Dict[str, Any],
+        ai_score: int,
+        *,
+        forecast: Optional[ForecastInsight] = None,
+    ) -> int:
         set_id = str(candidate.get("set_id") or "")
         if not set_id:
             return max(1, min(100, ai_score))
@@ -2170,7 +2346,16 @@ class DiscoveryOracle:
         liquidity_factor = min(35, len(recent) * 3)
         source = str(candidate.get("source") or "")
         source_bonus = 20 if source in {"lego_retiring", "lego_proxy_reader", "lego_http_fallback"} else 8
-        final_score = int((ai_score * 0.65) + liquidity_factor + source_bonus)
+        quant_bonus = 0
+        if forecast is not None:
+            quant_bonus = int(
+                min(
+                    16,
+                    (forecast.forecast_score * 0.10)
+                    + (forecast.probability_upside_12m * 8.0),
+                )
+            )
+        final_score = int((ai_score * 0.55) + liquidity_factor + source_bonus + quant_bonus)
         return max(1, min(100, final_score))
 
     @staticmethod
