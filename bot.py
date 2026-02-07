@@ -414,11 +414,22 @@ async def run_scheduled_cycle(
     fiscal_guardian: FiscalGuardian,
 ) -> None:
     bot = Bot(token=token)
+    LOGGER.info("Scheduled cycle started | chat_id_set=%s", bool(chat_id))
     try:
         report = await oracle.discover_with_diagnostics(
             persist=True,
             top_limit=12,
             fallback_limit=3,
+        )
+        diagnostics = report.get("diagnostics") or {}
+        LOGGER.info(
+            "Scheduled discovery diagnostics | raw=%s dedup=%s ranked=%s above_threshold=%s fallback=%s anti_bot=%s",
+            diagnostics.get("source_raw_counts"),
+            diagnostics.get("dedup_candidates"),
+            diagnostics.get("ranked_candidates"),
+            diagnostics.get("above_threshold_count"),
+            diagnostics.get("fallback_used"),
+            diagnostics.get("anti_bot_alert"),
         )
         lines = [
             "<b>🧱 LEGO HUNTER</b> <i>Update automatico (ogni 6h)</i>",
@@ -437,19 +448,37 @@ async def run_scheduled_cycle(
         holdings = repository.get_portfolio("holding")
         lines.append(f"📦 Set in collezione: <b>{len(holdings)}</b>")
 
+        payload = "\n".join(lines)
+        LOGGER.info(
+            "Sending scheduled Telegram report | lines=%s chars=%s holdings=%s",
+            len(lines),
+            len(payload),
+            len(holdings),
+        )
         await bot.send_message(
             chat_id=chat_id,
-            text="\n".join(lines),
+            text=payload,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
+        LOGGER.info("Scheduled Telegram report sent successfully")
+    except RetryAfter as exc:
+        LOGGER.error("Telegram flood-control while sending scheduled report: %s", exc)
+        raise
+    except TelegramError as exc:
+        LOGGER.exception("Telegram error during scheduled report")
+        raise
+    except Exception:
+        LOGGER.exception("Scheduled cycle failed")
+        raise
     finally:
         try:
             await bot.close()
         except RetryAfter as exc:
-            LOGGER.warning("Telegram flood-control on bot.close(): %s", exc)
+            LOGGER.warning("Telegram flood-control on bot.close() (non-fatal): %s", exc)
         except TelegramError as exc:
-            LOGGER.warning("Telegram error on bot.close(): %s", exc)
+            LOGGER.warning("Telegram error on bot.close() (non-fatal): %s", exc)
+        LOGGER.info("Scheduled cycle finished")
 
 
 def parse_args() -> argparse.Namespace:
@@ -465,6 +494,7 @@ def parse_args() -> argparse.Namespace:
 
 async def main_async() -> None:
     args = parse_args()
+    LOGGER.info("Application start | mode=%s", args.mode)
 
     telegram_token = os.getenv("TELEGRAM_TOKEN")
     if not telegram_token:

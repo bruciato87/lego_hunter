@@ -89,8 +89,22 @@ class DiscoveryOracle:
         fallback_limit: int = 3,
     ) -> Dict[str, Any]:
         """Run discovery and return picks plus execution diagnostics."""
+        LOGGER.info(
+            "Discovery start | persist=%s top_limit=%s fallback_limit=%s threshold=%s",
+            persist,
+            top_limit,
+            fallback_limit,
+            self.min_ai_score,
+        )
         source_candidates = await self._collect_source_candidates()
         source_diagnostics = self._last_source_diagnostics
+        LOGGER.info(
+            "Discovery sources | raw=%s dedup=%s failures=%s anti_bot=%s",
+            source_diagnostics.get("source_raw_counts"),
+            source_diagnostics.get("dedup_candidates"),
+            len(source_diagnostics.get("source_failures") or []),
+            source_diagnostics.get("anti_bot_alert"),
+        )
         ranked = await self._rank_and_persist_candidates(source_candidates, persist=persist)
 
         ranked.sort(key=lambda row: (row["ai_investment_score"], row["market_demand_score"]), reverse=True)
@@ -133,6 +147,30 @@ class DiscoveryOracle:
             "anti_bot_message": source_diagnostics["anti_bot_message"],
         }
 
+        if ranked:
+            top_debug = [
+                {
+                    "set_id": row.get("set_id"),
+                    "source": row.get("source"),
+                    "ai": row.get("ai_investment_score"),
+                    "demand": row.get("market_demand_score"),
+                }
+                for row in ranked[:3]
+            ]
+        else:
+            top_debug = []
+
+        LOGGER.info(
+            "Discovery summary | ranked=%s above_threshold=%s fallback_used=%s max_ai=%s top=%s",
+            diagnostics["ranked_candidates"],
+            diagnostics["above_threshold_count"],
+            diagnostics["fallback_used"],
+            diagnostics["max_ai_score"],
+            top_debug,
+        )
+        if diagnostics["anti_bot_alert"]:
+            LOGGER.warning("Discovery anti-bot alert | message=%s", diagnostics["anti_bot_message"])
+
         return {
             "selected": selected,
             "above_threshold": above_threshold[:top_limit],
@@ -147,9 +185,12 @@ class DiscoveryOracle:
         persist: bool,
     ) -> list[Dict[str, Any]]:
         if not source_candidates:
+            LOGGER.info("Ranking skipped | no source candidates available")
             return []
 
         ranked: list[Dict[str, Any]] = []
+        persisted_opportunities = 0
+        persisted_snapshots = 0
         for candidate in source_candidates:
             ai = await self._get_ai_insight(candidate)
             demand = self._estimate_market_demand(candidate, ai.score)
@@ -180,6 +221,7 @@ class DiscoveryOracle:
 
             try:
                 self.repository.upsert_opportunity(opportunity)
+                persisted_opportunities += 1
                 if candidate.get("current_price") is not None:
                     self.repository.insert_market_snapshot(
                         MarketTimeSeriesRecord(
@@ -193,8 +235,15 @@ class DiscoveryOracle:
                             raw_payload=candidate,
                         )
                     )
+                    persisted_snapshots += 1
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Failed to persist opportunity %s: %s", candidate.get("set_id"), exc)
+        LOGGER.info(
+            "Ranking completed | candidates=%s persisted_opportunities=%s persisted_snapshots=%s",
+            len(source_candidates),
+            persisted_opportunities,
+            persisted_snapshots,
+        )
         return ranked
 
     async def validate_secondary_deals(self, opportunities: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
@@ -324,6 +373,13 @@ class DiscoveryOracle:
             "anti_bot_alert": anti_bot_alert,
             "anti_bot_message": anti_bot_message,
         }
+        LOGGER.info(
+            "Source collection completed | raw=%s dedup_counts=%s dedup_total=%s failures=%s",
+            source_raw_counts,
+            source_dedup_counts,
+            len(dedup_values),
+            source_failures,
+        )
         return dedup_values, diagnostics
 
     async def _get_ai_insight(self, candidate: Dict[str, Any]) -> AIInsight:
