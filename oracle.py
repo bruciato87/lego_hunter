@@ -149,6 +149,9 @@ class DiscoveryOracle:
                     )
                 return
             LOGGER.warning("Gemini model probe failed | model=%s reason=%s", model_name, reason)
+            if self._is_global_quota_exhausted(reason):
+                self._disable_gemini("fallback_quota_exhausted", reason)
+                return
 
         self._disable_gemini(
             "fallback_no_working_model",
@@ -169,6 +172,18 @@ class DiscoveryOracle:
             raw_name = getattr(model, "name", None)
             normalized = self._normalize_model_name(raw_name)
             if not normalized.startswith("models/gemini"):
+                continue
+            lowered_name = normalized.lower()
+            if any(
+                token in lowered_name
+                for token in (
+                    "image",
+                    "tts",
+                    "transcribe",
+                    "speech",
+                    "audio",
+                )
+            ):
                 continue
             methods = [str(item).lower() for item in (getattr(model, "supported_generation_methods", None) or [])]
             if "generatecontent" not in methods:
@@ -247,15 +262,13 @@ class DiscoveryOracle:
             return False, "google-generativeai unavailable"
         try:
             model = genai.GenerativeModel(model_name)
-            response = model.generate_content(
-                '{"ping":"pong"}',
+            model.generate_content(
+                "Rispondi con una sola parola: ok",
                 generation_config={
                     "temperature": 0.0,
                     "max_output_tokens": 16,
-                    "response_mime_type": "application/json",
                 },
             )
-            _ = getattr(response, "text", None)
             return True, "ok"
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)
@@ -340,6 +353,14 @@ class DiscoveryOracle:
                 "rate limit",
                 "429",
             )
+        )
+
+    @staticmethod
+    def _is_global_quota_exhausted(reason: str) -> bool:
+        lowered = str(reason or "").lower()
+        return (
+            ("quota exceeded" in lowered or "resource exhausted" in lowered)
+            and "limit: 0" in lowered
         )
 
     async def discover_opportunities(

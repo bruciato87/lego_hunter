@@ -280,6 +280,18 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
             DiscoveryOracle._should_rotate_gemini_model(Exception("invalid json response"))
         )
 
+    def test_detect_global_quota_exhausted(self) -> None:
+        self.assertTrue(
+            DiscoveryOracle._is_global_quota_exhausted(
+                "Quota exceeded for metric ... limit: 0, model: gemini-2.0-flash"
+            )
+        )
+        self.assertFalse(
+            DiscoveryOracle._is_global_quota_exhausted(
+                "Quota exceeded for metric ... limit: 50, model: gemini-2.0-flash"
+            )
+        )
+
     def test_extract_json_from_wrapped_text(self) -> None:
         raw = "Risposta:\n{\"score\": 77, \"summary\": \"ok\"}\nfine"
         payload = DiscoveryOracle._extract_json(raw)
