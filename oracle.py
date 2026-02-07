@@ -11,7 +11,7 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional
 from urllib.parse import urljoin
 
@@ -47,6 +47,10 @@ DEFAULT_AI_PROBE_BUDGET_SEC = 90.0
 DEFAULT_AI_PROBE_TIMEOUT_SEC = 12.0
 DEFAULT_AI_GENERATION_TIMEOUT_SEC = 20.0
 DEFAULT_OPENROUTER_MODELS_TIMEOUT_SEC = 15.0
+DEFAULT_AI_SCORING_CONCURRENCY = 4
+DEFAULT_AI_RANK_MAX_CANDIDATES = 12
+DEFAULT_AI_CACHE_TTL_SEC = 10800.0
+DEFAULT_AI_CACHE_MAX_ITEMS = 4000
 DEFAULT_HISTORY_WINDOW_DAYS = 180
 DEFAULT_BACKTEST_LOOKBACK_DAYS = 365
 DEFAULT_BACKTEST_HORIZON_DAYS = 180
@@ -185,6 +189,30 @@ class DiscoveryOracle:
             minimum=5.0,
             maximum=90.0,
         )
+        self.ai_scoring_concurrency = self._safe_env_int(
+            "AI_SCORING_CONCURRENCY",
+            default=DEFAULT_AI_SCORING_CONCURRENCY,
+            minimum=1,
+            maximum=12,
+        )
+        self.ai_rank_max_candidates = self._safe_env_int(
+            "AI_RANK_MAX_CANDIDATES",
+            default=DEFAULT_AI_RANK_MAX_CANDIDATES,
+            minimum=3,
+            maximum=120,
+        )
+        self.ai_cache_ttl_sec = self._safe_env_float(
+            "AI_INSIGHT_CACHE_TTL_SEC",
+            default=DEFAULT_AI_CACHE_TTL_SEC,
+            minimum=0.0,
+            maximum=86400.0,
+        )
+        self.ai_cache_max_items = self._safe_env_int(
+            "AI_INSIGHT_CACHE_MAX_ITEMS",
+            default=DEFAULT_AI_CACHE_MAX_ITEMS,
+            minimum=100,
+            maximum=20000,
+        )
         requested_mode = (os.getenv("DISCOVERY_SOURCE_MODE") or DEFAULT_DISCOVERY_SOURCE_MODE).strip().lower()
         if requested_mode not in DISCOVERY_SOURCE_MODES:
             LOGGER.warning(
@@ -206,6 +234,9 @@ class DiscoveryOracle:
         self._openrouter_probe_report: list[Dict[str, Any]] = []
         self._openrouter_candidate_index: Optional[int] = None
         self._openrouter_inventory_loaded = False
+        self._ai_insight_cache: Dict[str, tuple[float, AIInsight]] = {}
+        self._ai_failover_lock: Optional[asyncio.Lock] = None
+        self._last_ranking_diagnostics: Dict[str, Any] = {}
         self.ai_runtime = {
             "engine": "heuristic",
             "model": "heuristic-ai-v2",
@@ -272,6 +303,13 @@ class DiscoveryOracle:
             self.ai_probe_budget_sec,
             self.ai_probe_timeout_sec,
             self.ai_generation_timeout_sec,
+        )
+        LOGGER.info(
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s",
+            self.ai_scoring_concurrency,
+            self.ai_rank_max_candidates,
+            self.ai_cache_ttl_sec,
+            self.ai_cache_max_items,
         )
         LOGGER.info(
             "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f",
@@ -1130,6 +1168,18 @@ class DiscoveryOracle:
             }
         LOGGER.warning("OpenRouter disabled | mode=%s reason=%s", mode, reason)
 
+    async def _advance_gemini_model_locked(self, *, reason: str) -> bool:
+        if self._ai_failover_lock is None:
+            self._ai_failover_lock = asyncio.Lock()
+        async with self._ai_failover_lock:
+            return self._advance_gemini_model(reason=reason)
+
+    async def _advance_openrouter_model_locked(self, *, reason: str) -> bool:
+        if self._ai_failover_lock is None:
+            self._ai_failover_lock = asyncio.Lock()
+        async with self._ai_failover_lock:
+            return self._advance_openrouter_model(reason=reason)
+
     @staticmethod
     def _should_rotate_openrouter_model(exc: Exception) -> bool:
         text = str(exc).lower()
@@ -1145,6 +1195,25 @@ class DiscoveryOracle:
                 "permission",
                 "401",
                 "403",
+                "missing choices",
+                "missing message",
+                "missing text content",
+                "invalid response payload",
+                "invalid json payload",
+            )
+        )
+
+    @staticmethod
+    def _is_openrouter_malformed_response_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(
+            token in text
+            for token in (
+                "missing choices",
+                "missing message",
+                "missing text content",
+                "invalid response payload",
+                "invalid json payload",
             )
         )
 
@@ -1187,40 +1256,98 @@ class DiscoveryOracle:
         )
         if response.status_code >= 400:
             raise RuntimeError(f"OpenRouter error {response.status_code}: {response.text[:260]}")
-        data = response.json()
+        try:
+            data = response.json()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"OpenRouter invalid JSON payload: {response.text[:180]}") from exc
         if not isinstance(data, dict):
             raise RuntimeError("OpenRouter invalid response payload")
+        error_payload = data.get("error")
+        if isinstance(error_payload, dict):
+            err_message = str(error_payload.get("message") or "unknown_error")
+            err_code = error_payload.get("code")
+            raise RuntimeError(f"OpenRouter payload error {err_code}: {err_message[:220]}")
         return data
 
     def _openrouter_generate(self, prompt: str) -> str:
         if not self._openrouter_model_id:
             return "{}"
 
-        data = self._openrouter_chat_completion(
-            model_id=self._openrouter_model_id,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=220,
-            temperature=0.2,
-        )
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            data = self._openrouter_chat_completion(
+                model_id=self._openrouter_model_id,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=220,
+                temperature=0.2,
+            )
+            try:
+                return self._extract_openrouter_text(data)
+            except RuntimeError as exc:
+                if self._is_openrouter_malformed_response_error(exc) and attempt < max_attempts:
+                    delay = 0.45 * attempt
+                    LOGGER.warning(
+                        "OpenRouter malformed response | model=%s attempt=%s/%s retry_in=%.2fs reason=%s",
+                        self._openrouter_model_id,
+                        attempt,
+                        max_attempts,
+                        delay,
+                        exc,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+        raise RuntimeError("OpenRouter response missing text content")
+
+    @staticmethod
+    def _extract_openrouter_text(data: Dict[str, Any]) -> str:
         choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise RuntimeError("OpenRouter response missing choices")
-        message = choices[0].get("message") if isinstance(choices[0], dict) else None
-        if not isinstance(message, dict):
-            raise RuntimeError("OpenRouter response missing message")
-        content = message.get("content")
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if isinstance(first, dict):
+                message = first.get("message")
+                if isinstance(message, dict):
+                    content = message.get("content")
+                    if isinstance(content, str) and content.strip():
+                        return content.strip()
+                    if isinstance(content, list):
+                        chunks: list[str] = []
+                        for part in content:
+                            if isinstance(part, dict):
+                                txt = part.get("text")
+                                if txt:
+                                    chunks.append(str(txt))
+                        if chunks:
+                            return " ".join(chunks).strip()
+                    raise RuntimeError("OpenRouter response missing text content")
+
+                text_value = first.get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    return text_value.strip()
+                raise RuntimeError("OpenRouter response missing message")
+
+        output_text = data.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+        output = data.get("output")
+        if isinstance(output, list):
             chunks: list[str] = []
-            for part in content:
+            for part in output:
                 if isinstance(part, dict):
-                    txt = part.get("text")
-                    if txt:
-                        chunks.append(str(txt))
+                    content = part.get("content")
+                    if isinstance(content, list):
+                        for chunk in content:
+                            if isinstance(chunk, dict):
+                                txt = chunk.get("text")
+                                if txt:
+                                    chunks.append(str(txt))
+                elif isinstance(part, str) and part.strip():
+                    chunks.append(part.strip())
             if chunks:
                 return " ".join(chunks).strip()
-        raise RuntimeError("OpenRouter response missing text content")
+
+        raise RuntimeError("OpenRouter response missing choices")
 
     @staticmethod
     def _should_rotate_gemini_model(exc: Exception) -> bool:
@@ -1467,6 +1594,7 @@ class DiscoveryOracle:
             "root_cause_hint": source_diagnostics.get("root_cause_hint"),
             "ai_runtime": self._ai_runtime_public(self.ai_runtime),
             "backtest_runtime": self._backtest_runtime_public(self.backtest_runtime),
+            "ranking": dict(self._last_ranking_diagnostics or {}),
         }
 
         if ranked:
@@ -1486,7 +1614,7 @@ class DiscoveryOracle:
             top_debug = []
 
         LOGGER.info(
-            "Discovery summary | ranked=%s above_threshold=%s high_conf=%s fallback_used=%s max_ai=%s max_composite=%s max_prob=%.1f profile=%s ai=%s top=%s",
+            "Discovery summary | ranked=%s above_threshold=%s high_conf=%s fallback_used=%s max_ai=%s max_composite=%s max_prob=%.1f profile=%s ai=%s ranking=%s top=%s",
             diagnostics["ranked_candidates"],
             diagnostics["above_threshold_count"],
             diagnostics["above_threshold_high_confidence_count"],
@@ -1496,6 +1624,7 @@ class DiscoveryOracle:
             diagnostics["max_probability_upside_12m"],
             diagnostics["threshold_profile"],
             diagnostics["ai_runtime"],
+            diagnostics["ranking"],
             top_debug,
         )
         if diagnostics["anti_bot_alert"]:
@@ -1517,42 +1646,65 @@ class DiscoveryOracle:
     ) -> list[Dict[str, Any]]:
         if not source_candidates:
             LOGGER.info("Ranking skipped | no source candidates available")
+            self._last_ranking_diagnostics = {
+                "input_candidates": 0,
+                "prepared_candidates": 0,
+                "ai_shortlist_count": 0,
+                "ai_prefilter_skipped_count": 0,
+                "ai_scored_count": 0,
+                "ai_cache_hits": 0,
+                "ai_cache_misses": 0,
+                "ai_errors": 0,
+                "quant_prep_sec": 0.0,
+                "ai_scoring_sec": 0.0,
+                "persistence_sec": 0.0,
+                "total_sec": 0.0,
+            }
             return []
+
+        started = time.monotonic()
+        prep_started = time.monotonic()
+        prepared = self._prepare_quantitative_context(source_candidates)
+        prep_duration = time.monotonic() - prep_started
+        shortlist, skipped = self._select_ai_shortlist(prepared)
+        skipped_set_ids = {row["set_id"]: row for row in skipped}
+
+        ai_started = time.monotonic()
+        ai_results, ai_stats = await self._score_ai_shortlist(shortlist)
+        ai_duration = time.monotonic() - ai_started
 
         ranked: list[Dict[str, Any]] = []
         opportunities: list[tuple[OpportunityRadarRecord, Dict[str, Any]]] = []
-        theme_baseline_cache: Dict[str, Dict[str, float]] = {}
-        for candidate in source_candidates:
-            ai = await self._get_ai_insight(candidate)
-            set_id = str(candidate.get("set_id") or "").strip()
-            theme = str(candidate.get("theme") or "Unknown")
+        for row in prepared:
+            candidate = row["candidate"]
+            set_id = row["set_id"]
+            theme = row["theme"]
+            forecast = row["forecast"]
+            history_30 = row["history_30"]
 
-            try:
-                history = self.repository.get_recent_market_prices(set_id, days=self.history_window_days)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("History fetch failed for %s: %s", set_id, exc)
-                history = []
-
-            if theme in theme_baseline_cache:
-                theme_baseline = theme_baseline_cache[theme]
-            else:
-                try:
-                    theme_baseline = self.repository.get_theme_radar_baseline(
-                        theme,
-                        days=self.history_window_days,
-                        limit=120,
+            ai = ai_results.get(set_id)
+            if ai is None:
+                ai = self._heuristic_ai_fallback(candidate)
+                if set_id in skipped_set_ids:
+                    pre_rank = int(skipped_set_ids[set_id].get("prefilter_rank") or 0)
+                    ai = AIInsight(
+                        score=ai.score,
+                        summary=(
+                            "AI scoring saltato per ottimizzazione costi/latency; "
+                            "set fuori shortlist quantitativa del ciclo."
+                        ),
+                        predicted_eol_date=ai.predicted_eol_date or candidate.get("eol_date_prediction"),
+                        fallback_used=True,
+                        confidence="LOW_CONFIDENCE",
+                        risk_note=f"AI non eseguita: pre-filter rank #{pre_rank} oltre top {len(shortlist)}.",
                     )
-                except Exception as exc:  # noqa: BLE001
-                    LOGGER.warning("Theme baseline fetch failed for theme=%s: %s", theme, exc)
-                    theme_baseline = {}
-                theme_baseline_cache[theme] = theme_baseline
 
-            forecast = self.forecaster.forecast(
-                candidate=candidate,
-                history_rows=history,
-                theme_baseline=theme_baseline,
+            demand = self._estimate_market_demand(
+                candidate,
+                ai.score,
+                forecast=forecast,
+                recent_prices=history_30,
             )
-            demand = self._estimate_market_demand(candidate, ai.score, forecast=forecast)
             composite_score = self._calculate_composite_score(
                 ai_score=ai.score,
                 demand_score=demand,
@@ -1588,6 +1740,9 @@ class DiscoveryOracle:
                     "forecast_estimated_months_to_target": forecast.estimated_months_to_target,
                     "forecast_rationale": forecast.rationale,
                     "composite_score": int(composite_score),
+                    "prefilter_score": int(row.get("prefilter_score") or 0),
+                    "prefilter_rank": int(row.get("prefilter_rank") or 0),
+                    "ai_shortlisted": bool(row.get("ai_shortlisted")),
                 },
             )
 
@@ -1606,6 +1761,9 @@ class DiscoveryOracle:
             payload["ai_fallback_used"] = bool(ai.fallback_used)
             payload["ai_confidence"] = str(ai.confidence or "HIGH_CONFIDENCE")
             payload["forecast_rationale"] = forecast.rationale
+            payload["prefilter_score"] = int(row.get("prefilter_score") or 0)
+            payload["prefilter_rank"] = int(row.get("prefilter_rank") or 0)
+            payload["ai_shortlisted"] = bool(row.get("ai_shortlisted"))
             if ai.risk_note:
                 payload["risk_note"] = ai.risk_note
             ranked.append(payload)
@@ -1633,6 +1791,7 @@ class DiscoveryOracle:
                     rerank_attempt=rerank_attempt + 1,
                 )
 
+        persist_started = time.monotonic()
         persisted_opportunities = 0
         persisted_snapshots = 0
         if persist:
@@ -1656,13 +1815,317 @@ class DiscoveryOracle:
                         persisted_snapshots += 1
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.warning("Failed to persist opportunity %s: %s", candidate.get("set_id"), exc)
+        persist_duration = time.monotonic() - persist_started
+        total_duration = time.monotonic() - started
+        self._last_ranking_diagnostics = {
+            "input_candidates": len(source_candidates),
+            "prepared_candidates": len(prepared),
+            "ai_shortlist_count": len(shortlist),
+            "ai_prefilter_skipped_count": len(skipped),
+            "ai_scored_count": int(ai_stats.get("ai_scored_count", 0)),
+            "ai_cache_hits": int(ai_stats.get("ai_cache_hits", 0)),
+            "ai_cache_misses": int(ai_stats.get("ai_cache_misses", 0)),
+            "ai_errors": int(ai_stats.get("ai_errors", 0)),
+            "quant_prep_sec": round(prep_duration, 2),
+            "ai_scoring_sec": round(ai_duration, 2),
+            "persistence_sec": round(persist_duration, 2),
+            "total_sec": round(total_duration, 2),
+        }
         LOGGER.info(
-            "Ranking completed | candidates=%s persisted_opportunities=%s persisted_snapshots=%s",
+            "Ranking completed | candidates=%s shortlisted=%s ai_scored=%s cache_hits=%s persisted_opportunities=%s persisted_snapshots=%s durations={prep:%.2fs ai:%.2fs persist:%.2fs total:%.2fs}",
             len(source_candidates),
+            len(shortlist),
+            self._last_ranking_diagnostics["ai_scored_count"],
+            self._last_ranking_diagnostics["ai_cache_hits"],
             persisted_opportunities,
             persisted_snapshots,
+            prep_duration,
+            ai_duration,
+            persist_duration,
+            total_duration,
         )
         return ranked
+
+    def _prepare_quantitative_context(self, source_candidates: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        set_ids = [str(row.get("set_id") or "").strip() for row in source_candidates if str(row.get("set_id") or "").strip()]
+        history_by_set = self._load_history_by_set(set_ids)
+        theme_baseline_cache: Dict[str, Dict[str, float]] = {}
+        prepared: list[Dict[str, Any]] = []
+
+        for candidate in source_candidates:
+            set_id = str(candidate.get("set_id") or "").strip()
+            theme = str(candidate.get("theme") or "Unknown")
+            history = history_by_set.get(set_id, [])
+            history_30 = self._recent_rows_within_days(history, days=30)
+
+            if theme in theme_baseline_cache:
+                theme_baseline = theme_baseline_cache[theme]
+            else:
+                try:
+                    theme_baseline = self.repository.get_theme_radar_baseline(
+                        theme,
+                        days=self.history_window_days,
+                        limit=120,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Theme baseline fetch failed for theme=%s: %s", theme, exc)
+                    theme_baseline = {}
+                theme_baseline_cache[theme] = theme_baseline
+
+            try:
+                forecast = self.forecaster.forecast(
+                    candidate=candidate,
+                    history_rows=history,
+                    theme_baseline=theme_baseline,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Forecast failed for set_id=%s: %s", set_id, exc)
+                forecast = ForecastInsight(
+                    forecast_score=22,
+                    probability_upside_12m=0.22,
+                    expected_roi_12m_pct=0.0,
+                    interval_low_pct=-18.0,
+                    interval_high_pct=24.0,
+                    target_roi_pct=float(self.target_roi_pct),
+                    estimated_months_to_target=None,
+                    confidence_score=28,
+                    data_points=len(history),
+                    rationale="Fallback forecast per errore calcolo.",
+                )
+
+            prefilter_score = self._calculate_prefilter_score(
+                candidate=candidate,
+                forecast=forecast,
+                recent_rows=history_30,
+            )
+            prepared.append(
+                {
+                    "candidate": candidate,
+                    "set_id": set_id,
+                    "theme": theme,
+                    "forecast": forecast,
+                    "history_30": history_30,
+                    "prefilter_score": prefilter_score,
+                    "prefilter_rank": 0,
+                    "ai_shortlisted": False,
+                }
+            )
+
+        prepared.sort(
+            key=lambda row: (
+                int(row.get("prefilter_score") or 0),
+                int(row["forecast"].forecast_score),
+                int(self._source_priority(row["candidate"].get("source"))),
+            ),
+            reverse=True,
+        )
+        for idx, row in enumerate(prepared, start=1):
+            row["prefilter_rank"] = idx
+        return prepared
+
+    def _select_ai_shortlist(self, prepared: list[Dict[str, Any]]) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
+        if not prepared:
+            return [], []
+
+        shortlist_count = min(len(prepared), max(1, self.ai_rank_max_candidates))
+        shortlist = prepared[:shortlist_count]
+        skipped = prepared[shortlist_count:]
+        for row in shortlist:
+            row["ai_shortlisted"] = True
+        return shortlist, skipped
+
+    def _calculate_prefilter_score(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        forecast: ForecastInsight,
+        recent_rows: list[Dict[str, Any]],
+    ) -> int:
+        source_component = float(min(100, max(1, self._source_priority(candidate.get("source")))))
+        confidence_component = float(max(1, min(100, int(forecast.confidence_score))))
+        forecast_component = float(max(1, min(100, int(forecast.forecast_score))))
+        liquidity_component = float(min(100, len(recent_rows) * 5))
+        price = float(candidate.get("current_price") or 0.0)
+        price_band_bonus = 10.0 if 20.0 <= price <= 250.0 else 2.0
+
+        score = (
+            0.58 * forecast_component
+            + 0.22 * confidence_component
+            + 0.12 * source_component
+            + 0.08 * min(100.0, liquidity_component + price_band_bonus)
+        )
+        return max(1, min(100, int(round(score))))
+
+    async def _score_ai_shortlist(
+        self,
+        shortlist: list[Dict[str, Any]],
+    ) -> tuple[Dict[str, AIInsight], Dict[str, int]]:
+        stats = {
+            "ai_scored_count": 0,
+            "ai_cache_hits": 0,
+            "ai_cache_misses": 0,
+            "ai_errors": 0,
+        }
+        if not shortlist:
+            return {}, stats
+
+        semaphore = asyncio.Semaphore(max(1, self.ai_scoring_concurrency))
+        results: Dict[str, AIInsight] = {}
+
+        async def worker(entry: Dict[str, Any]) -> tuple[str, AIInsight, bool, Optional[Exception]]:
+            candidate = entry["candidate"]
+            set_id = entry["set_id"]
+            cached = self._get_cached_ai_insight(candidate)
+            if cached is not None:
+                return set_id, cached, True, None
+
+            async with semaphore:
+                try:
+                    ai = await self._get_ai_insight(candidate)
+                    return set_id, ai, False, None
+                except Exception as exc:  # noqa: BLE001
+                    return set_id, self._heuristic_ai_fallback(candidate), False, exc
+
+        tasks = [asyncio.create_task(worker(entry)) for entry in shortlist]
+        for entry, task in zip(shortlist, tasks):
+            set_id = entry["set_id"]
+            try:
+                result_set_id, ai, from_cache, err = await task
+            except Exception as exc:  # noqa: BLE001
+                result_set_id = set_id
+                ai = self._heuristic_ai_fallback(entry["candidate"])
+                from_cache = False
+                err = exc
+
+            if from_cache:
+                stats["ai_cache_hits"] += 1
+            else:
+                stats["ai_cache_misses"] += 1
+                if not ai.fallback_used:
+                    stats["ai_scored_count"] += 1
+                    self._set_cached_ai_insight(entry["candidate"], ai)
+
+            if err is not None:
+                stats["ai_errors"] += 1
+                LOGGER.warning("AI scoring worker failed | set_id=%s error=%s", result_set_id, err)
+            results[result_set_id] = ai
+        return results, stats
+
+    def _load_history_by_set(self, set_ids: list[str]) -> Dict[str, list[Dict[str, Any]]]:
+        grouped: Dict[str, list[Dict[str, Any]]] = {set_id: [] for set_id in set_ids}
+        if not set_ids:
+            return grouped
+
+        try:
+            rows = self.repository.get_market_history_for_sets(
+                set_ids,
+                days=self.history_window_days,
+            )
+            for row in rows:
+                row_set_id = str(row.get("set_id") or "").strip()
+                if not row_set_id:
+                    continue
+                grouped.setdefault(row_set_id, []).append(row)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Batch history fetch failed: %s", exc)
+
+        missing = [set_id for set_id in set_ids if not grouped.get(set_id)]
+        for set_id in missing:
+            try:
+                grouped[set_id] = self.repository.get_recent_market_prices(
+                    set_id,
+                    days=self.history_window_days,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("History fetch failed for %s: %s", set_id, exc)
+                grouped[set_id] = []
+        return grouped
+
+    @staticmethod
+    def _recent_rows_within_days(rows: list[Dict[str, Any]], *, days: int) -> list[Dict[str, Any]]:
+        if not rows:
+            return []
+        now_utc = datetime.now(timezone.utc)
+        limit_sec = float(days) * 24.0 * 60.0 * 60.0
+        kept: list[Dict[str, Any]] = []
+        for row in rows:
+            raw = row.get("recorded_at")
+            if not raw:
+                continue
+            try:
+                parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if (now_utc - parsed).total_seconds() <= limit_sec:
+                kept.append(row)
+        return kept
+
+    def _ai_cache_key(self, candidate: Dict[str, Any]) -> Optional[str]:
+        set_id = str(candidate.get("set_id") or "").strip()
+        if not set_id:
+            return None
+        theme = str(candidate.get("theme") or "").strip().lower()
+        source = str(candidate.get("source") or "").strip().lower()
+        eol = str(candidate.get("eol_date_prediction") or "").strip()
+        price_raw = candidate.get("current_price")
+        try:
+            price = f"{float(price_raw):.2f}"
+        except (TypeError, ValueError):
+            price = "na"
+        return f"{set_id}|{theme}|{source}|{eol}|{price}"
+
+    @staticmethod
+    def _clone_ai_insight(insight: AIInsight) -> AIInsight:
+        return AIInsight(
+            score=int(insight.score),
+            summary=str(insight.summary),
+            predicted_eol_date=insight.predicted_eol_date,
+            fallback_used=bool(insight.fallback_used),
+            confidence=str(insight.confidence),
+            risk_note=insight.risk_note,
+        )
+
+    def _get_cached_ai_insight(self, candidate: Dict[str, Any]) -> Optional[AIInsight]:
+        if self.ai_cache_ttl_sec <= 0:
+            return None
+        key = self._ai_cache_key(candidate)
+        if not key:
+            return None
+        row = self._ai_insight_cache.get(key)
+        if row is None:
+            return None
+        expires_at, cached = row
+        now_ts = time.time()
+        if expires_at <= now_ts:
+            self._ai_insight_cache.pop(key, None)
+            return None
+        return self._clone_ai_insight(cached)
+
+    def _set_cached_ai_insight(self, candidate: Dict[str, Any], insight: AIInsight) -> None:
+        if self.ai_cache_ttl_sec <= 0 or insight.fallback_used:
+            return
+        key = self._ai_cache_key(candidate)
+        if not key:
+            return
+        now_ts = time.time()
+        if len(self._ai_insight_cache) >= self.ai_cache_max_items:
+            expired = [
+                cache_key
+                for cache_key, (expires_at, _cached) in self._ai_insight_cache.items()
+                if expires_at <= now_ts
+            ]
+            for cache_key in expired:
+                self._ai_insight_cache.pop(cache_key, None)
+            while len(self._ai_insight_cache) >= self.ai_cache_max_items and self._ai_insight_cache:
+                oldest_key = next(iter(self._ai_insight_cache))
+                self._ai_insight_cache.pop(oldest_key, None)
+
+        self._ai_insight_cache[key] = (
+            now_ts + self.ai_cache_ttl_sec,
+            self._clone_ai_insight(insight),
+        )
 
     @staticmethod
     def _is_ai_score_collapse(ranked: list[Dict[str, Any]]) -> bool:
@@ -2304,7 +2767,10 @@ class DiscoveryOracle:
                 payload = self._extract_json(text)
                 return self._payload_to_ai_insight(payload, candidate)
             except Exception as exc:  # noqa: BLE001
-                if self._should_rotate_gemini_model(exc) and self._advance_gemini_model(reason=str(exc)):
+                rotated = False
+                if self._should_rotate_gemini_model(exc):
+                    rotated = await self._advance_gemini_model_locked(reason=str(exc))
+                if rotated:
                     try:
                         text = await asyncio.to_thread(self._gemini_generate, prompt)
                         payload = self._extract_json(text)
@@ -2330,7 +2796,10 @@ class DiscoveryOracle:
                 payload = self._extract_json(text)
                 return self._payload_to_ai_insight(payload, candidate)
             except Exception as exc:  # noqa: BLE001
-                if self._should_rotate_openrouter_model(exc) and self._advance_openrouter_model(reason=str(exc)):
+                rotated = False
+                if self._should_rotate_openrouter_model(exc):
+                    rotated = await self._advance_openrouter_model_locked(reason=str(exc))
+                if rotated:
                     try:
                         text = await asyncio.to_thread(self._openrouter_generate, prompt)
                         payload = self._extract_json(text)
@@ -2472,15 +2941,19 @@ class DiscoveryOracle:
         ai_score: int,
         *,
         forecast: Optional[ForecastInsight] = None,
+        recent_prices: Optional[list[Dict[str, Any]]] = None,
     ) -> int:
         set_id = str(candidate.get("set_id") or "")
         if not set_id:
             return max(1, min(100, ai_score))
 
-        try:
-            recent = self.repository.get_recent_market_prices(set_id, days=30)
-        except Exception:  # noqa: BLE001
-            recent = []
+        if recent_prices is not None:
+            recent = recent_prices
+        else:
+            try:
+                recent = self.repository.get_recent_market_prices(set_id, days=30)
+            except Exception:  # noqa: BLE001
+                recent = []
 
         liquidity_factor = min(35, len(recent) * 3)
         source = str(candidate.get("source") or "")

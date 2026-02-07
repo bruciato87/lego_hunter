@@ -26,6 +26,15 @@ class FakeRepo:
     def get_recent_market_prices(self, set_id, days=30, platform=None):  # noqa: ANN001
         return self.recent.get(set_id, [])
 
+    def get_market_history_for_sets(self, set_ids, days=540):  # noqa: ANN001
+        rows = []
+        for set_id in set_ids:
+            for row in self.recent.get(set_id, []):
+                enriched = dict(row)
+                enriched.setdefault("set_id", set_id)
+                rows.append(enriched)
+        return rows
+
     def get_theme_radar_baseline(self, theme, days=180, limit=120):  # noqa: ANN001
         return self.theme_baselines.get(
             theme,
@@ -42,11 +51,13 @@ class DummyOracle(DiscoveryOracle):
     def __init__(self, repository, candidates):  # noqa: ANN001
         super().__init__(repository, gemini_api_key=None, min_ai_score=60)
         self._candidates = candidates
+        self.ai_calls = 0
 
     async def _collect_source_candidates(self):
         return self._candidates
 
     async def _get_ai_insight(self, candidate):  # noqa: ANN001
+        self.ai_calls += 1
         mock_fallback = bool(candidate.get("mock_fallback", False))
         return AIInsight(
             score=int(candidate.get("mock_score", 50)),
@@ -546,6 +557,11 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
             ),
             "unsupported_or_denied",
         )
+        self.assertTrue(
+            DiscoveryOracle._should_rotate_openrouter_model(
+                Exception("OpenRouter response missing choices")
+            )
+        )
 
     async def test_get_ai_insight_uses_openrouter_when_available(self) -> None:
         repo = FakeRepo()
@@ -572,6 +588,100 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(insight.score, 88)
         self.assertEqual(insight.predicted_eol_date, "2026-11-01")
+
+    def test_openrouter_generate_retries_on_malformed_payload(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle._openrouter_model_id = "vendor/model-pro:free"
+
+        with patch.object(
+            oracle,
+            "_openrouter_chat_completion",
+            side_effect=[
+                {"id": "resp-missing-choices"},
+                {"choices": [{"message": {"content": '{"score": 71, "summary": "ok"}'}}]},
+            ],
+        ) as mocked_call:
+            text = oracle._openrouter_generate("prompt")
+
+        self.assertIn('"score": 71', text)
+        self.assertEqual(mocked_call.call_count, 2)
+
+    async def test_ranking_prefilter_limits_ai_scoring_calls(self) -> None:
+        repo = FakeRepo()
+        now = datetime.now(timezone.utc)
+        candidates = []
+        for idx in range(14):
+            set_id = str(76000 + idx)
+            repo.recent[set_id] = [
+                {
+                    "set_id": set_id,
+                    "price": 25.0 + float((idx + d) % 9),
+                    "platform": "vinted" if d % 2 == 0 else "subito",
+                    "recorded_at": (now - timedelta(days=d)).isoformat(),
+                }
+                for d in range(8)
+            ]
+            candidates.append(
+                {
+                    "set_id": set_id,
+                    "set_name": f"Set {set_id}",
+                    "theme": "City" if idx % 2 == 0 else "Icons",
+                    "source": "lego_proxy_reader" if idx < 10 else "amazon_proxy_reader",
+                    "current_price": 39.99 + idx,
+                    "eol_date_prediction": "2026-09-01",
+                    "metadata": {},
+                    "mock_score": max(35, 95 - idx * 4),
+                    "mock_fallback": False,
+                }
+            )
+
+        oracle = DummyOracle(repo, candidates)
+        oracle.ai_rank_max_candidates = 5
+        report = await oracle.discover_with_diagnostics(persist=False, top_limit=20, fallback_limit=3)
+        ranking_diag = report["diagnostics"]["ranking"]
+
+        self.assertEqual(oracle.ai_calls, 5)
+        self.assertEqual(int(ranking_diag.get("ai_shortlist_count") or 0), 5)
+        self.assertEqual(int(ranking_diag.get("ai_prefilter_skipped_count") or 0), len(candidates) - 5)
+        self.assertEqual(int(ranking_diag.get("ai_cache_misses") or 0), 5)
+
+    async def test_ai_insight_cache_reuses_previous_score(self) -> None:
+        repo = FakeRepo()
+        now = datetime.now(timezone.utc)
+        repo.recent["75367"] = [
+            {
+                "set_id": "75367",
+                "price": 120.0 + (idx % 3),
+                "platform": "vinted",
+                "recorded_at": (now - timedelta(days=idx)).isoformat(),
+            }
+            for idx in range(6)
+        ]
+        candidates = [
+            {
+                "set_id": "75367",
+                "set_name": "LEGO Star Wars",
+                "theme": "Star Wars",
+                "source": "lego_proxy_reader",
+                "current_price": 129.99,
+                "eol_date_prediction": "2026-05-01",
+                "metadata": {},
+                "mock_score": 82,
+                "mock_fallback": False,
+            }
+        ]
+        oracle = DummyOracle(repo, candidates)
+        oracle.ai_rank_max_candidates = 1
+        oracle.ai_cache_ttl_sec = 3600.0
+
+        first_report = await oracle.discover_with_diagnostics(persist=False, top_limit=5, fallback_limit=1)
+        second_report = await oracle.discover_with_diagnostics(persist=False, top_limit=5, fallback_limit=1)
+
+        self.assertEqual(oracle.ai_calls, 1)
+        self.assertEqual(int(first_report["diagnostics"]["ranking"].get("ai_cache_hits") or 0), 0)
+        self.assertGreaterEqual(int(second_report["diagnostics"]["ranking"].get("ai_cache_hits") or 0), 1)
 
     def test_extract_json_from_wrapped_text(self) -> None:
         raw = "Risposta:\n{\"score\": 77, \"summary\": \"ok\"}\nfine"
