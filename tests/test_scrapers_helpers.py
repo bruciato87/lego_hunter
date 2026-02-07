@@ -22,7 +22,7 @@ class ScraperHelpersTests(unittest.TestCase):
 
     def test_guess_theme(self) -> None:
         self.assertEqual(BaseStealthScraper._guess_theme("LEGO Star Wars X-Wing"), "Star Wars")
-        self.assertEqual(BaseStealthScraper._guess_theme("LEGO Botanicals"), "Unknown")
+        self.assertEqual(BaseStealthScraper._guess_theme("LEGO Botanicals"), "Botanicals")
 
 
 if __name__ == "__main__":

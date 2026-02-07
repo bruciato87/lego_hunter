@@ -1875,7 +1875,7 @@ class DiscoveryOracle:
             persist,
             top_limit,
             fallback_limit,
-            self.min_ai_score,
+            self.min_composite_score,
         )
         source_candidates = await self._collect_source_candidates()
         source_diagnostics = self._last_source_diagnostics
@@ -1921,7 +1921,7 @@ class DiscoveryOracle:
                 {
                     **row,
                     "signal_strength": "LOW_CONFIDENCE",
-                    "risk_note": row.get("risk_note") or "Score AI non affidabile nel ciclo corrente.",
+                    "risk_note": self._build_low_confidence_note(row),
                 }
                 for row in above_threshold_low_conf[:fallback_limit]
             ]
@@ -3049,14 +3049,22 @@ class DiscoveryOracle:
             set_id = cls._extract_set_id(full_url, name)
             if not set_id:
                 continue
+            price = cls._extract_price_from_text(inner)
+            theme = cls._guess_theme_from_name(name)
             rows.append(
                 {
                     "set_id": set_id,
                     "set_name": name,
-                    "theme": cls._guess_theme_from_name(name),
+                    "theme": theme,
                     "source": "lego_http_fallback",
-                    "current_price": cls._extract_price_from_text(inner),
-                    "eol_date_prediction": (date.today() + timedelta(days=75)).isoformat(),
+                    "current_price": price,
+                    "eol_date_prediction": cls._estimate_eol_prediction(
+                        source="lego_http_fallback",
+                        set_id=set_id,
+                        theme=theme,
+                        price=price,
+                        context_text=inner,
+                    ),
                     "listing_url": full_url,
                     "metadata": {"fallback": True},
                 }
@@ -3125,14 +3133,21 @@ class DiscoveryOracle:
             end = matches[idx + 1].start() if idx + 1 < len(matches) else min(len(markdown_text), match.end() + 500)
             snippet = markdown_text[match.end() : end]
             price = cls._extract_price_from_text(snippet)
+            theme = cls._guess_theme_from_name(name)
             rows.append(
                 {
                     "set_id": set_id,
                     "set_name": name,
-                    "theme": cls._guess_theme_from_name(name),
+                    "theme": theme,
                     "source": "lego_proxy_reader",
                     "current_price": price,
-                    "eol_date_prediction": (date.today() + timedelta(days=75)).isoformat(),
+                    "eol_date_prediction": cls._estimate_eol_prediction(
+                        source="lego_proxy_reader",
+                        set_id=set_id,
+                        theme=theme,
+                        price=price,
+                        context_text=snippet,
+                    ),
                     "listing_url": url,
                     "metadata": {"proxy_reader": True},
                 }
@@ -3224,20 +3239,21 @@ class DiscoveryOracle:
     @staticmethod
     def _guess_theme_from_name(name: str) -> str:
         lowered = (name or "").lower()
-        mapping = {
-            "star wars": "Star Wars",
-            "technic": "Technic",
-            "city": "City",
-            "icons": "Icons",
-            "harry potter": "Harry Potter",
-            "marvel": "Marvel",
-            "ninjago": "Ninjago",
-            "friends": "Friends",
-            "architecture": "Architecture",
-        }
-        for key, value in mapping.items():
-            if key in lowered:
-                return value
+        keyword_map = [
+            ("Star Wars", ("star wars", "guerre stellari")),
+            ("Technic", ("technic", "ingranaggi", "escavatore", "gru")),
+            ("City", ("city", "citta", "polizia", "vigili del fuoco", "ambulanza")),
+            ("Icons", ("icons", "creator expert", "modular", "medieval", "castello")),
+            ("Botanicals", ("botanical", "botanicals", "narcisi", "fiori", "bouquet", "rose", "orchidea")),
+            ("Harry Potter", ("harry potter", "hogwarts")),
+            ("Marvel", ("marvel", "avengers", "spider-man", "spiderman")),
+            ("Ninjago", ("ninjago",)),
+            ("Friends", ("friends",)),
+            ("Architecture", ("architecture",)),
+        ]
+        for theme, keywords in keyword_map:
+            if any(keyword in lowered for keyword in keywords):
+                return theme
         return "Unknown"
 
     async def _get_openrouter_insight_opportunistic(
@@ -3528,6 +3544,32 @@ class DiscoveryOracle:
             and confidence_score >= self.min_confidence_score
         )
 
+    def _build_low_confidence_note(self, row: Dict[str, Any]) -> str:
+        existing = str(row.get("risk_note") or "").strip()
+        if existing:
+            return existing
+
+        if row.get("ai_fallback_used"):
+            return "Score AI in fallback nel ciclo corrente: verifica manuale consigliata."
+
+        reasons: list[str] = []
+        probability_pct = float(row.get("forecast_probability_upside_12m") or 0.0)
+        min_probability_pct = float(self.min_upside_probability) * 100.0
+        if probability_pct < min_probability_pct:
+            reasons.append(
+                f"Probabilita upside 12m sotto soglia ({probability_pct:.1f}% < {min_probability_pct:.0f}%)"
+            )
+
+        confidence_score = int(row.get("confidence_score") or 0)
+        if confidence_score < self.min_confidence_score:
+            reasons.append(
+                f"Confidenza dati sotto soglia ({confidence_score} < {self.min_confidence_score})"
+            )
+
+        if reasons:
+            return "; ".join(reasons) + "."
+        return "Segnale sotto criteri HIGH_CONFIDENCE: verifica manuale consigliata."
+
     def _estimate_market_demand(
         self,
         candidate: Dict[str, Any],
@@ -3548,20 +3590,132 @@ class DiscoveryOracle:
             except Exception:  # noqa: BLE001
                 recent = []
 
-        liquidity_factor = min(35, len(recent) * 3)
+        unique_days = len(
+            {
+                str(row.get("recorded_at") or "")[:10]
+                for row in recent
+                if str(row.get("recorded_at") or "").strip()
+            }
+        )
+        liquidity_factor = min(32.0, (len(recent) * 1.8) + (unique_days * 1.1))
         source = str(candidate.get("source") or "")
-        source_bonus = 20 if source in {"lego_retiring", "lego_proxy_reader", "lego_http_fallback"} else 8
-        quant_bonus = 0
+        source_bonus = 12.0 if source in {"lego_retiring", "lego_proxy_reader", "lego_http_fallback"} else 6.0
+        quant_bonus = 0.0
+        confidence_bonus = 0.0
         if forecast is not None:
-            quant_bonus = int(
-                min(
-                    16,
-                    (forecast.forecast_score * 0.10)
-                    + (forecast.probability_upside_12m * 8.0),
-                )
+            quant_bonus = min(
+                24.0,
+                (forecast.forecast_score * 0.10)
+                + (forecast.probability_upside_12m * 14.0),
             )
-        final_score = int((ai_score * 0.55) + liquidity_factor + source_bonus + quant_bonus)
+            confidence_bonus = min(
+                12.0,
+                max(0.0, (float(forecast.confidence_score) - 30.0) * 0.16),
+            )
+
+        price_penalty = 0.0
+        try:
+            price_value = float(candidate.get("current_price"))
+        except (TypeError, ValueError):
+            price_value = None
+        if price_value is not None:
+            if price_value < 12.0:
+                price_penalty = 4.0
+            elif price_value > 450.0:
+                price_penalty = 6.0
+            elif price_value > 300.0:
+                price_penalty = 3.0
+
+        raw_score = (
+            (float(ai_score) * 0.48)
+            + liquidity_factor
+            + source_bonus
+            + quant_bonus
+            + confidence_bonus
+            - price_penalty
+        )
+        if raw_score > 92.0:
+            raw_score = 92.0 + ((raw_score - 92.0) * 0.35)
+
+        final_score = int(round(raw_score))
         return max(1, min(100, final_score))
+
+    @staticmethod
+    def _extract_first_date(text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        iso_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
+        if iso_match:
+            value = iso_match.group(1)
+            try:
+                date.fromisoformat(value)
+                return value
+            except ValueError:
+                pass
+
+        eu_match = re.search(r"\b([0-3]?\d)[/.\-]([0-1]?\d)[/.\-](20\d{2})\b", text)
+        if eu_match:
+            day = int(eu_match.group(1))
+            month = int(eu_match.group(2))
+            year = int(eu_match.group(3))
+            try:
+                return date(year, month, day).isoformat()
+            except ValueError:
+                return None
+
+        return None
+
+    @classmethod
+    def _estimate_eol_prediction(
+        cls,
+        *,
+        source: str,
+        set_id: Optional[str],
+        theme: str,
+        price: Optional[float],
+        context_text: str = "",
+    ) -> str:
+        explicit = cls._extract_first_date(context_text)
+        if explicit:
+            return explicit
+
+        base_days_by_source = {
+            "lego_retiring": 72.0,
+            "lego_proxy_reader": 92.0,
+            "lego_http_fallback": 98.0,
+        }
+        base = base_days_by_source.get(source, 90.0)
+
+        if price is not None:
+            if price <= 20.0:
+                base -= 16.0
+            elif price <= 60.0:
+                base -= 8.0
+            elif price <= 200.0:
+                base += 4.0
+            elif price <= 400.0:
+                base += 14.0
+            else:
+                base += 22.0
+
+        theme_adjust = {
+            "Star Wars": 10.0,
+            "Technic": 12.0,
+            "Icons": 8.0,
+            "Botanicals": -4.0,
+            "City": -6.0,
+            "Friends": -8.0,
+        }
+        base += theme_adjust.get(theme, 0.0)
+
+        sid = str(set_id or "").strip()
+        if sid:
+            hash_adjust = (sum(ord(ch) for ch in sid) % 21) - 10
+            base += float(hash_adjust)
+
+        days = int(round(max(30.0, min(240.0, base))))
+        return (date.today() + timedelta(days=days)).isoformat()
 
     @staticmethod
     def _extract_json(raw_text: str) -> Dict[str, Any]:

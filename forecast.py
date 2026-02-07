@@ -75,6 +75,7 @@ class InvestmentForecaster:
         liquidity = min(1.0, (len(prices_30) / 30.0) * 0.55 + (unique_days_90 / 60.0) * 0.45)
 
         primary_price = self._safe_float(candidate.get("current_price"))
+        entry_price_signal = self._entry_price_signal(primary_price)
         secondary_gap_pct = 0.0
         if primary_price and primary_price > 0 and median_secondary_30:
             secondary_gap_pct = ((median_secondary_30 - primary_price) / primary_price) * 100.0
@@ -98,6 +99,7 @@ class InvestmentForecaster:
             eol_urgency=eol_urgency,
             liquidity=liquidity,
             theme_tailwind=theme_tailwind,
+            entry_price_signal=entry_price_signal,
         )
         probability = self._probability_upside(
             expected_roi=expected_roi,
@@ -131,6 +133,7 @@ class InvestmentForecaster:
             volatility=volatility,
             confidence=confidence,
             sample_size=len(prices),
+            entry_price_signal=entry_price_signal,
         )
 
         return ForecastInsight(
@@ -155,6 +158,7 @@ class InvestmentForecaster:
         eol_urgency: float,
         liquidity: float,
         theme_tailwind: float,
+        entry_price_signal: float,
     ) -> float:
         momentum_norm = self._clamp((momentum + 0.2) / 0.6, 0.0, 1.0)
         gap_norm = self._clamp((secondary_gap_pct + 10.0) / 35.0, 0.0, 1.0)
@@ -166,9 +170,24 @@ class InvestmentForecaster:
             + 14.0 * gap_norm
             + 12.0 * liquidity
             + 10.0 * theme_tailwind
+            + 8.0 * (entry_price_signal - 0.5)
             - 17.0 * min(1.0, volatility)
         )
         return self._clamp(expected, -20.0, 180.0)
+
+    @staticmethod
+    def _entry_price_signal(primary_price: Optional[float]) -> float:
+        if primary_price is None or primary_price <= 0:
+            return 0.5
+        log_price = math.log1p(primary_price)
+        center = math.log1p(120.0)
+        distance = abs(log_price - center)
+        signal = 1.0 - min(1.0, distance / 2.2)
+        if primary_price < 18.0:
+            signal -= 0.12
+        elif primary_price > 450.0:
+            signal -= 0.18
+        return InvestmentForecaster._clamp(signal, 0.0, 1.0)
 
     def _probability_upside(
         self,
@@ -349,14 +368,20 @@ class InvestmentForecaster:
         volatility: float,
         confidence: int,
         sample_size: int,
+        entry_price_signal: float,
     ) -> str:
         trend = "rialzista" if momentum >= 0.03 else ("in consolidamento" if momentum >= -0.02 else "debole")
         gap = "premio sul secondario" if secondary_gap_pct >= 0 else "sconto sul secondario"
         eol_hint = "EOL vicino" if eol_urgency >= 0.7 else ("EOL intermedio" if eol_urgency >= 0.4 else "EOL lontano")
         liquidity_hint = "liquidita buona" if liquidity >= 0.6 else "liquidita limitata"
         risk_hint = "volatilita alta" if volatility >= 0.45 else "volatilita contenuta"
+        entry_hint = (
+            "entry price efficiente"
+            if entry_price_signal >= 0.65
+            else ("entry price neutro" if entry_price_signal >= 0.45 else "entry price impegnativo")
+        )
         return (
-            f"Trend {trend}; {gap}; {eol_hint}; {liquidity_hint}; {risk_hint}. "
+            f"Trend {trend}; {gap}; {eol_hint}; {liquidity_hint}; {risk_hint}; {entry_hint}. "
             f"Confidenza dati {confidence}/100 su {sample_size} snapshot."
         )
 

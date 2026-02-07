@@ -84,6 +84,36 @@ class ForecastTests(unittest.TestCase):
         self.assertLessEqual(insight.probability_upside_12m, 0.98)
         self.assertIn("Confidenza dati", insight.rationale)
 
+    def test_entry_price_signal_differentiates_expected_roi(self) -> None:
+        forecaster = InvestmentForecaster(target_roi_pct=30.0)
+        candidate_base = {
+            "set_id": "10332",
+            "set_name": "Piazza della citta medievale",
+            "theme": "Icons",
+            "source": "lego_proxy_reader",
+            "eol_date_prediction": (datetime.now(timezone.utc).date() + timedelta(days=75)).isoformat(),
+        }
+
+        insight_mid = forecaster.forecast(
+            candidate={**candidate_base, "current_price": 120.0},
+            history_rows=[],
+            theme_baseline={},
+        )
+        insight_low = forecaster.forecast(
+            candidate={**candidate_base, "current_price": 10.0},
+            history_rows=[],
+            theme_baseline={},
+        )
+        insight_high = forecaster.forecast(
+            candidate={**candidate_base, "current_price": 520.0},
+            history_rows=[],
+            theme_baseline={},
+        )
+
+        self.assertGreater(insight_mid.expected_roi_12m_pct, insight_low.expected_roi_12m_pct)
+        self.assertGreater(insight_mid.expected_roi_12m_pct, insight_high.expected_roi_12m_pct)
+        self.assertIn("entry price", insight_mid.rationale.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

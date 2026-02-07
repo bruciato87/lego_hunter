@@ -305,6 +305,32 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected[0]["signal_strength"], "LOW_CONFIDENCE")
         self.assertFalse(bool(selected[0].get("ai_fallback_used")))
 
+    async def test_non_fallback_low_confidence_explains_quant_reason(self) -> None:
+        repo = FakeRepo()
+        candidates = [
+            {
+                "set_id": "13000",
+                "set_name": "Gru cingolata Liebherr LR 13000",
+                "theme": "Technic",
+                "source": "lego_proxy_reader",
+                "current_price": 129.99,
+                "eol_date_prediction": "2026-08-01",
+                "metadata": {},
+                "mock_score": 95,
+                "mock_fallback": False,
+            }
+        ]
+        oracle = DummyOracle(repo, candidates)
+
+        report = await oracle.discover_with_diagnostics(persist=False, top_limit=10, fallback_limit=3)
+        selected = report["selected"]
+        note = str(selected[0].get("risk_note") or "")
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["signal_strength"], "LOW_CONFIDENCE")
+        self.assertNotIn("Score AI non affidabile", note)
+        self.assertTrue(("Probabilita" in note) or ("Confidenza" in note))
+
     async def test_discovery_excludes_fallback_scores_from_high_confidence_picks(self) -> None:
         repo = FakeRepo()
         now = datetime.now(timezone.utc)
@@ -389,7 +415,7 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
                 "current_price": 14.99,
                 "eol_date_prediction": "2026-04-23",
                 "metadata": {},
-                "mock_score": 73,
+                "mock_score": 90,
                 "mock_fallback": True,
             }
         ]
@@ -539,6 +565,54 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["set_id"], "10332")
         self.assertEqual(rows[1]["set_id"], "76441")
         self.assertEqual(rows[0]["current_price"], 229.99)
+        self.assertNotEqual(rows[0]["eol_date_prediction"], rows[1]["eol_date_prediction"])
+
+    def test_estimate_market_demand_is_not_flat_or_always_100(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        forecast = oracle.forecaster.forecast(
+            candidate={
+                "set_id": "10332",
+                "set_name": "Piazza della citta medievale",
+                "theme": "Icons",
+                "source": "lego_proxy_reader",
+                "current_price": 229.99,
+                "eol_date_prediction": "2026-06-01",
+            },
+            history_rows=[],
+            theme_baseline={},
+        )
+        recent_rows = [
+            {
+                "price": 220.0,
+                "platform": "vinted",
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ]
+
+        score_mid = oracle._estimate_market_demand(
+            {
+                "set_id": "10332",
+                "source": "lego_proxy_reader",
+                "current_price": 229.99,
+            },
+            85,
+            forecast=forecast,
+            recent_prices=recent_rows,
+        )
+        score_high = oracle._estimate_market_demand(
+            {
+                "set_id": "13000",
+                "source": "lego_proxy_reader",
+                "current_price": 699.99,
+            },
+            85,
+            forecast=forecast,
+            recent_prices=recent_rows,
+        )
+
+        self.assertLess(score_mid, 100)
+        self.assertNotEqual(score_mid, score_high)
 
     def test_sort_gemini_candidates_prefers_more_capable_latest(self) -> None:
         ranked = DiscoveryOracle._sort_gemini_model_candidates(

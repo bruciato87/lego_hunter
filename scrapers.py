@@ -179,20 +179,21 @@ class BaseStealthScraper:
     @staticmethod
     def _guess_theme(name: str) -> str:
         lowered = name.lower()
-        mapping = {
-            "star wars": "Star Wars",
-            "technic": "Technic",
-            "city": "City",
-            "icons": "Icons",
-            "harry potter": "Harry Potter",
-            "marvel": "Marvel",
-            "ninjago": "Ninjago",
-            "friends": "Friends",
-            "architecture": "Architecture",
-        }
-        for key, value in mapping.items():
-            if key in lowered:
-                return value
+        keyword_map = [
+            ("Star Wars", ("star wars", "guerre stellari")),
+            ("Technic", ("technic", "ingranaggi", "escavatore", "gru")),
+            ("City", ("city", "citta", "polizia", "vigili del fuoco", "ambulanza")),
+            ("Icons", ("icons", "creator expert", "modular", "medieval", "castello")),
+            ("Botanicals", ("botanical", "botanicals", "narcisi", "fiori", "bouquet", "rose", "orchidea")),
+            ("Harry Potter", ("harry potter", "hogwarts")),
+            ("Marvel", ("marvel", "avengers", "spider-man", "spiderman")),
+            ("Ninjago", ("ninjago",)),
+            ("Friends", ("friends",)),
+            ("Architecture", ("architecture",)),
+        ]
+        for theme, keywords in keyword_map:
+            if any(keyword in lowered for keyword in keywords):
+                return theme
         return "Unknown"
 
 
