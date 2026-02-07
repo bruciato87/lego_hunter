@@ -25,6 +25,7 @@ try:
 except Exception:  # noqa: BLE001
     requests = None
 
+from backtest import OpportunityBacktester
 from forecast import ForecastInsight, InvestmentForecaster
 from models import LegoHunterRepository, MarketTimeSeriesRecord, OpportunityRadarRecord
 from scrapers import AmazonBestsellerScraper, LegoRetiringScraper, SecondaryMarketValidator
@@ -47,6 +48,8 @@ DEFAULT_AI_PROBE_TIMEOUT_SEC = 12.0
 DEFAULT_AI_GENERATION_TIMEOUT_SEC = 20.0
 DEFAULT_OPENROUTER_MODELS_TIMEOUT_SEC = 15.0
 DEFAULT_HISTORY_WINDOW_DAYS = 180
+DEFAULT_BACKTEST_LOOKBACK_DAYS = 365
+DEFAULT_BACKTEST_HORIZON_DAYS = 180
 
 
 @dataclass
@@ -104,6 +107,37 @@ class DiscoveryOracle:
             maximum=150.0,
         )
         self.forecaster = InvestmentForecaster(target_roi_pct=self.target_roi_pct)
+        self.backtest_lookback_days = self._safe_env_int(
+            "BACKTEST_LOOKBACK_DAYS",
+            default=DEFAULT_BACKTEST_LOOKBACK_DAYS,
+            minimum=90,
+            maximum=1095,
+        )
+        self.backtest_horizon_days = self._safe_env_int(
+            "BACKTEST_HORIZON_DAYS",
+            default=DEFAULT_BACKTEST_HORIZON_DAYS,
+            minimum=30,
+            maximum=540,
+        )
+        self.backtest_min_selected = self._safe_env_int(
+            "BACKTEST_MIN_SELECTED",
+            default=15,
+            minimum=5,
+            maximum=200,
+        )
+        self.auto_tune_thresholds = self._safe_env_bool("AUTO_TUNE_THRESHOLDS", default=False)
+        self.backtester = OpportunityBacktester(
+            target_roi_pct=self.target_roi_pct,
+            horizon_days=self.backtest_horizon_days,
+            top_k=3,
+        )
+        self.threshold_profile = {
+            "source": "static_env",
+            "composite": self.min_composite_score,
+            "probability": self.min_upside_probability,
+            "confidence": self.min_confidence_score,
+        }
+        self.backtest_runtime: Dict[str, Any] = {}
         self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
         self.gemini_model = self._normalize_model_name(os.getenv("GEMINI_MODEL") or gemini_model)
         self.openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
@@ -226,6 +260,10 @@ class DiscoveryOracle:
                     "model": "heuristic-ai-v2",
                     "mode": "fallback_no_external_ai",
                 }
+
+        if self.auto_tune_thresholds:
+            self._apply_auto_tuned_thresholds()
+
         LOGGER.info(
             "AI probe tuning | max_candidates=%s batch=%s early_successes=%s budget_sec=%.1f probe_timeout_sec=%.1f gen_timeout_sec=%.1f",
             self.ai_probe_max_candidates,
@@ -242,6 +280,14 @@ class DiscoveryOracle:
             self.min_confidence_score,
             self.history_window_days,
             self.target_roi_pct,
+        )
+        LOGGER.info(
+            "Backtest tuning | enabled=%s lookback_days=%s horizon_days=%s min_selected=%s profile=%s",
+            self.auto_tune_thresholds,
+            self.backtest_lookback_days,
+            self.backtest_horizon_days,
+            self.backtest_min_selected,
+            self.threshold_profile,
         )
         LOGGER.info("Discovery source mode configured: %s", self.discovery_source_mode)
 
@@ -479,6 +525,19 @@ class DiscoveryOracle:
         if maximum is not None:
             value = min(maximum, value)
         return value
+
+    @staticmethod
+    def _safe_env_bool(name: str, *, default: bool = False) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        lowered = str(raw).strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        LOGGER.warning("Invalid bool env %s=%r. Using default=%s.", name, raw, default)
+        return default
 
     @staticmethod
     def _select_probe_candidates(candidates: list[str], limit: int) -> list[str]:
@@ -1195,6 +1254,83 @@ class DiscoveryOracle:
             public["probe_report"] = probe[:5]
         return public
 
+    @staticmethod
+    def _backtest_runtime_public(runtime: Dict[str, Any]) -> Dict[str, Any]:
+        public = dict(runtime or {})
+        if "error" in public:
+            public["error"] = str(public.get("error"))[:220]
+        return public
+
+    def _apply_auto_tuned_thresholds(self) -> None:
+        try:
+            report = self.backtester.run(
+                repository=self.repository,
+                lookback_days=self.backtest_lookback_days,
+                max_opportunities=2500,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.backtest_runtime = {
+                "status": "error",
+                "error": str(exc),
+            }
+            LOGGER.warning("Backtest auto-tuning failed while loading data: %s", exc)
+            return
+
+        if report.sample_size < max(20, self.backtest_min_selected):
+            self.backtest_runtime = {
+                "status": "insufficient_data",
+                "sample_size": report.sample_size,
+                "required": max(20, self.backtest_min_selected),
+                "lookback_days": report.lookback_days,
+                "horizon_days": report.horizon_days,
+            }
+            return
+
+        suggestion = self.backtester.tune_thresholds(
+            observations=report.observations,
+            current_composite=self.min_composite_score,
+            current_probability=self.min_upside_probability,
+            current_confidence=self.min_confidence_score,
+            min_selected=self.backtest_min_selected,
+        )
+
+        metrics = suggestion.metrics
+        self.backtest_runtime = {
+            "status": "ok",
+            "sample_size": metrics.sample_size,
+            "selected_count": metrics.selected_count,
+            "precision": round(metrics.precision, 4),
+            "recall": round(metrics.recall, 4),
+            "precision_at_k": round(metrics.precision_at_k, 4),
+            "coverage": round(metrics.coverage, 4),
+            "brier_score": round(metrics.brier_score, 4),
+            "avg_realized_roi_selected": round(metrics.avg_realized_roi_selected, 2),
+            "objective_score": round(suggestion.objective_score, 4),
+            "target_roi_pct": report.target_roi_pct,
+            "lookback_days": report.lookback_days,
+            "horizon_days": report.horizon_days,
+        }
+
+        if suggestion.changed:
+            self.min_composite_score = suggestion.composite_score
+            self.min_upside_probability = suggestion.probability_upside
+            self.min_confidence_score = suggestion.confidence_score
+            self.threshold_profile = {
+                "source": "auto_tuned_backtest",
+                "composite": self.min_composite_score,
+                "probability": self.min_upside_probability,
+                "confidence": self.min_confidence_score,
+            }
+            LOGGER.info("Backtest auto-tuning applied | profile=%s metrics=%s", self.threshold_profile, self.backtest_runtime)
+        else:
+            self.threshold_profile = {
+                "source": "auto_tuned_backtest_unchanged",
+                "composite": self.min_composite_score,
+                "probability": self.min_upside_probability,
+                "confidence": self.min_confidence_score,
+            }
+            LOGGER.info("Backtest auto-tuning kept current profile | profile=%s metrics=%s", self.threshold_profile, self.backtest_runtime)
+
     async def discover_opportunities(
         self,
         *,
@@ -1291,6 +1427,7 @@ class DiscoveryOracle:
             "ai_threshold": self.min_ai_score,
             "min_probability_high_confidence": self.min_upside_probability,
             "min_confidence_score_high_confidence": self.min_confidence_score,
+            "threshold_profile": dict(self.threshold_profile),
             "source_strategy": source_diagnostics.get("source_strategy"),
             "source_order": source_diagnostics.get("source_order", []),
             "selected_source": source_diagnostics.get("selected_source"),
@@ -1329,6 +1466,7 @@ class DiscoveryOracle:
             "anti_bot_message": source_diagnostics["anti_bot_message"],
             "root_cause_hint": source_diagnostics.get("root_cause_hint"),
             "ai_runtime": self._ai_runtime_public(self.ai_runtime),
+            "backtest_runtime": self._backtest_runtime_public(self.backtest_runtime),
         }
 
         if ranked:
@@ -1348,7 +1486,7 @@ class DiscoveryOracle:
             top_debug = []
 
         LOGGER.info(
-            "Discovery summary | ranked=%s above_threshold=%s high_conf=%s fallback_used=%s max_ai=%s max_composite=%s max_prob=%.1f ai=%s top=%s",
+            "Discovery summary | ranked=%s above_threshold=%s high_conf=%s fallback_used=%s max_ai=%s max_composite=%s max_prob=%.1f profile=%s ai=%s top=%s",
             diagnostics["ranked_candidates"],
             diagnostics["above_threshold_count"],
             diagnostics["above_threshold_high_confidence_count"],
@@ -1356,6 +1494,7 @@ class DiscoveryOracle:
             diagnostics["max_ai_score"],
             diagnostics["max_composite_score"],
             diagnostics["max_probability_upside_12m"],
+            diagnostics["threshold_profile"],
             diagnostics["ai_runtime"],
             top_debug,
         )

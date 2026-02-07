@@ -450,11 +450,36 @@ class LegoHunterTelegramBot:
         )
         lines.append(
             f"Soglia composita: {int(diagnostics.get('threshold', 0))} | "
+            f"Min Prob: {float(diagnostics.get('min_probability_high_confidence', 0.0)) * 100.0:.0f}% | "
+            f"Min Conf: {int(diagnostics.get('min_confidence_score_high_confidence', 0))} | "
             f"Sopra soglia: {int(diagnostics.get('above_threshold_count', 0))} | "
             f"Max AI: {int(diagnostics.get('max_ai_score', 0))} | "
             f"Max Score: {int(diagnostics.get('max_composite_score', 0))} | "
             f"Max Prob12m: {float(diagnostics.get('max_probability_upside_12m', 0.0)):.1f}%"
         )
+
+        threshold_profile = diagnostics.get("threshold_profile")
+        if isinstance(threshold_profile, dict):
+            profile_source = html.escape(str(threshold_profile.get("source") or "n/d"))
+            lines.append(f"🎛️ Profilo soglie: <code>{profile_source}</code>")
+
+        backtest_runtime = diagnostics.get("backtest_runtime")
+        if isinstance(backtest_runtime, dict) and backtest_runtime:
+            status = str(backtest_runtime.get("status") or "n/d")
+            if status == "ok":
+                lines.append(
+                    "📈 Backtest: "
+                    f"sample {int(backtest_runtime.get('sample_size', 0))} | "
+                    f"P@K {float(backtest_runtime.get('precision_at_k', 0.0)):.2f} | "
+                    f"Precision {float(backtest_runtime.get('precision', 0.0)):.2f} | "
+                    f"Brier {float(backtest_runtime.get('brier_score', 0.0)):.2f}"
+                )
+            elif status == "insufficient_data":
+                lines.append(
+                    "📈 Backtest: dati insufficienti "
+                    f"({int(backtest_runtime.get('sample_size', 0))}/"
+                    f"{int(backtest_runtime.get('required', 0))})"
+                )
 
         if diagnostics.get("fallback_source_used"):
             lines.append("🛟 Fallback sorgente HTTP attivo (scraper primari a zero).")

@@ -179,6 +179,7 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
 
         report = await oracle.discover_with_diagnostics(persist=False, top_limit=10, fallback_limit=3)
         row = report["ranked"][0]
+        diagnostics = report["diagnostics"]
 
         self.assertIn("composite_score", row)
         self.assertIn("forecast_score", row)
@@ -187,6 +188,8 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("expected_roi_12m_pct", row)
         self.assertGreaterEqual(int(row["composite_score"]), 1)
         self.assertLessEqual(int(row["composite_score"]), 100)
+        self.assertIn("threshold_profile", diagnostics)
+        self.assertIn("backtest_runtime", diagnostics)
 
     async def test_non_fallback_can_be_low_confidence_with_weak_quant_data(self) -> None:
         repo = FakeRepo()

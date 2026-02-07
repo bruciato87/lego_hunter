@@ -12,6 +12,8 @@ Bot Telegram autonomo per discovery e monitoraggio opportunita LEGO con data moa
 - Ranking predittivo ibrido: `Composite Score` = AI + domanda + forecast quantitativo su serie storiche
 - Forecast quantitativo: probabilita upside 12 mesi, ROI atteso, intervallo di confidenza, tempo stimato al target ROI
 - Definizione `HIGH_CONFIDENCE`: score sopra soglia + probabilita minima + confidenza dati minima + AI non in fallback
+- Backtesting walk-forward su Data Moat: precision@k, coverage, calibrazione probabilistica (Brier score)
+- Auto-tuning soglie opzionale: regola automaticamente `MIN_*` su storico reale (senza hardcode)
 - Validazione secondario (Vinted/Subito)
 - Guardia fiscale DAC7 (blocco segnali vendita vicino soglia)
 - Comandi Telegram orientati agli oggetti LEGO: `/scova`, `/radar`, `/cerca`, `/offerte`, `/collezione`, `/vendi`
@@ -50,6 +52,10 @@ python bot.py --mode scheduled
 - `MIN_CONFIDENCE_SCORE` (opzionale, default `68`)
 - `HISTORY_WINDOW_DAYS` (opzionale, default `180`)
 - `TARGET_ROI_PCT` (opzionale, default `30`)
+- `AUTO_TUNE_THRESHOLDS` (opzionale, default `false`)
+- `BACKTEST_LOOKBACK_DAYS` (opzionale, default `365`)
+- `BACKTEST_HORIZON_DAYS` (opzionale, default `180`)
+- `BACKTEST_MIN_SELECTED` (opzionale, default `15`)
 
 ## Database
 Eseguire lo script SQL:

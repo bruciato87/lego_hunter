@@ -272,6 +272,67 @@ class LegoHunterRepository:
         )
         return result.data or []
 
+    def get_recent_opportunities(
+        self,
+        *,
+        days: int = 365,
+        limit: int = 2000,
+        include_archived: bool = False,
+    ) -> list[Dict[str, Any]]:
+        since = datetime.now(timezone.utc).timestamp() - (days * 24 * 60 * 60)
+        since_iso = datetime.fromtimestamp(since, tz=timezone.utc).isoformat()
+
+        query = (
+            self.client.table("opportunity_radar")
+            .select(
+                "set_id,set_name,theme,source,current_price,ai_investment_score,"
+                "market_demand_score,metadata,discovered_at,last_seen_at,eol_date_prediction"
+            )
+            .gte("discovered_at", since_iso)
+            .order("discovered_at", desc=True)
+            .limit(limit)
+        )
+        if not include_archived:
+            query = query.eq("is_archived", False)
+
+        result = self._with_retry("get_recent_opportunities", lambda: query.execute())
+        return result.data or []
+
+    def get_market_history_for_sets(
+        self,
+        set_ids: Iterable[str],
+        *,
+        days: int = 540,
+    ) -> list[Dict[str, Any]]:
+        unique_ids = [str(item).strip() for item in set_ids if str(item).strip()]
+        if not unique_ids:
+            return []
+
+        since = datetime.now(timezone.utc).timestamp() - (days * 24 * 60 * 60)
+        since_iso = datetime.fromtimestamp(since, tz=timezone.utc).isoformat()
+        collected: list[Dict[str, Any]] = []
+
+        for chunk in self._chunks(unique_ids, chunk_size=80):
+            query = (
+                self.client.table("market_time_series")
+                .select("set_id,platform,price,recorded_at,listing_type")
+                .in_("set_id", chunk)
+                .gte("recorded_at", since_iso)
+                .order("recorded_at", desc=False)
+            )
+            result = self._with_retry("get_market_history_for_sets", lambda: query.execute())
+            collected.extend(result.data or [])
+
+        return collected
+
+    @staticmethod
+    def _chunks(items: list[str], *, chunk_size: int) -> Iterable[list[str]]:
+        if chunk_size <= 0:
+            yield items
+            return
+        for idx in range(0, len(items), chunk_size):
+            yield items[idx : idx + chunk_size]
+
     def get_theme_radar_baseline(
         self,
         theme: str,
