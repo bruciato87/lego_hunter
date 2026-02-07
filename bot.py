@@ -5,6 +5,7 @@ import asyncio
 import html
 import logging
 import os
+from datetime import date, datetime
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import quote_plus
 
@@ -403,6 +404,27 @@ class LegoHunterTelegramBot:
         return f"€{amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
     @staticmethod
+    def _format_eol_date(value: Any) -> str:
+        if value is None:
+            return "n/d"
+
+        if isinstance(value, datetime):
+            return value.date().strftime("%d/%m/%Y")
+        if isinstance(value, date):
+            return value.strftime("%d/%m/%Y")
+
+        raw = str(value).strip()
+        if not raw:
+            return "n/d"
+
+        raw_date = raw.split("T", 1)[0]
+        try:
+            parsed = date.fromisoformat(raw_date)
+            return parsed.strftime("%d/%m/%Y")
+        except ValueError:
+            return raw
+
+    @staticmethod
     def _extract_listing_url(row: dict[str, Any]) -> Optional[str]:
         direct_url = str(row.get("listing_url") or "").strip()
         if direct_url.startswith("http://") or direct_url.startswith("https://"):
@@ -475,7 +497,7 @@ class LegoHunterTelegramBot:
                 confidence_score = int(row.get("confidence_score") or metadata.get("forecast_confidence_score") or 0)
                 demand_score = int(row.get("market_demand_score") or 0)
                 price = LegoHunterTelegramBot._fmt_eur(row.get("current_price"))
-                eol = html.escape(str(row.get("eol_date_prediction") or "n/d"))
+                eol = html.escape(LegoHunterTelegramBot._format_eol_date(row.get("eol_date_prediction")))
 
                 lines.append(f"{badge} <b>{idx}) {set_name}</b> ({set_id})")
                 lines.append(

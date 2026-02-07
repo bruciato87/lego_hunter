@@ -239,7 +239,12 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         joined = "\n".join(lines)
         self.assertIn("Apri su LEGO", joined)
         self.assertIn('href="https://www.lego.com/it-it/product/medieval-town-square-10332"', joined)
-        self.assertIn("EOL 2026-06-01", joined)
+        self.assertIn("EOL 01/06/2026", joined)
+
+    def test_format_eol_date_parses_iso_datetime(self) -> None:
+        self.assertEqual(LegoHunterTelegramBot._format_eol_date("2026-06-01T08:15:30Z"), "01/06/2026")
+        self.assertEqual(LegoHunterTelegramBot._format_eol_date(""), "n/d")
+        self.assertEqual(LegoHunterTelegramBot._format_eol_date("non valida"), "non valida")
 
     def test_format_discovery_report_adds_lego_search_link_when_listing_missing(self) -> None:
         report = {
