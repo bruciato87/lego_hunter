@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import logging
 import os
 from typing import Any, Optional
@@ -75,26 +76,31 @@ class LegoHunterTelegramBot:
 
         await update.message.reply_text("Scansione in corso: Lego Retiring Soon + Amazon + ranking AI...")
         try:
-            opportunities = await self.oracle.discover_opportunities(persist=True, top_limit=20)
+            report = await self.oracle.discover_with_diagnostics(
+                persist=True,
+                top_limit=20,
+                fallback_limit=3,
+            )
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("Discovery failed")
             await update.message.reply_text(f"Errore discovery: {exc}")
             return
 
-        if not opportunities:
-            await update.message.reply_text("Nessuna opportunita' valida trovata in questo ciclo.")
+        selected = report.get("selected", [])
+        diagnostics = report.get("diagnostics", {})
+        if not selected:
+            lines = [
+                "🧱 <b>Discovery LEGO</b>",
+                "Nessuna opportunita' disponibile in questo ciclo.",
+            ]
+            if diagnostics.get("anti_bot_alert"):
+                lines.append(f"🚨 {html.escape(str(diagnostics.get('anti_bot_message') or 'Possibile anti-bot.'))}")
+            await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
             return
 
-        top = opportunities[:3]
-        lines = ["Top Picks LEGO di oggi:"]
-        for idx, row in enumerate(top, start=1):
-            lines.append(
-                f"{idx}. {row.get('set_name')} ({row.get('set_id')})\n"
-                f"AI {row.get('ai_investment_score')}/100 | Demand {row.get('market_demand_score')}/100\n"
-                f"Prezzo: {self._fmt_eur(row.get('current_price'))} | EOL: {row.get('eol_date_prediction') or 'n/d'}"
-            )
-
-        await update.message.reply_text("\n\n".join(lines))
+        lines = ["🧱 <b>Discovery LEGO</b>"]
+        lines.extend(self._format_discovery_report(report, top_limit=3))
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def cmd_radar(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update):
@@ -304,6 +310,73 @@ class LegoHunterTelegramBot:
             amount = 0.0
         return f"€{amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
+    @staticmethod
+    def _format_discovery_report(report: dict[str, Any], *, top_limit: int = 3) -> list[str]:
+        selected = list(report.get("selected") or [])[:top_limit]
+        diagnostics = report.get("diagnostics") or {}
+
+        lines: list[str] = []
+        if diagnostics.get("fallback_used"):
+            lines.append("⚠️ Nessun set sopra soglia: mostro i migliori <b>LOW_CONFIDENCE</b>.")
+        else:
+            lines.append("✅ Opportunita' sopra soglia trovate.")
+
+        if selected:
+            lines.append("")
+            lines.append("<b>Top Picks</b>")
+            for idx, row in enumerate(selected, start=1):
+                strength = str(row.get("signal_strength") or "HIGH_CONFIDENCE")
+                badge = "🟢" if strength == "HIGH_CONFIDENCE" else "🟡"
+                set_name = html.escape(str(row.get("set_name") or "n/d"))
+                set_id = html.escape(str(row.get("set_id") or "n/d"))
+                source = html.escape(str(row.get("source") or "unknown"))
+                ai_score = int(row.get("ai_investment_score") or 0)
+                demand_score = int(row.get("market_demand_score") or 0)
+                price = LegoHunterTelegramBot._fmt_eur(row.get("current_price"))
+                eol = html.escape(str(row.get("eol_date_prediction") or "n/d"))
+
+                lines.append(f"{badge} <b>{idx}) {set_name}</b> ({set_id})")
+                lines.append(
+                    f"AI {ai_score}/100 | Demand {demand_score}/100 | Prezzo {price} | EOL {eol}"
+                )
+                lines.append(f"Fonte: {source} | Segnale: {strength}")
+                if strength == "LOW_CONFIDENCE":
+                    risk_note = str(row.get("risk_note") or "Conferma manuale consigliata.")
+                    lines.append(f"Nota: {html.escape(risk_note)}")
+                lines.append("")
+        else:
+            lines.append("🟠 Nessun candidato utile in questo ciclo.")
+
+        source_raw = diagnostics.get("source_raw_counts") or {}
+        lines.append("<b>Diagnostica Discovery</b>")
+        lines.append(
+            "Lego Retiring: "
+            f"{int(source_raw.get('lego_retiring', 0))} | "
+            f"Amazon: {int(source_raw.get('amazon_bestsellers', 0))} | "
+            f"Dedup: {int(diagnostics.get('dedup_candidates', 0))}"
+        )
+        lines.append(
+            f"Soglia AI: {int(diagnostics.get('threshold', 0))} | "
+            f"Sopra soglia: {int(diagnostics.get('above_threshold_count', 0))} | "
+            f"Max AI: {int(diagnostics.get('max_ai_score', 0))}"
+        )
+
+        failures = list(diagnostics.get("source_failures") or [])
+        if failures:
+            compact = "; ".join(str(item) for item in failures[:2])
+            if len(failures) > 2:
+                compact += f" (+{len(failures) - 2} altri)"
+            lines.append(f"⚠️ Fonti con errori: {html.escape(compact)}")
+
+        if diagnostics.get("anti_bot_alert"):
+            anti_bot_message = str(
+                diagnostics.get("anti_bot_message")
+                or "Entrambe le fonti discovery sono a zero: possibile anti-bot."
+            )
+            lines.append(f"🚨 {html.escape(anti_bot_message)}")
+
+        return lines
+
 
 def build_application(manager: LegoHunterTelegramBot, token: str) -> Application:
     app = Application.builder().token(token).build()
@@ -341,24 +414,27 @@ async def run_scheduled_cycle(
 ) -> None:
     bot = Bot(token=token)
     try:
-        opportunities = await oracle.discover_opportunities(persist=True, top_limit=12)
-        top = opportunities[:3]
-
-        if top:
-            lines = ["[LEGO HUNTER] Aggiornamento automatico (6h)"]
-            for idx, row in enumerate(top, start=1):
-                lines.append(
-                    f"{idx}) {row.get('set_name')} ({row.get('set_id')}) - AI {row.get('ai_investment_score')}/100 - "
-                    f"Prezzo {LegoHunterTelegramBot._fmt_eur(row.get('current_price'))}"
-                )
-        else:
-            lines = ["[LEGO HUNTER] Nessuna nuova opportunita' sopra soglia in questo ciclo."]
+        report = await oracle.discover_with_diagnostics(
+            persist=True,
+            top_limit=12,
+            fallback_limit=3,
+        )
+        lines = [
+            "<b>🧱 LEGO HUNTER</b> <i>Update automatico (ogni 6h)</i>",
+            "",
+        ]
+        lines.extend(LegoHunterTelegramBot._format_discovery_report(report, top_limit=3))
 
         safety = fiscal_guardian.check_safety_status()
-        lines.append(f"Stato DAC7: {safety.get('status')} | {safety.get('message')}")
+        status = str(safety.get("status") or "UNKNOWN")
+        status_emoji = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}.get(status, "⚪")
+        fiscal_message = html.escape(str(safety.get("message") or "n/d"))
+        lines.append("")
+        lines.append("<b>Fiscal Guard</b>")
+        lines.append(f"{status_emoji} DAC7 {status} | {fiscal_message}")
 
         holdings = repository.get_portfolio("holding")
-        lines.append(f"Set in collezione: {len(holdings)}")
+        lines.append(f"📦 Set in collezione: <b>{len(holdings)}</b>")
 
         await bot.send_message(
             chat_id=chat_id,

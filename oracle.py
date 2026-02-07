@@ -45,6 +45,14 @@ class DiscoveryOracle:
         self.gemini_model = gemini_model
 
         self._model = None
+        self._last_source_diagnostics: Dict[str, Any] = {
+            "source_raw_counts": {"lego_retiring": 0, "amazon_bestsellers": 0},
+            "source_dedup_counts": {},
+            "source_failures": [],
+            "dedup_candidates": 0,
+            "anti_bot_alert": False,
+            "anti_bot_message": None,
+        }
         if self.gemini_api_key and genai is not None:
             genai.configure(api_key=self.gemini_api_key)
             self._model = genai.GenerativeModel(self.gemini_model)
@@ -56,9 +64,88 @@ class DiscoveryOracle:
                     "google-generativeai package not installed: fallback heuristic scoring will be used"
                 )
 
-    async def discover_opportunities(self, *, persist: bool = True, top_limit: int = 25) -> list[Dict[str, Any]]:
-        """Scan sources, enrich with AI score, and store top opportunities."""
+    async def discover_opportunities(
+        self,
+        *,
+        persist: bool = True,
+        top_limit: int = 25,
+        include_low_confidence: bool = False,
+    ) -> list[Dict[str, Any]]:
+        """Scan sources, enrich with AI score, and return opportunities."""
+        report = await self.discover_with_diagnostics(
+            persist=persist,
+            top_limit=top_limit,
+            fallback_limit=3,
+        )
+        if include_low_confidence:
+            return report["selected"][:top_limit]
+        return report["above_threshold"][:top_limit]
+
+    async def discover_with_diagnostics(
+        self,
+        *,
+        persist: bool = True,
+        top_limit: int = 25,
+        fallback_limit: int = 3,
+    ) -> Dict[str, Any]:
+        """Run discovery and return picks plus execution diagnostics."""
         source_candidates = await self._collect_source_candidates()
+        source_diagnostics = self._last_source_diagnostics
+        ranked = await self._rank_and_persist_candidates(source_candidates, persist=persist)
+
+        ranked.sort(key=lambda row: (row["ai_investment_score"], row["market_demand_score"]), reverse=True)
+        above_threshold = [row for row in ranked if row["ai_investment_score"] >= self.min_ai_score]
+
+        selected: list[Dict[str, Any]]
+        fallback_used = False
+
+        if above_threshold:
+            selected = [
+                {
+                    **row,
+                    "signal_strength": "HIGH_CONFIDENCE",
+                }
+                for row in above_threshold[:top_limit]
+            ]
+        else:
+            fallback_used = bool(ranked)
+            selected = [
+                {
+                    **row,
+                    "signal_strength": "LOW_CONFIDENCE",
+                    "risk_note": f"Nessun set sopra soglia {self.min_ai_score}.",
+                }
+                for row in ranked[:fallback_limit]
+            ]
+
+        diagnostics = {
+            "threshold": self.min_ai_score,
+            "source_raw_counts": source_diagnostics["source_raw_counts"],
+            "source_dedup_counts": source_diagnostics["source_dedup_counts"],
+            "source_failures": source_diagnostics["source_failures"],
+            "dedup_candidates": source_diagnostics["dedup_candidates"],
+            "ranked_candidates": len(ranked),
+            "above_threshold_count": len(above_threshold),
+            "below_threshold_count": len(ranked) - len(above_threshold),
+            "max_ai_score": max((row["ai_investment_score"] for row in ranked), default=0),
+            "fallback_used": fallback_used,
+            "anti_bot_alert": source_diagnostics["anti_bot_alert"],
+            "anti_bot_message": source_diagnostics["anti_bot_message"],
+        }
+
+        return {
+            "selected": selected,
+            "above_threshold": above_threshold[:top_limit],
+            "ranked": ranked,
+            "diagnostics": diagnostics,
+        }
+
+    async def _rank_and_persist_candidates(
+        self,
+        source_candidates: list[Dict[str, Any]],
+        *,
+        persist: bool,
+    ) -> list[Dict[str, Any]]:
         if not source_candidates:
             return []
 
@@ -108,10 +195,7 @@ class DiscoveryOracle:
                     )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Failed to persist opportunity %s: %s", candidate.get("set_id"), exc)
-
-        ranked.sort(key=lambda row: (row["ai_investment_score"], row["market_demand_score"]), reverse=True)
-        filtered = [row for row in ranked if row["ai_investment_score"] >= self.min_ai_score]
-        return filtered[:top_limit]
+        return ranked
 
     async def validate_secondary_deals(self, opportunities: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
         """Fetch Vinted/Subito offers for discovered sets and persist secondary snapshots."""
@@ -172,21 +256,32 @@ class DiscoveryOracle:
         return merged
 
     async def _collect_source_candidates(self) -> list[Dict[str, Any]]:
+        candidates, diagnostics = await self._collect_source_candidates_with_diagnostics()
+        self._last_source_diagnostics = diagnostics
+        return candidates
+
+    async def _collect_source_candidates_with_diagnostics(self) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
         async with LegoRetiringScraper() as lego_scraper, AmazonBestsellerScraper() as amazon_scraper:
             lego_task = lego_scraper.fetch_retiring_sets(limit=50)
             amazon_task = amazon_scraper.fetch_bestsellers(limit=50)
             lego_data, amazon_data = await asyncio.gather(lego_task, amazon_task, return_exceptions=True)
 
         candidates: list[Dict[str, Any]] = []
+        source_raw_counts: Dict[str, int] = {"lego_retiring": 0, "amazon_bestsellers": 0}
+        source_failures: list[str] = []
 
         if isinstance(lego_data, Exception):
             LOGGER.warning("Lego source failed: %s", lego_data)
+            source_failures.append(f"lego_retiring: {lego_data}")
         else:
+            source_raw_counts["lego_retiring"] = len(lego_data)
             candidates.extend(lego_data)
 
         if isinstance(amazon_data, Exception):
             LOGGER.warning("Amazon source failed: %s", amazon_data)
+            source_failures.append(f"amazon_bestsellers: {amazon_data}")
         else:
+            source_raw_counts["amazon_bestsellers"] = len(amazon_data)
             candidates.extend(amazon_data)
 
         dedup: Dict[str, Dict[str, Any]] = {}
@@ -204,7 +299,32 @@ class DiscoveryOracle:
             if current.get("source") != "lego_retiring" and row.get("source") == "lego_retiring":
                 dedup[set_id] = row
 
-        return list(dedup.values())
+        dedup_values = list(dedup.values())
+        source_dedup_counts: Dict[str, int] = {}
+        for row in dedup_values:
+            source = str(row.get("source") or "unknown")
+            source_dedup_counts[source] = source_dedup_counts.get(source, 0) + 1
+
+        anti_bot_alert = (
+            source_raw_counts["lego_retiring"] == 0
+            and source_raw_counts["amazon_bestsellers"] == 0
+            and not source_failures
+        )
+        anti_bot_message = (
+            "Entrambe le fonti discovery hanno restituito 0 risultati: possibile anti-bot o cambio DOM."
+            if anti_bot_alert
+            else None
+        )
+
+        diagnostics = {
+            "source_raw_counts": source_raw_counts,
+            "source_dedup_counts": source_dedup_counts,
+            "source_failures": source_failures,
+            "dedup_candidates": len(dedup_values),
+            "anti_bot_alert": anti_bot_alert,
+            "anti_bot_message": anti_bot_message,
+        }
+        return dedup_values, diagnostics
 
     async def _get_ai_insight(self, candidate: Dict[str, Any]) -> AIInsight:
         if self._model is None:
