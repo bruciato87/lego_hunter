@@ -56,7 +56,18 @@ python bot.py --mode scheduled
 - `BACKTEST_LOOKBACK_DAYS` (opzionale, default `365`)
 - `BACKTEST_HORIZON_DAYS` (opzionale, default `180`)
 - `BACKTEST_MIN_SELECTED` (opzionale, default `15`)
+- `HISTORICAL_REFERENCE_ENABLED` (opzionale, default `true`)
+- `HISTORICAL_REFERENCE_CASES_PATH` (opzionale, default `data/historical_seed/historical_reference_cases.csv`)
+- `HISTORICAL_REFERENCE_MIN_SAMPLES` (opzionale, default `24`)
+- `HISTORICAL_PRIOR_WEIGHT` (opzionale, default `0.10`, range `0.0-0.35`)
+- `HISTORICAL_PRICE_BAND_TOLERANCE` (opzionale, default `0.45`)
 
 ## Database
 Eseguire lo script SQL:
 - `supabase_schema.sql`
+
+## Seed storico (Data Moat bootstrap)
+- Il ranking usa un prior storico da `data/historical_seed/historical_reference_cases.csv`.
+- Il prior non sostituisce i dati live: viene usato come fattore additivo controllato (`HISTORICAL_PRIOR_WEIGHT`) per migliorare la stabilita' dei punteggi nei primi mesi.
+- Script di rigenerazione seed: `scripts/build_historical_reference_cases.py`.
+- Lo script legge il dataset raw ZIP in `data/historical_seed/raw/` (non versionato) e produce il CSV finale versionato.

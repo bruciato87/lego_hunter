@@ -172,6 +172,61 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertGreater(high_pattern, low_pattern)
 
+    def test_composite_score_increases_with_historical_prior(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_prior_weight = 0.2
+        baseline = oracle._calculate_composite_score(
+            ai_score=70,
+            demand_score=72,
+            forecast_score=69,
+            pattern_score=60,
+            ai_fallback_used=False,
+            historical_score=None,
+        )
+        boosted = oracle._calculate_composite_score(
+            ai_score=70,
+            demand_score=72,
+            forecast_score=69,
+            pattern_score=60,
+            ai_fallback_used=False,
+            historical_score=95,
+        )
+        self.assertGreater(boosted, baseline)
+
+    def test_historical_prior_for_candidate_from_reference_cases(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_reference_min_samples = 12
+        oracle._historical_reference_cases = []
+        for idx in range(20):
+            oracle._historical_reference_cases.append(
+                {
+                    "set_id": str(70000 + idx),
+                    "theme": "Star Wars",
+                    "theme_norm": "star wars",
+                    "set_name": f"Case {idx}",
+                    "msrp_usd": 90.0 + idx,
+                    "roi_12m_pct": 32.0 + (idx % 5),
+                    "win_12m": 1,
+                    "source_dataset": "seed",
+                    "pattern_tags": "[]",
+                }
+            )
+        candidate = {
+            "set_id": "75367",
+            "set_name": "LEGO Star Wars",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 99.99,
+        }
+
+        prior = oracle._historical_prior_for_candidate(candidate)
+        self.assertIsNotNone(prior)
+        assert prior is not None
+        self.assertGreaterEqual(int(prior.get("sample_size") or 0), 12)
+        self.assertGreaterEqual(int(prior.get("prior_score") or 0), 60)
+
     def test_effective_pattern_score_penalizes_fallback_retiring_only(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
@@ -437,6 +492,7 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
             }
         ]
         oracle = DummyOracle(repo, candidates)
+        oracle._historical_reference_cases = []
 
         report = await oracle.discover_with_diagnostics(persist=False, top_limit=10, fallback_limit=3)
         selected = report["selected"]
@@ -461,6 +517,7 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
             }
         ]
         oracle = DummyOracle(repo, candidates)
+        oracle._historical_reference_cases = []
 
         report = await oracle.discover_with_diagnostics(persist=False, top_limit=10, fallback_limit=3)
         selected = report["selected"]

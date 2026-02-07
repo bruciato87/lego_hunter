@@ -7,3 +7,4 @@ __pycache__/
 htmlcov/
 .env
 .venv/
+data/historical_seed/raw/

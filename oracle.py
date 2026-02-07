@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import math
 import html
 import json
 import logging
 import os
 import re
+import statistics
 import time
 from collections import Counter
 from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -85,6 +88,11 @@ DEFAULT_AI_DYNAMIC_SHORTLIST_BONUS = 1
 DEFAULT_AI_TOP_PICK_RESCUE_ENABLED = True
 DEFAULT_AI_TOP_PICK_RESCUE_COUNT = 3
 DEFAULT_AI_TOP_PICK_RESCUE_TIMEOUT_SEC = 9.0
+DEFAULT_HISTORICAL_REFERENCE_CASES_PATH = "data/historical_seed/historical_reference_cases.csv"
+DEFAULT_HISTORICAL_REFERENCE_ENABLED = True
+DEFAULT_HISTORICAL_REFERENCE_MIN_SAMPLES = 24
+DEFAULT_HISTORICAL_PRIOR_WEIGHT = 0.10
+DEFAULT_HISTORICAL_PRICE_BAND_TOLERANCE = 0.45
 DEFAULT_HISTORY_WINDOW_DAYS = 180
 DEFAULT_BACKTEST_LOOKBACK_DAYS = 365
 DEFAULT_BACKTEST_HORIZON_DAYS = 180
@@ -475,6 +483,31 @@ class DiscoveryOracle:
             minimum=2.0,
             maximum=20.0,
         )
+        self.historical_reference_enabled = self._safe_env_bool(
+            "HISTORICAL_REFERENCE_ENABLED",
+            default=DEFAULT_HISTORICAL_REFERENCE_ENABLED,
+        )
+        self.historical_reference_path = (
+            os.getenv("HISTORICAL_REFERENCE_CASES_PATH") or DEFAULT_HISTORICAL_REFERENCE_CASES_PATH
+        ).strip()
+        self.historical_reference_min_samples = self._safe_env_int(
+            "HISTORICAL_REFERENCE_MIN_SAMPLES",
+            default=DEFAULT_HISTORICAL_REFERENCE_MIN_SAMPLES,
+            minimum=5,
+            maximum=250,
+        )
+        self.historical_prior_weight = self._safe_env_float(
+            "HISTORICAL_PRIOR_WEIGHT",
+            default=DEFAULT_HISTORICAL_PRIOR_WEIGHT,
+            minimum=0.0,
+            maximum=0.35,
+        )
+        self.historical_price_band_tolerance = self._safe_env_float(
+            "HISTORICAL_PRICE_BAND_TOLERANCE",
+            default=DEFAULT_HISTORICAL_PRICE_BAND_TOLERANCE,
+            minimum=0.10,
+            maximum=1.50,
+        )
         self.bootstrap_thresholds_enabled = self._safe_env_bool(
             "BOOTSTRAP_THRESHOLDS_ENABLED",
             default=DEFAULT_BOOTSTRAP_THRESHOLDS_ENABLED,
@@ -572,6 +605,7 @@ class DiscoveryOracle:
         self._ai_insight_cache: Dict[str, tuple[float, AIInsight]] = {}
         self._ai_failover_lock: Optional[asyncio.Lock] = None
         self._last_ranking_diagnostics: Dict[str, Any] = {}
+        self._historical_reference_cases: list[Dict[str, Any]] = []
         self.ai_runtime = {
             "engine": "local_ai",
             "provider": "local",
@@ -630,6 +664,8 @@ class DiscoveryOracle:
                     "model": "local-quant-ai-v1",
                     "mode": "fallback_no_external_ai",
                 }
+
+        self._historical_reference_cases = self._load_historical_reference_cases()
 
         if self.auto_tune_thresholds:
             self._apply_auto_tuned_thresholds()
@@ -697,6 +733,15 @@ class DiscoveryOracle:
             self.backtest_horizon_days,
             self.backtest_min_selected,
             self.threshold_profile,
+        )
+        LOGGER.info(
+            "Historical prior tuning | enabled=%s cases=%s path=%s min_samples=%s weight=%.2f price_tolerance=%.2f",
+            self.historical_reference_enabled,
+            len(self._historical_reference_cases),
+            self.historical_reference_path,
+            self.historical_reference_min_samples,
+            self.historical_prior_weight,
+            self.historical_price_band_tolerance,
         )
         LOGGER.info("Discovery source mode configured: %s", self.discovery_source_mode)
 
@@ -2632,6 +2677,7 @@ class DiscoveryOracle:
                     "ai": row.get("ai_raw_score"),
                     "quant": row.get("forecast_score"),
                     "demand": row.get("market_demand_score"),
+                    "hist": row.get("historical_prior_score"),
                     "prob12m": row.get("forecast_probability_upside_12m"),
                 }
                 for row in ranked[:3]
@@ -2690,6 +2736,7 @@ class DiscoveryOracle:
                 "ai_top_pick_rescue_failures": 0,
                 "ai_top_pick_rescue_timeouts": 0,
                 "ai_top_pick_rescue_cache_hits": 0,
+                "historical_prior_applied_count": 0,
                 "quant_prep_sec": 0.0,
                 "ai_scoring_sec": 0.0,
                 "persistence_sec": 0.0,
@@ -2784,6 +2831,7 @@ class DiscoveryOracle:
                     LOGGER.warning("Failed to persist opportunity %s: %s", candidate.get("set_id"), exc)
         persist_duration = time.monotonic() - persist_started
         total_duration = time.monotonic() - started
+        historical_prior_applied = sum(1 for row in ranked if row.get("historical_prior_score") is not None)
         self._last_ranking_diagnostics = {
             "input_candidates": len(source_candidates),
             "prepared_candidates": len(prepared),
@@ -2802,13 +2850,14 @@ class DiscoveryOracle:
             "ai_top_pick_rescue_failures": int(rescue_stats.get("ai_top_pick_rescue_failures", 0)),
             "ai_top_pick_rescue_timeouts": int(rescue_stats.get("ai_top_pick_rescue_timeouts", 0)),
             "ai_top_pick_rescue_cache_hits": int(rescue_stats.get("ai_top_pick_rescue_cache_hits", 0)),
+            "historical_prior_applied_count": historical_prior_applied,
             "quant_prep_sec": round(prep_duration, 2),
             "ai_scoring_sec": round(ai_duration, 2),
             "persistence_sec": round(persist_duration, 2),
             "total_sec": round(total_duration, 2),
         }
         LOGGER.info(
-            "Ranking completed | candidates=%s shortlisted=%s ai_scored=%s cache_hits=%s persisted_cache_hits=%s rescue_attempts=%s rescue_successes=%s persisted_opportunities=%s persisted_snapshots=%s durations={prep:%.2fs ai:%.2fs persist:%.2fs total:%.2fs}",
+            "Ranking completed | candidates=%s shortlisted=%s ai_scored=%s cache_hits=%s persisted_cache_hits=%s rescue_attempts=%s rescue_successes=%s historical_prior_applied=%s persisted_opportunities=%s persisted_snapshots=%s durations={prep:%.2fs ai:%.2fs persist:%.2fs total:%.2fs}",
             len(source_candidates),
             len(shortlist),
             self._last_ranking_diagnostics["ai_scored_count"],
@@ -2816,6 +2865,7 @@ class DiscoveryOracle:
             self._last_ranking_diagnostics["ai_persisted_cache_hits"],
             self._last_ranking_diagnostics["ai_top_pick_rescue_attempts"],
             self._last_ranking_diagnostics["ai_top_pick_rescue_successes"],
+            self._last_ranking_diagnostics["historical_prior_applied_count"],
             persisted_opportunities,
             persisted_snapshots,
             prep_duration,
@@ -2871,12 +2921,19 @@ class DiscoveryOracle:
                 forecast=forecast,
                 recent_prices=history_30,
             )
+            historical_prior = self._historical_prior_for_candidate(candidate)
+            historical_score = (
+                int(historical_prior.get("prior_score"))
+                if historical_prior is not None and historical_prior.get("prior_score") is not None
+                else None
+            )
             composite_score = self._calculate_composite_score(
                 ai_score=ai.score,
                 demand_score=demand,
                 forecast_score=forecast.forecast_score,
                 pattern_score=effective_pattern_score,
                 ai_fallback_used=bool(ai.fallback_used),
+                historical_score=historical_score,
             )
 
             opportunity = OpportunityRadarRecord(
@@ -2916,6 +2973,24 @@ class DiscoveryOracle:
                     "prefilter_score": int(row.get("prefilter_score") or 0),
                     "prefilter_rank": int(row.get("prefilter_rank") or 0),
                     "ai_shortlisted": bool(row.get("ai_shortlisted")),
+                    "historical_prior_score": historical_score,
+                    "historical_sample_size": int(historical_prior.get("sample_size") or 0) if historical_prior else 0,
+                    "historical_avg_roi_12m_pct": (
+                        round(float(historical_prior.get("avg_roi_12m_pct") or 0.0), 2)
+                        if historical_prior
+                        else None
+                    ),
+                    "historical_win_rate_12m_pct": (
+                        round(float(historical_prior.get("win_rate_12m") or 0.0) * 100.0, 2)
+                        if historical_prior
+                        else None
+                    ),
+                    "historical_support_confidence": (
+                        int(historical_prior.get("support_confidence") or 0)
+                        if historical_prior
+                        else 0
+                    ),
+                    "historical_source": historical_prior.get("source") if historical_prior else None,
                 },
             )
 
@@ -2942,6 +3017,17 @@ class DiscoveryOracle:
             payload["prefilter_score"] = int(row.get("prefilter_score") or 0)
             payload["prefilter_rank"] = int(row.get("prefilter_rank") or 0)
             payload["ai_shortlisted"] = bool(row.get("ai_shortlisted"))
+            payload["historical_prior_score"] = historical_score
+            payload["historical_sample_size"] = int(historical_prior.get("sample_size") or 0) if historical_prior else 0
+            payload["historical_avg_roi_12m_pct"] = (
+                round(float(historical_prior.get("avg_roi_12m_pct") or 0.0), 2) if historical_prior else None
+            )
+            payload["historical_win_rate_12m_pct"] = (
+                round(float(historical_prior.get("win_rate_12m") or 0.0) * 100.0, 2) if historical_prior else None
+            )
+            payload["historical_support_confidence"] = (
+                int(historical_prior.get("support_confidence") or 0) if historical_prior else 0
+            )
             if ai.risk_note:
                 payload["risk_note"] = ai.risk_note
             ranked.append(payload)
@@ -3698,6 +3784,133 @@ class DiscoveryOracle:
             else:
                 message = repr(exc).strip() or "<no_error_message>"
         return err_type, message
+
+    def _load_historical_reference_cases(self) -> list[Dict[str, Any]]:
+        if not self.historical_reference_enabled:
+            return []
+        path = Path(self.historical_reference_path)
+        if not path.exists():
+            LOGGER.warning("Historical reference cases file not found: %s", path)
+            return []
+
+        cases: list[Dict[str, Any]] = []
+        try:
+            with path.open("r", encoding="utf-8", newline="") as fp:
+                reader = csv.DictReader(fp)
+                for row in reader:
+                    set_id = str(row.get("set_id") or "").strip()
+                    if not set_id:
+                        continue
+                    theme = str(row.get("theme") or "").strip() or "Unknown"
+                    roi_12m_raw = row.get("roi_12m_pct")
+                    try:
+                        roi_12m = float(roi_12m_raw) if roi_12m_raw not in (None, "") else None
+                    except (TypeError, ValueError):
+                        roi_12m = None
+                    if roi_12m is None:
+                        continue
+
+                    msrp_raw = row.get("msrp_usd")
+                    try:
+                        msrp = float(msrp_raw) if msrp_raw not in (None, "") else None
+                    except (TypeError, ValueError):
+                        msrp = None
+
+                    win_12m_raw = row.get("win_12m")
+                    try:
+                        win_12m = int(win_12m_raw) if win_12m_raw not in (None, "") else None
+                    except (TypeError, ValueError):
+                        win_12m = None
+                    if win_12m is None:
+                        win_12m = int(roi_12m >= float(self.target_roi_pct))
+
+                    cases.append(
+                        {
+                            "set_id": set_id,
+                            "theme": theme,
+                            "theme_norm": theme.lower().strip(),
+                            "set_name": str(row.get("set_name") or "").strip(),
+                            "msrp_usd": msrp,
+                            "roi_12m_pct": roi_12m,
+                            "win_12m": int(win_12m),
+                            "source_dataset": str(row.get("source_dataset") or "").strip(),
+                            "pattern_tags": str(row.get("pattern_tags") or "").strip(),
+                        }
+                    )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Historical reference cases load failed: %s", exc)
+            return []
+        return cases
+
+    @staticmethod
+    def _clamp_score(value: float, *, minimum: float = 1.0, maximum: float = 100.0) -> float:
+        return max(float(minimum), min(float(maximum), float(value)))
+
+    def _historical_prior_for_candidate(self, candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self._historical_reference_cases:
+            return None
+
+        theme = str(candidate.get("theme") or "").strip().lower()
+        if not theme:
+            return None
+
+        theme_cases = [row for row in self._historical_reference_cases if row.get("theme_norm") == theme]
+        if len(theme_cases) < 6:
+            return None
+
+        price_raw = candidate.get("current_price")
+        try:
+            current_price = float(price_raw) if price_raw is not None else None
+        except (TypeError, ValueError):
+            current_price = None
+
+        selected = theme_cases
+        if current_price is not None and current_price > 0:
+            tolerance = float(self.historical_price_band_tolerance)
+            low = current_price * max(0.05, 1.0 - tolerance)
+            high = current_price * (1.0 + tolerance)
+            price_band_cases = [
+                row
+                for row in theme_cases
+                if row.get("msrp_usd") is not None and low <= float(row["msrp_usd"]) <= high
+            ]
+            if len(price_band_cases) >= int(self.historical_reference_min_samples):
+                selected = price_band_cases
+
+        rois = [float(row["roi_12m_pct"]) for row in selected if row.get("roi_12m_pct") is not None]
+        if len(rois) < max(8, int(self.historical_reference_min_samples // 2)):
+            return None
+
+        wins = [
+            int(row.get("win_12m"))
+            for row in selected
+            if row.get("win_12m") in (0, 1)
+        ]
+        sample_size = len(rois)
+        avg_roi = float(statistics.fmean(rois))
+        median_roi = float(statistics.median(rois))
+        win_rate = float(statistics.fmean(wins)) if wins else float(
+            statistics.fmean([1 if roi >= float(self.target_roi_pct) else 0 for roi in rois])
+        )
+        roi_stdev = float(statistics.pstdev(rois)) if len(rois) > 1 else 0.0
+
+        roi_component = self._clamp_score(50.0 + (avg_roi * 0.85))
+        win_component = self._clamp_score(win_rate * 100.0)
+        sample_bonus = min(10.0, math.log2(sample_size + 1.0) * 2.0)
+        prior_score = self._clamp_score((0.55 * win_component) + (0.45 * roi_component) + sample_bonus - 5.0)
+        support_confidence = self._clamp_score(35.0 + (math.log2(sample_size + 1.0) * 12.0) - min(25.0, roi_stdev * 0.25))
+
+        return {
+            "theme": theme,
+            "sample_size": sample_size,
+            "avg_roi_12m_pct": round(avg_roi, 4),
+            "median_roi_12m_pct": round(median_roi, 4),
+            "win_rate_12m": round(win_rate, 4),
+            "roi_stddev_12m_pct": round(roi_stdev, 4),
+            "prior_score": int(round(prior_score)),
+            "support_confidence": int(round(support_confidence)),
+            "source": "historical_reference_cases",
+        }
 
     def _load_history_by_set(self, set_ids: list[str]) -> Dict[str, list[Dict[str, Any]]]:
         grouped: Dict[str, list[Dict[str, Any]]] = {set_id: [] for set_id in set_ids}
@@ -5235,6 +5448,7 @@ class DiscoveryOracle:
         forecast_score: int,
         pattern_score: int,
         ai_fallback_used: bool,
+        historical_score: Optional[int] = None,
     ) -> int:
         if ai_fallback_used:
             ai_weight = 0.14
@@ -5247,12 +5461,17 @@ class DiscoveryOracle:
             quant_weight = 0.30
             pattern_weight = 0.16
 
-        composite = (
+        base_composite = (
             ai_weight * float(ai_score)
             + demand_weight * float(demand_score)
             + quant_weight * float(forecast_score)
             + pattern_weight * float(pattern_score)
         )
+        if historical_score is None:
+            return max(1, min(100, int(round(base_composite))))
+
+        historical_weight = max(0.0, min(0.35, float(self.historical_prior_weight)))
+        composite = ((1.0 - historical_weight) * base_composite) + (historical_weight * float(historical_score))
         return max(1, min(100, int(round(composite))))
 
     @staticmethod
