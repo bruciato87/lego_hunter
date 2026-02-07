@@ -894,7 +894,8 @@ class DiscoveryOracle:
             if not allowed_batch:
                 continue
 
-            with ThreadPoolExecutor(max_workers=min(len(allowed_batch), probe_limit)) as executor:
+            executor = ThreadPoolExecutor(max_workers=min(len(allowed_batch), probe_limit))
+            try:
                 futures = {executor.submit(probe_fn, model_name): model_name for model_name in allowed_batch}
                 remaining_budget = max(0.1, self.ai_probe_budget_sec - (time.monotonic() - started))
                 batch_timeout = max(
@@ -962,6 +963,8 @@ class DiscoveryOracle:
                     if (time.monotonic() - started) >= self.ai_probe_budget_sec:
                         budget_exhausted = True
                         break
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
         report: list[Dict[str, Any]] = []
         for model_name in candidates:
