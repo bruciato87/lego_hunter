@@ -52,6 +52,8 @@ DEFAULT_AI_RANK_MAX_CANDIDATES = 12
 DEFAULT_AI_CACHE_TTL_SEC = 10800.0
 DEFAULT_AI_CACHE_MAX_ITEMS = 4000
 DEFAULT_OPENROUTER_MALFORMED_LIMIT = 3
+DEFAULT_AI_SCORING_HARD_BUDGET_SEC = 60.0
+DEFAULT_AI_SCORING_ITEM_TIMEOUT_SEC = 18.0
 DEFAULT_HISTORY_WINDOW_DAYS = 180
 DEFAULT_BACKTEST_LOOKBACK_DAYS = 365
 DEFAULT_BACKTEST_HORIZON_DAYS = 180
@@ -220,6 +222,18 @@ class DiscoveryOracle:
             minimum=1,
             maximum=20,
         )
+        self.ai_scoring_hard_budget_sec = self._safe_env_float(
+            "AI_SCORING_HARD_BUDGET_SEC",
+            default=DEFAULT_AI_SCORING_HARD_BUDGET_SEC,
+            minimum=10.0,
+            maximum=300.0,
+        )
+        self.ai_scoring_item_timeout_sec = self._safe_env_float(
+            "AI_SCORING_ITEM_TIMEOUT_SEC",
+            default=DEFAULT_AI_SCORING_ITEM_TIMEOUT_SEC,
+            minimum=4.0,
+            maximum=120.0,
+        )
         requested_mode = (os.getenv("DISCOVERY_SOURCE_MODE") or DEFAULT_DISCOVERY_SOURCE_MODE).strip().lower()
         if requested_mode not in DISCOVERY_SOURCE_MODES:
             LOGGER.warning(
@@ -313,12 +327,14 @@ class DiscoveryOracle:
             self.ai_generation_timeout_sec,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
             self.ai_cache_ttl_sec,
             self.ai_cache_max_items,
             self.openrouter_malformed_limit,
+            self.ai_scoring_hard_budget_sec,
+            self.ai_scoring_item_timeout_sec,
         )
         LOGGER.info(
             "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f",
@@ -1998,12 +2014,17 @@ class DiscoveryOracle:
             "ai_cache_hits": 0,
             "ai_cache_misses": 0,
             "ai_errors": 0,
+            "ai_budget_exhausted": 0,
+            "ai_timeout_count": 0,
         }
         if not shortlist:
             return {}, stats
 
         semaphore = asyncio.Semaphore(max(1, self.ai_scoring_concurrency))
         results: Dict[str, AIInsight] = {}
+        started = time.monotonic()
+        deadline = started + self.ai_scoring_hard_budget_sec
+        entry_by_set: Dict[str, Dict[str, Any]] = {str(row["set_id"]): row for row in shortlist}
 
         async def worker(entry: Dict[str, Any]) -> tuple[str, AIInsight, bool, Optional[Exception]]:
             candidate = entry["candidate"]
@@ -2017,34 +2038,117 @@ class DiscoveryOracle:
                 if runtime_mode in {"fallback_openrouter_malformed_payload", "fallback_after_openrouter_error"}:
                     return set_id, self._heuristic_ai_fallback(candidate), False, None
                 try:
-                    ai = await self._get_ai_insight(candidate)
+                    ai = await asyncio.wait_for(
+                        self._get_ai_insight(candidate),
+                        timeout=self.ai_scoring_item_timeout_sec,
+                    )
                     return set_id, ai, False, None
+                except asyncio.TimeoutError as exc:
+                    return set_id, self._heuristic_ai_fallback(candidate), False, exc
                 except Exception as exc:  # noqa: BLE001
                     return set_id, self._heuristic_ai_fallback(candidate), False, exc
 
-        tasks = [asyncio.create_task(worker(entry)) for entry in shortlist]
-        for entry, task in zip(shortlist, tasks):
-            set_id = entry["set_id"]
-            try:
-                result_set_id, ai, from_cache, err = await task
-            except Exception as exc:  # noqa: BLE001
-                result_set_id = set_id
-                ai = self._heuristic_ai_fallback(entry["candidate"])
+        tasks_by_set = {
+            str(entry["set_id"]): asyncio.create_task(worker(entry))
+            for entry in shortlist
+        }
+
+        while tasks_by_set:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                for pending_set_id, pending_task in list(tasks_by_set.items()):
+                    pending_task.cancel()
+                    entry = entry_by_set.get(pending_set_id)
+                    candidate = entry["candidate"] if entry else {"set_id": pending_set_id}
+                    if pending_set_id not in results:
+                        fallback = self._heuristic_ai_fallback(candidate)
+                        fallback = AIInsight(
+                            score=fallback.score,
+                            summary=fallback.summary,
+                            predicted_eol_date=fallback.predicted_eol_date,
+                            fallback_used=True,
+                            confidence="LOW_CONFIDENCE",
+                            risk_note=(
+                                "AI budget esaurito nel ciclo corrente: score calcolato con fallback euristico."
+                            ),
+                        )
+                        results[pending_set_id] = fallback
+                        stats["ai_cache_misses"] += 1
+                        stats["ai_budget_exhausted"] += 1
+                tasks_by_set.clear()
+                break
+
+            done, _pending = await asyncio.wait(
+                list(tasks_by_set.values()),
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+
+            for task in done:
+                set_id = next((key for key, value in tasks_by_set.items() if value is task), None)
+                if set_id is None:
+                    continue
+                entry = entry_by_set.get(set_id)
+                candidate = entry["candidate"] if entry else {"set_id": set_id}
+                tasks_by_set.pop(set_id, None)
+                err: Optional[Exception] = None
                 from_cache = False
-                err = exc
 
-            if from_cache:
-                stats["ai_cache_hits"] += 1
-            else:
-                stats["ai_cache_misses"] += 1
-                if not ai.fallback_used:
-                    stats["ai_scored_count"] += 1
-                    self._set_cached_ai_insight(entry["candidate"], ai)
+                try:
+                    result_set_id, ai, from_cache, err = task.result()
+                    set_id = str(result_set_id)
+                except Exception as exc:  # noqa: BLE001
+                    ai = self._heuristic_ai_fallback(candidate)
+                    err = exc
+                    from_cache = False
 
-            if err is not None:
-                stats["ai_errors"] += 1
-                LOGGER.warning("AI scoring worker failed | set_id=%s error=%s", result_set_id, err)
-            results[result_set_id] = ai
+                if from_cache:
+                    stats["ai_cache_hits"] += 1
+                else:
+                    stats["ai_cache_misses"] += 1
+                    if not ai.fallback_used:
+                        stats["ai_scored_count"] += 1
+                        self._set_cached_ai_insight(candidate, ai)
+
+                if isinstance(err, asyncio.TimeoutError):
+                    stats["ai_timeout_count"] += 1
+                if err is not None:
+                    stats["ai_errors"] += 1
+                    LOGGER.warning("AI scoring worker failed | set_id=%s error=%s", set_id, err)
+                results[set_id] = ai
+
+        # Safety net: ensure every shortlisted candidate has a score.
+        for set_id, entry in entry_by_set.items():
+            if set_id in results:
+                continue
+            fallback = self._heuristic_ai_fallback(entry["candidate"])
+            fallback = AIInsight(
+                score=fallback.score,
+                summary=fallback.summary,
+                predicted_eol_date=fallback.predicted_eol_date,
+                fallback_used=True,
+                confidence="LOW_CONFIDENCE",
+                risk_note="Score fallback: candidato non processato entro il budget AI del ciclo.",
+            )
+            results[set_id] = fallback
+            stats["ai_cache_misses"] += 1
+            stats["ai_budget_exhausted"] += 1
+
+        elapsed = time.monotonic() - started
+        LOGGER.info(
+            "AI shortlist scoring summary | candidates=%s scored=%s cache_hits=%s cache_misses=%s errors=%s timeouts=%s budget_exhausted=%s elapsed=%.2fs budget=%.2fs",
+            len(shortlist),
+            stats["ai_scored_count"],
+            stats["ai_cache_hits"],
+            stats["ai_cache_misses"],
+            stats["ai_errors"],
+            stats["ai_timeout_count"],
+            stats["ai_budget_exhausted"],
+            elapsed,
+            self.ai_scoring_hard_budget_sec,
+        )
         return results, stats
 
     def _load_history_by_set(self, set_ids: list[str]) -> Dict[str, list[Dict[str, Any]]]:
