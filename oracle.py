@@ -80,6 +80,91 @@ DEFAULT_HISTORY_WINDOW_DAYS = 180
 DEFAULT_BACKTEST_LOOKBACK_DAYS = 365
 DEFAULT_BACKTEST_HORIZON_DAYS = 180
 
+CULT_MOVIE_KEYWORDS = (
+    "fast & furious",
+    "paul walker",
+    "lord of the rings",
+    "lotr",
+    "dune",
+    "jurassic",
+    "batman",
+    "ghostbusters",
+    "back to the future",
+)
+BLOCKBUSTER_FRANCHISE_KEYWORDS = (
+    "star wars",
+    "marvel",
+    "harry potter",
+    "ninjago",
+    "disney",
+    "pokemon",
+)
+EXCLUSIVE_MINIFIGURE_KEYWORDS = (
+    "exclusive minifigure",
+    "minifigure esclusiva",
+    "solo minifigure",
+    "only minifigure",
+    "personaggio esclusivo",
+    "paul walker",
+)
+SERIES_COLLECTION_KEYWORDS = (
+    "series",
+    "collezione",
+    "collection",
+    "helmet",
+    "casco",
+    "modular",
+    "diorama",
+    "botanical collection",
+    "speed champions",
+)
+ADULT_DISPLAY_KEYWORDS = (
+    "18+",
+    "for adults",
+    "adults",
+    "ideas",
+    "art",
+    "van gogh",
+    "display model",
+    "botanical",
+)
+FLAGSHIP_COLLECTOR_KEYWORDS = (
+    "ucs",
+    "ultimate collector",
+    "collector",
+    "iconic",
+    "technic",
+    "flagship",
+)
+MODULAR_COMPLETIST_KEYWORDS = (
+    "modular",
+    "town square",
+    "medieval",
+    "castle",
+    "city center",
+)
+VEHICLE_NOSTALGIA_KEYWORDS = (
+    "skyline",
+    "charger",
+    "mustang",
+    "camaro",
+    "aston martin",
+    "batmobile",
+    "x-jet",
+    "rover",
+    "van",
+)
+SCARCITY_KEYWORDS = (
+    "limited edition",
+    "gwp",
+    "gift with purchase",
+    "edizione limitata",
+    "retiring soon",
+    "last chance",
+)
+ART_DISPLAY_THEMES = {"Art", "Ideas", "Icons", "Botanicals", "Architecture"}
+LEGO_PRIMARY_SOURCES = {"lego_retiring", "lego_proxy_reader", "lego_http_fallback"}
+
 
 @dataclass
 class AIInsight:
@@ -89,6 +174,15 @@ class AIInsight:
     fallback_used: bool = False
     confidence: str = "HIGH_CONFIDENCE"
     risk_note: Optional[str] = None
+
+
+@dataclass
+class PatternEvaluation:
+    score: int
+    confidence_score: int
+    summary: str
+    signals: list[Dict[str, Any]]
+    features: Dict[str, Any]
 
 
 class DiscoveryOracle:
@@ -2555,6 +2649,7 @@ class DiscoveryOracle:
                         risk_note=f"AI non eseguita: pre-filter rank #{pre_rank} oltre top {len(shortlist)}.",
                     )
 
+            pattern_eval = self._evaluate_success_patterns(candidate)
             demand = self._estimate_market_demand(
                 candidate,
                 ai.score,
@@ -2565,6 +2660,7 @@ class DiscoveryOracle:
                 ai_score=ai.score,
                 demand_score=demand,
                 forecast_score=forecast.forecast_score,
+                pattern_score=pattern_eval.score,
                 ai_fallback_used=bool(ai.fallback_used),
             )
 
@@ -2596,6 +2692,11 @@ class DiscoveryOracle:
                     "forecast_estimated_months_to_target": forecast.estimated_months_to_target,
                     "forecast_rationale": forecast.rationale,
                     "composite_score": int(composite_score),
+                    "success_pattern_score": int(pattern_eval.score),
+                    "success_pattern_confidence": int(pattern_eval.confidence_score),
+                    "success_pattern_summary": pattern_eval.summary,
+                    "success_patterns": pattern_eval.signals,
+                    "success_pattern_features": pattern_eval.features,
                     "prefilter_score": int(row.get("prefilter_score") or 0),
                     "prefilter_rank": int(row.get("prefilter_rank") or 0),
                     "ai_shortlisted": bool(row.get("ai_shortlisted")),
@@ -2614,6 +2715,10 @@ class DiscoveryOracle:
             payload["confidence_score"] = int(forecast.confidence_score)
             payload["estimated_months_to_target"] = forecast.estimated_months_to_target
             payload["composite_score"] = composite_score
+            payload["pattern_score"] = int(pattern_eval.score)
+            payload["pattern_confidence_score"] = int(pattern_eval.confidence_score)
+            payload["pattern_summary"] = pattern_eval.summary
+            payload["pattern_signals"] = pattern_eval.signals
             payload["ai_fallback_used"] = bool(ai.fallback_used)
             payload["ai_confidence"] = str(ai.confidence or "HIGH_CONFIDENCE")
             payload["forecast_rationale"] = forecast.rationale
@@ -3289,7 +3394,10 @@ class DiscoveryOracle:
                 f"fonte={row.get('source')} | prezzo={row.get('current_price')} | eol_hint={row.get('eol_date_prediction')}"
             )
         lines.append("")
-        lines.append("Criteri: domanda collezionisti, brand power del tema, rivalutazione attesa, liquidita.")
+        lines.append(
+            "Criteri: domanda collezionisti, brand power, rivalutazione attesa, liquidita', "
+            "pattern di successo (licenza esclusiva, completismo serie, display value adulto, scarsita' EOL)."
+        )
         return "\n".join(lines)
 
     @staticmethod
@@ -4462,7 +4570,8 @@ class DiscoveryOracle:
             f"Tema: {candidate.get('theme')}\n"
             f"Fonte: {candidate.get('source')}\n"
             f"Prezzo: {candidate.get('current_price')}\n"
-            "Criteri: domanda collezionisti, brand power del tema, probabilita rivalutazione, velocita di rotazione."
+            "Criteri: domanda collezionisti, brand power, probabilita' rivalutazione, velocita' di rotazione, "
+            "pattern di successo (licenza esclusiva, completismo serie, display value adulto, scarsita' EOL)."
         )
 
     def _heuristic_ai_fallback(self, candidate: Dict[str, Any]) -> AIInsight:
@@ -4506,27 +4615,249 @@ class DiscoveryOracle:
             risk_note="Ranking calcolato con Local AI fallback (provider esterno temporaneamente non disponibile).",
         )
 
+    @staticmethod
+    def _contains_any_keyword(text: str, keywords: Iterable[str]) -> bool:
+        lowered = str(text or "").lower()
+        return any(keyword in lowered for keyword in keywords if keyword)
+
+    @classmethod
+    def _infer_success_pattern_features(cls, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(candidate.get("set_name") or "")
+        theme = str(candidate.get("theme") or "Unknown")
+        source = str(candidate.get("source") or "unknown")
+        listing_url = str(candidate.get("listing_url") or "")
+        metadata = candidate.get("metadata")
+        raw_blob = ""
+        if isinstance(metadata, dict):
+            raw_blob = str(metadata.get("raw_blob") or metadata.get("description") or "")
+
+        text_blob = " ".join((name, theme, listing_url, raw_blob))
+        text_lower = text_blob.lower()
+
+        franchise = "Unknown"
+        if cls._contains_any_keyword(text_lower, CULT_MOVIE_KEYWORDS):
+            franchise = "Cult Movie"
+        elif cls._contains_any_keyword(text_lower, BLOCKBUSTER_FRANCHISE_KEYWORDS):
+            franchise = "Franchise"
+
+        minifigure_is_exclusive = cls._contains_any_keyword(text_lower, EXCLUSIVE_MINIFIGURE_KEYWORDS)
+        set_type = "Collection/Series" if cls._contains_any_keyword(text_lower, SERIES_COLLECTION_KEYWORDS) else "Standalone"
+        recommended_age = "18+" if cls._contains_any_keyword(text_lower, ("18+", "for adults", "adults")) else "n/d"
+        category = "Art/Ideas" if theme in ART_DISPLAY_THEMES or cls._contains_any_keyword(text_lower, ADULT_DISPLAY_KEYWORDS) else theme
+
+        price_value: Optional[float]
+        try:
+            price_value = float(candidate.get("current_price"))
+        except (TypeError, ValueError):
+            price_value = None
+
+        eol_days: Optional[int] = None
+        raw_eol = str(candidate.get("eol_date_prediction") or "").strip()
+        parsed_eol = cls._extract_first_date(raw_eol) if raw_eol else None
+        if parsed_eol:
+            try:
+                eol_days = (date.fromisoformat(parsed_eol) - date.today()).days
+            except ValueError:
+                eol_days = None
+
+        return {
+            "franchise": franchise,
+            "minifigure_is_exclusive": minifigure_is_exclusive,
+            "set_type": set_type,
+            "recommended_age": recommended_age,
+            "category": category,
+            "theme": theme,
+            "source": source,
+            "price": price_value,
+            "eol_days": eol_days,
+            "is_display_theme": theme in ART_DISPLAY_THEMES,
+            "is_vehicle_icon": cls._contains_any_keyword(text_lower, VEHICLE_NOSTALGIA_KEYWORDS),
+            "is_modular_family": cls._contains_any_keyword(text_lower, MODULAR_COMPLETIST_KEYWORDS),
+            "is_scarcity_flagged": cls._contains_any_keyword(text_lower, SCARCITY_KEYWORDS),
+        }
+
+    @classmethod
+    def _evaluate_success_patterns(cls, candidate: Dict[str, Any]) -> PatternEvaluation:
+        features = cls._infer_success_pattern_features(candidate)
+        signals: list[Dict[str, Any]] = []
+
+        def add_signal(code: str, label: str, score: int, confidence: float, rationale: str) -> None:
+            signals.append(
+                {
+                    "code": code,
+                    "label": label,
+                    "score": int(max(1, min(100, score))),
+                    "confidence": round(max(0.05, min(1.0, confidence)), 2),
+                    "rationale": rationale,
+                }
+            )
+
+        franchise = str(features.get("franchise") or "Unknown")
+        set_type = str(features.get("set_type") or "Standalone")
+        recommended_age = str(features.get("recommended_age") or "n/d")
+        category = str(features.get("category") or "")
+        theme = str(features.get("theme") or "Unknown")
+        source = str(features.get("source") or "unknown")
+        price = features.get("price")
+        eol_days = features.get("eol_days")
+
+        if bool(features.get("minifigure_is_exclusive")) and franchise == "Cult Movie":
+            add_signal(
+                "exclusive_cult_license",
+                "Licenza esclusiva cult",
+                95,
+                0.88,
+                "Minifigure/personaggio esclusivo legato a franchise cinematografico cult.",
+            )
+
+        if set_type == "Collection/Series":
+            add_signal(
+                "series_completism",
+                "Completismo di serie",
+                85,
+                0.84,
+                "Set parte di linea collezionabile: pressione FOMO sui collezionisti.",
+            )
+
+        if recommended_age == "18+" and category == "Art/Ideas":
+            add_signal(
+                "adult_display_value",
+                "Display value adulto",
+                90,
+                0.86,
+                "Target adulto/decorativo: domanda meno ciclica e piu' da esposizione.",
+            )
+
+        if franchise == "Cult Movie" and bool(features.get("is_vehicle_icon")):
+            add_signal(
+                "nostalgia_vehicle",
+                "Icona veicolo nostalgia",
+                88,
+                0.78,
+                "Veicolo iconico da franchise cult: forte componente emozionale.",
+            )
+
+        if (
+            recommended_age == "18+"
+            and (
+                cls._contains_any_keyword(str(candidate.get("set_name") or ""), FLAGSHIP_COLLECTOR_KEYWORDS)
+                or (isinstance(price, float) and price >= 180.0)
+            )
+            and theme in {"Star Wars", "Technic", "Icons", "Architecture"}
+        ):
+            add_signal(
+                "flagship_collector",
+                "Flagship da collezione",
+                86,
+                0.8,
+                "Set premium/flagship con bassa sostituibilita' percepita.",
+            )
+
+        if source in LEGO_PRIMARY_SOURCES and isinstance(eol_days, int) and 0 <= eol_days <= 210:
+            add_signal(
+                "retiring_window",
+                "Catalizzatore EOL",
+                83,
+                0.74,
+                "Finestra di ritiro vicina: riduzione offerta primaria imminente.",
+            )
+
+        if bool(features.get("is_modular_family")) and theme in {"Icons", "City", "Star Wars"}:
+            add_signal(
+                "modular_continuity",
+                "Continuita' collezione",
+                84,
+                0.76,
+                "Set inserito in famiglia seriale/modulare ad alta fedelta'.",
+            )
+
+        if franchise in {"Cult Movie", "Franchise"} and isinstance(price, float) and 20.0 <= price <= 90.0:
+            add_signal(
+                "accessible_license_entry",
+                "Entry point licenza forte",
+                80,
+                0.68,
+                "Prezzo d'ingresso accessibile su IP forte: ampiezza domanda secondaria.",
+            )
+
+        if bool(features.get("is_scarcity_flagged")):
+            add_signal(
+                "scarcity_signal",
+                "Segnale di scarsita'",
+                82,
+                0.64,
+                "Indicatori testuali di tiratura limitata/uscita imminente.",
+            )
+
+        signals.sort(
+            key=lambda row: (float(row.get("score", 0)) * float(row.get("confidence", 0.0)), int(row.get("score", 0))),
+            reverse=True,
+        )
+
+        if signals:
+            top = signals[:4]
+            den = sum(float(row.get("confidence", 0.0)) for row in top) or 1.0
+            weighted = sum(float(row.get("score", 0.0)) * float(row.get("confidence", 0.0)) for row in top) / den
+            stack_bonus = min(8.0, max(0.0, (len(top) - 1) * 1.5))
+            score = int(round(max(1.0, min(100.0, weighted + stack_bonus))))
+            confidence_score = int(
+                round(
+                    max(1.0, min(100.0, (sum(float(row.get("confidence", 0.0)) for row in top) / len(top)) * 100.0))
+                )
+            )
+            labels = [str(row.get("label") or "") for row in top if row.get("label")]
+            summary = ", ".join(labels[:2]) if labels else "Pattern multipli rilevati."
+            return PatternEvaluation(
+                score=score,
+                confidence_score=confidence_score,
+                summary=summary,
+                signals=signals[:5],
+                features=features,
+            )
+
+        baseline = 50.0
+        if source in LEGO_PRIMARY_SOURCES:
+            baseline += 4.0
+        if franchise in {"Cult Movie", "Franchise"}:
+            baseline += 3.0
+        if isinstance(price, float) and 20.0 <= price <= 180.0:
+            baseline += 2.0
+        if category == "Art/Ideas":
+            baseline += 2.0
+        score = int(round(max(1.0, min(100.0, baseline))))
+        return PatternEvaluation(
+            score=score,
+            confidence_score=35,
+            summary="Nessun pattern dominante: prevale analisi quantitativa.",
+            signals=[],
+            features=features,
+        )
+
     def _calculate_composite_score(
         self,
         *,
         ai_score: int,
         demand_score: int,
         forecast_score: int,
+        pattern_score: int,
         ai_fallback_used: bool,
     ) -> int:
         if ai_fallback_used:
-            ai_weight = 0.15
-            demand_weight = 0.25
-            quant_weight = 0.60
+            ai_weight = 0.14
+            demand_weight = 0.22
+            quant_weight = 0.49
+            pattern_weight = 0.15
         else:
-            ai_weight = 0.42
-            demand_weight = 0.23
-            quant_weight = 0.35
+            ai_weight = 0.34
+            demand_weight = 0.20
+            quant_weight = 0.30
+            pattern_weight = 0.16
 
         composite = (
             ai_weight * float(ai_score)
             + demand_weight * float(demand_score)
             + quant_weight * float(forecast_score)
+            + pattern_weight * float(pattern_score)
         )
         return max(1, min(100, int(round(composite))))
 

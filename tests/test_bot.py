@@ -220,6 +220,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                     "signal_strength": "HIGH_CONFIDENCE",
                     "metadata": {
                         "listing_url": "https://www.lego.com/it-it/product/medieval-town-square-10332",
+                        "success_pattern_score": 84,
+                        "success_pattern_summary": "Completismo di serie, Continuita' collezione",
                     },
                 }
             ],
@@ -240,6 +242,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Apri su LEGO", joined)
         self.assertIn('href="https://www.lego.com/it-it/product/medieval-town-square-10332"', joined)
         self.assertIn("EOL 01/06/2026", joined)
+        self.assertIn("Pattern 84/100", joined)
+        self.assertIn("Completismo di serie", joined)
 
     def test_format_eol_date_parses_iso_datetime(self) -> None:
         self.assertEqual(LegoHunterTelegramBot._format_eol_date("2026-06-01T08:15:30Z"), "01/06/2026")

@@ -487,6 +487,8 @@ class LegoHunterTelegramBot:
                 composite = int(row.get("composite_score") or row.get("ai_investment_score") or metadata.get("composite_score") or 0)
                 ai_score = int(row.get("ai_raw_score") or metadata.get("ai_raw_score") or row.get("ai_investment_score") or 0)
                 quant_score = int(row.get("forecast_score") or metadata.get("forecast_score") or 0)
+                pattern_score = int(row.get("pattern_score") or metadata.get("success_pattern_score") or 0)
+                pattern_summary = str(row.get("pattern_summary") or metadata.get("success_pattern_summary") or "").strip()
                 prob_12m = float(
                     row.get("forecast_probability_upside_12m")
                     or metadata.get("forecast_probability_upside_12m")
@@ -501,12 +503,14 @@ class LegoHunterTelegramBot:
 
                 lines.append(f"{badge} <b>{idx}) {set_name}</b> ({set_id})")
                 lines.append(
-                    f"Score {composite}/100 | AI {ai_score}/100 | Quant {quant_score}/100 | Demand {demand_score}/100"
+                    f"Score {composite}/100 | AI {ai_score}/100 | Quant {quant_score}/100 | Demand {demand_score}/100 | Pattern {pattern_score}/100"
                 )
                 target_line = f"Target {int(months_to_target)} mesi" if months_to_target is not None else "Target n/d"
                 lines.append(
                     f"Prob Upside 12m {prob_12m:.1f}% | ROI atteso 12m {roi_12m:+.1f}% | {target_line} | EOL {eol} | Conf {confidence_score}/100"
                 )
+                if pattern_summary:
+                    lines.append(f"Pattern: {html.escape(pattern_summary)}")
                 lines.append(f"Fonte: {source} | Segnale: {strength}")
                 lines.append(LegoHunterTelegramBot._format_pick_link(row))
                 if strength == "LOW_CONFIDENCE":

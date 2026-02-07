@@ -93,6 +93,76 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
                 candidate=None,
             )
 
+    def test_success_patterns_rule_exclusive_cult_license(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        candidate = {
+            "set_id": "76917",
+            "set_name": "LEGO Fast & Furious Skyline con minifigure esclusiva Paul Walker",
+            "theme": "Speed Champions",
+            "source": "lego_proxy_reader",
+            "current_price": 24.99,
+            "eol_date_prediction": "2026-04-30",
+        }
+
+        pattern = oracle._evaluate_success_patterns(candidate)
+        codes = {str(row.get("code")) for row in pattern.signals}
+        self.assertIn("exclusive_cult_license", codes)
+        self.assertGreaterEqual(pattern.score, 90)
+
+    def test_success_patterns_rule_series_completism(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        candidate = {
+            "set_id": "75343",
+            "set_name": "Casco Dark Trooper - Star Wars Helmet Collection",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 69.99,
+            "eol_date_prediction": "2026-05-30",
+        }
+
+        pattern = oracle._evaluate_success_patterns(candidate)
+        codes = {str(row.get("code")) for row in pattern.signals}
+        self.assertIn("series_completism", codes)
+        self.assertGreaterEqual(pattern.score, 82)
+
+    def test_success_patterns_rule_adult_display_value(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        candidate = {
+            "set_id": "31215",
+            "set_name": "LEGO Art Van Gogh 18+ display model for adults",
+            "theme": "Art",
+            "source": "lego_proxy_reader",
+            "current_price": 79.99,
+            "eol_date_prediction": "2026-07-15",
+        }
+
+        pattern = oracle._evaluate_success_patterns(candidate)
+        codes = {str(row.get("code")) for row in pattern.signals}
+        self.assertIn("adult_display_value", codes)
+        self.assertGreaterEqual(pattern.score, 88)
+
+    def test_composite_score_increases_with_pattern_score(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        low_pattern = oracle._calculate_composite_score(
+            ai_score=78,
+            demand_score=74,
+            forecast_score=69,
+            pattern_score=45,
+            ai_fallback_used=False,
+        )
+        high_pattern = oracle._calculate_composite_score(
+            ai_score=78,
+            demand_score=74,
+            forecast_score=69,
+            pattern_score=92,
+            ai_fallback_used=False,
+        )
+        self.assertGreater(high_pattern, low_pattern)
+
     def test_rank_candidate_models_skips_temporarily_banned(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
