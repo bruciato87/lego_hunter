@@ -661,7 +661,7 @@ async def run_scheduled_cycle(
             diagnostics.get("ai_runtime"),
         )
         lines = [
-            "<b>🧱 LEGO HUNTER</b> <i>Update automatico (ogni 3 ore)</i>",
+            "<b>🧱 LEGO HUNTER</b> <i>Update automatico (ogni 6 ore)</i>",
             "",
         ]
         lines.extend(LegoHunterTelegramBot._format_discovery_report(report, top_limit=3))
