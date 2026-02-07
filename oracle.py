@@ -2974,7 +2974,15 @@ class DiscoveryOracle:
             return stats
 
         top_k = max(1, int(self.ai_top_pick_rescue_count))
-        top_rows = ranked[:top_k]
+        top_rows = sorted(
+            ranked,
+            key=lambda row: (
+                int(row.get("composite_score") or row.get("ai_investment_score") or 0),
+                int(row.get("forecast_score") or 0),
+                int(row.get("market_demand_score") or 0),
+            ),
+            reverse=True,
+        )[:top_k]
         prepared_by_set = {str(row.get("set_id")): row for row in prepared}
         rescue_candidates: list[Dict[str, Any]] = []
 

@@ -1536,6 +1536,85 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertIn("75367", ai_results)
         self.assertFalse(ai_results["75367"].fallback_used)
 
+    async def test_top_pick_rescue_uses_composite_order_not_input_order(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.openrouter_api_key = "test-key"
+        oracle.ai_top_pick_rescue_enabled = True
+        oracle.ai_top_pick_rescue_count = 1
+        oracle.ai_top_pick_rescue_timeout_sec = 3.0
+
+        candidate_low = {
+            "set_id": "10001",
+            "set_name": "Low composite",
+            "theme": "City",
+            "source": "lego_proxy_reader",
+            "current_price": 29.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+        candidate_high = {
+            "set_id": "10002",
+            "set_name": "High composite",
+            "theme": "Icons",
+            "source": "lego_proxy_reader",
+            "current_price": 119.99,
+            "eol_date_prediction": "2026-06-01",
+        }
+
+        prepared = [
+            {
+                "candidate": candidate_low,
+                "set_id": "10001",
+                "theme": "City",
+                "forecast": oracle.forecaster.forecast(candidate=candidate_low, history_rows=[], theme_baseline={}),
+                "history_30": [],
+                "prefilter_score": 95,
+                "prefilter_rank": 1,
+                "ai_shortlisted": False,
+            },
+            {
+                "candidate": candidate_high,
+                "set_id": "10002",
+                "theme": "Icons",
+                "forecast": oracle.forecaster.forecast(candidate=candidate_high, history_rows=[], theme_baseline={}),
+                "history_30": [],
+                "prefilter_score": 60,
+                "prefilter_rank": 5,
+                "ai_shortlisted": False,
+            },
+        ]
+
+        # Intentionally unsorted input: first row has lower composite score.
+        ranked = [
+            {"set_id": "10001", "composite_score": 60, "forecast_score": 40, "market_demand_score": 60, "ai_fallback_used": True},
+            {"set_id": "10002", "composite_score": 78, "forecast_score": 55, "market_demand_score": 90, "ai_fallback_used": True},
+        ]
+        ai_results = {}
+
+        calls = []
+
+        async def fake_get_ai_insight(candidate):  # noqa: ANN001
+            calls.append(str(candidate.get("set_id")))
+            return AIInsight(
+                score=85,
+                summary="rescued",
+                predicted_eol_date=candidate.get("eol_date_prediction"),
+                fallback_used=False,
+                confidence="HIGH_CONFIDENCE",
+            )
+
+        with patch.object(oracle, "_get_ai_insight", new=AsyncMock(side_effect=fake_get_ai_insight)):
+            stats = await oracle._rescue_top_pick_ai_scores(
+                prepared=prepared,
+                ranked=ranked,
+                ai_results=ai_results,
+            )
+
+        self.assertEqual(calls, ["10002"])
+        self.assertEqual(int(stats["ai_top_pick_rescue_attempts"]), 1)
+        self.assertEqual(int(stats["ai_top_pick_rescue_successes"]), 1)
+        self.assertIn("10002", ai_results)
+
     async def test_score_ai_shortlist_limits_openrouter_concurrency_with_single_model(self) -> None:
         repo = FakeRepo()
         with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
