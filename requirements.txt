@@ -1,5 +1,5 @@
 python-telegram-bot==21.10
-supabase==2.15.0
+supabase==2.27.0
 playwright==1.51.0
 playwright-stealth==1.0.6
 google-generativeai==0.8.5
