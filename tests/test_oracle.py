@@ -247,6 +247,39 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[1]["set_id"], "76441")
         self.assertEqual(rows[0]["current_price"], 229.99)
 
+    def test_sort_gemini_candidates_prefers_more_capable_latest(self) -> None:
+        ranked = DiscoveryOracle._sort_gemini_model_candidates(
+            [
+                "models/gemini-1.5-flash",
+                "models/gemini-2.0-flash",
+                "models/gemini-2.5-pro",
+                "models/gemini-2.0-flash-lite",
+            ]
+        )
+        self.assertEqual(ranked[0], "models/gemini-2.5-pro")
+        self.assertIn("models/gemini-2.0-flash", ranked)
+
+    def test_sort_gemini_candidates_honors_preferred_when_present(self) -> None:
+        ranked = DiscoveryOracle._sort_gemini_model_candidates(
+            [
+                "models/gemini-2.5-pro",
+                "models/gemini-2.0-flash",
+            ],
+            preferred_model="gemini-2.0-flash",
+        )
+        self.assertEqual(ranked[0], "models/gemini-2.0-flash")
+
+    def test_should_rotate_gemini_model_for_quota_or_404(self) -> None:
+        self.assertTrue(
+            DiscoveryOracle._should_rotate_gemini_model(Exception("404 model not found"))
+        )
+        self.assertTrue(
+            DiscoveryOracle._should_rotate_gemini_model(Exception("Quota exceeded"))
+        )
+        self.assertFalse(
+            DiscoveryOracle._should_rotate_gemini_model(Exception("invalid json response"))
+        )
+
     def test_extract_json_from_wrapped_text(self) -> None:
         raw = "Risposta:\n{\"score\": 77, \"summary\": \"ok\"}\nfine"
         payload = DiscoveryOracle._extract_json(raw)

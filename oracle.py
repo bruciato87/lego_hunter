@@ -8,7 +8,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 from urllib.parse import urljoin
 
 try:
@@ -29,9 +29,11 @@ JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
 MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
+MODEL_VERSION_RE = re.compile(r"gemini-(\d+(?:\.\d+)?)", re.IGNORECASE)
 
 DISCOVERY_SOURCE_MODES = {"external_first", "playwright_first", "external_only"}
 DEFAULT_DISCOVERY_SOURCE_MODE = "external_first"
+DEFAULT_GEMINI_MODEL = "models/gemini-2.0-flash"
 
 
 @dataclass
@@ -49,13 +51,13 @@ class DiscoveryOracle:
         repository: LegoHunterRepository,
         *,
         gemini_api_key: Optional[str] = None,
-        gemini_model: str = "gemini-2.0-flash",
+        gemini_model: str = DEFAULT_GEMINI_MODEL,
         min_ai_score: int = 60,
     ) -> None:
         self.repository = repository
         self.min_ai_score = min_ai_score
         self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
-        self.gemini_model = gemini_model
+        self.gemini_model = self._normalize_model_name(os.getenv("GEMINI_MODEL") or gemini_model)
         requested_mode = (os.getenv("DISCOVERY_SOURCE_MODE") or DEFAULT_DISCOVERY_SOURCE_MODE).strip().lower()
         if requested_mode not in DISCOVERY_SOURCE_MODES:
             LOGGER.warning(
@@ -67,6 +69,8 @@ class DiscoveryOracle:
         self.discovery_source_mode = requested_mode
 
         self._model = None
+        self._gemini_candidates: list[str] = []
+        self._gemini_candidate_index: Optional[int] = None
         self.ai_runtime = {
             "engine": "heuristic",
             "model": "heuristic-v1",
@@ -90,31 +94,253 @@ class DiscoveryOracle:
             "anti_bot_message": None,
         }
         if self.gemini_api_key and genai is not None:
-            genai.configure(api_key=self.gemini_api_key)
-            self._model = genai.GenerativeModel(self.gemini_model)
+            self._initialize_gemini_runtime()
+        elif not self.gemini_api_key:
+            LOGGER.warning("Gemini API key missing: fallback heuristic scoring will be used")
             self.ai_runtime = {
-                "engine": "gemini",
-                "model": self.gemini_model,
-                "mode": "api",
+                "engine": "heuristic",
+                "model": "heuristic-v1",
+                "mode": "fallback_no_key",
             }
         else:
-            if not self.gemini_api_key:
-                LOGGER.warning("Gemini API key missing: fallback heuristic scoring will be used")
-                self.ai_runtime = {
-                    "engine": "heuristic",
-                    "model": "heuristic-v1",
-                    "mode": "fallback_no_key",
-                }
-            elif genai is None:
-                LOGGER.warning(
-                    "google-generativeai package not installed: fallback heuristic scoring will be used"
-                )
-                self.ai_runtime = {
-                    "engine": "heuristic",
-                    "model": "heuristic-v1",
-                    "mode": "fallback_missing_package",
-                }
+            LOGGER.warning(
+                "google-generativeai package not installed: fallback heuristic scoring will be used"
+            )
+            self.ai_runtime = {
+                "engine": "heuristic",
+                "model": "heuristic-v1",
+                "mode": "fallback_missing_package",
+            }
         LOGGER.info("Discovery source mode configured: %s", self.discovery_source_mode)
+
+    def _initialize_gemini_runtime(self) -> None:
+        if not self.gemini_api_key or genai is None:
+            return
+
+        try:
+            genai.configure(api_key=self.gemini_api_key)
+        except Exception as exc:  # noqa: BLE001
+            self._disable_gemini("fallback_gemini_config_error", str(exc))
+            return
+
+        discovered = self._discover_available_gemini_models()
+        candidates = self._sort_gemini_model_candidates(
+            discovered,
+            preferred_model=self.gemini_model,
+        )
+        if not candidates:
+            self._disable_gemini("fallback_no_models_listed", "Nessun modello Gemini con generateContent disponibile.")
+            return
+
+        self._gemini_candidates = candidates
+        max_probe = max(1, min(len(candidates), int(os.getenv("GEMINI_MAX_PROBE_MODELS", "6"))))
+        for idx, model_name in enumerate(candidates[:max_probe]):
+            ok, reason = self._probe_gemini_model(model_name)
+            if ok:
+                self._activate_gemini_model(model_name=model_name, index=idx, mode="api_dynamic")
+                if self._model is None:
+                    continue
+                if idx > 0:
+                    LOGGER.warning(
+                        "Gemini preferred model unavailable. Switched to candidate %s/%s: %s",
+                        idx + 1,
+                        len(candidates),
+                        model_name,
+                    )
+                return
+            LOGGER.warning("Gemini model probe failed | model=%s reason=%s", model_name, reason)
+
+        self._disable_gemini(
+            "fallback_no_working_model",
+            "Tutti i modelli Gemini candidati hanno fallito il probe API.",
+        )
+
+    def _discover_available_gemini_models(self) -> list[str]:
+        if genai is None:
+            return []
+        try:
+            models = list(genai.list_models())
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Gemini list_models failed: %s", exc)
+            return []
+
+        available: list[str] = []
+        for model in models:
+            raw_name = getattr(model, "name", None)
+            normalized = self._normalize_model_name(raw_name)
+            if not normalized.startswith("models/gemini"):
+                continue
+            methods = [str(item).lower() for item in (getattr(model, "supported_generation_methods", None) or [])]
+            if "generatecontent" not in methods:
+                continue
+            available.append(normalized)
+
+        return sorted(set(available))
+
+    @classmethod
+    def _sort_gemini_model_candidates(
+        cls,
+        model_names: Iterable[str],
+        *,
+        preferred_model: Optional[str] = None,
+    ) -> list[str]:
+        normalized_unique = sorted({cls._normalize_model_name(name) for name in model_names if name})
+        if not normalized_unique:
+            return []
+
+        ranked = sorted(
+            normalized_unique,
+            key=cls._score_gemini_model_name,
+            reverse=True,
+        )
+        preferred = cls._normalize_model_name(preferred_model)
+        if preferred and preferred in ranked:
+            ranked = [preferred] + [name for name in ranked if name != preferred]
+        return ranked
+
+    @classmethod
+    def _score_gemini_model_name(cls, model_name: str) -> int:
+        lowered = cls._normalize_model_name(model_name).lower()
+        version = cls._extract_gemini_version(lowered)
+        score = int(version * 100)
+
+        if "ultra" in lowered:
+            score += 420
+        elif "pro" in lowered:
+            score += 360
+        elif "thinking" in lowered:
+            score += 320
+        elif "flash" in lowered and "lite" not in lowered:
+            score += 260
+        elif "lite" in lowered:
+            score += 180
+        else:
+            score += 120
+
+        if "latest" in lowered:
+            score += 12
+        if any(token in lowered for token in ("preview", "experimental", "-exp")):
+            score -= 18
+        return score
+
+    @staticmethod
+    def _extract_gemini_version(model_name: str) -> float:
+        match = MODEL_VERSION_RE.search(model_name or "")
+        if not match:
+            return 0.0
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return 0.0
+
+    @staticmethod
+    def _normalize_model_name(model_name: Optional[str]) -> str:
+        cleaned = str(model_name or "").strip()
+        if not cleaned:
+            return ""
+        if cleaned.startswith("models/"):
+            return cleaned
+        return f"models/{cleaned}"
+
+    def _probe_gemini_model(self, model_name: str) -> tuple[bool, str]:
+        if genai is None:
+            return False, "google-generativeai unavailable"
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(
+                '{"ping":"pong"}',
+                generation_config={
+                    "temperature": 0.0,
+                    "max_output_tokens": 16,
+                    "response_mime_type": "application/json",
+                },
+            )
+            _ = getattr(response, "text", None)
+            return True, "ok"
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+
+    def _activate_gemini_model(self, *, model_name: str, index: int, mode: str) -> None:
+        if genai is None:
+            self._disable_gemini("fallback_missing_package", "google-generativeai non disponibile")
+            return
+
+        try:
+            self._model = genai.GenerativeModel(model_name)
+        except Exception as exc:  # noqa: BLE001
+            self._disable_gemini("fallback_after_gemini_error", str(exc))
+            return
+        self.gemini_model = model_name
+        self._gemini_candidate_index = index
+        self.ai_runtime = {
+            "engine": "gemini",
+            "model": model_name,
+            "mode": mode,
+            "candidate_index": index,
+            "candidate_count": len(self._gemini_candidates),
+        }
+        LOGGER.info(
+            "Gemini model activated | model=%s index=%s/%s mode=%s",
+            model_name,
+            index + 1,
+            max(1, len(self._gemini_candidates)),
+            mode,
+        )
+
+    def _advance_gemini_model(self, *, reason: str) -> bool:
+        if not self._gemini_candidates:
+            return False
+
+        start = (self._gemini_candidate_index + 1) if self._gemini_candidate_index is not None else 0
+        for idx in range(start, len(self._gemini_candidates)):
+            model_name = self._gemini_candidates[idx]
+            ok, probe_reason = self._probe_gemini_model(model_name)
+            if not ok:
+                LOGGER.warning(
+                    "Gemini candidate rejected during failover | model=%s reason=%s",
+                    model_name,
+                    probe_reason,
+                )
+                continue
+
+            self._activate_gemini_model(
+                model_name=model_name,
+                index=idx,
+                mode="api_dynamic_failover",
+            )
+            if self._model is None:
+                continue
+            LOGGER.warning("Gemini failover completed | previous_reason=%s new_model=%s", reason, model_name)
+            return True
+
+        return False
+
+    def _disable_gemini(self, mode: str, reason: str) -> None:
+        self._model = None
+        self._gemini_candidate_index = None
+        self.ai_runtime = {
+            "engine": "heuristic",
+            "model": "heuristic-v1",
+            "mode": mode,
+            "reason": reason[:220],
+        }
+        LOGGER.warning("Gemini disabled | mode=%s reason=%s", mode, reason)
+
+    @staticmethod
+    def _should_rotate_gemini_model(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(
+            token in text
+            for token in (
+                "not found",
+                "not supported",
+                "permission denied",
+                "resource exhausted",
+                "quota",
+                "rate limit",
+                "429",
+            )
+        )
 
     async def discover_opportunities(
         self,
@@ -936,15 +1162,24 @@ class DiscoveryOracle:
             predicted_eol_date = payload.get("predicted_eol_date") or candidate.get("eol_date_prediction")
             return AIInsight(score=score, summary=summary, predicted_eol_date=predicted_eol_date)
         except Exception as exc:  # noqa: BLE001
-            err_text = str(exc).lower()
-            if any(token in err_text for token in ("not found", "not supported", "permission denied", "quota")):
-                self._model = None
-                self.ai_runtime = {
-                    "engine": "heuristic",
-                    "model": "heuristic-v1",
-                    "mode": "fallback_after_gemini_error",
-                }
-                LOGGER.warning("Gemini disabled after API error; fallback heuristic enabled: %s", exc)
+            if self._should_rotate_gemini_model(exc) and self._advance_gemini_model(reason=str(exc)):
+                try:
+                    text = await asyncio.to_thread(self._gemini_generate, prompt)
+                    payload = self._extract_json(text)
+                    score = int(payload.get("score", 50))
+                    score = max(1, min(100, score))
+                    summary = str(payload.get("summary") or "No summary")[:1200]
+                    predicted_eol_date = payload.get("predicted_eol_date") or candidate.get("eol_date_prediction")
+                    return AIInsight(score=score, summary=summary, predicted_eol_date=predicted_eol_date)
+                except Exception as exc_after_switch:  # noqa: BLE001
+                    self._disable_gemini("fallback_after_gemini_error", str(exc_after_switch))
+                    LOGGER.warning(
+                        "Gemini scoring failed after failover for %s: %s",
+                        candidate.get("set_id"),
+                        exc_after_switch,
+                    )
+            elif self._should_rotate_gemini_model(exc):
+                self._disable_gemini("fallback_after_gemini_error", str(exc))
             else:
                 LOGGER.warning("Gemini scoring failed for %s: %s", candidate.get("set_id"), exc)
             return self._heuristic_ai_fallback(candidate)
