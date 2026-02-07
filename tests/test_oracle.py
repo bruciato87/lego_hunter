@@ -377,6 +377,54 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["score"], 77)
         self.assertEqual(payload["summary"], "ok")
 
+    def test_select_probe_candidates_keeps_head_and_sparse_tail(self) -> None:
+        candidates = [f"m{i}" for i in range(1, 11)]
+        selected = DiscoveryOracle._select_probe_candidates(candidates, 5)
+
+        self.assertEqual(len(selected), 5)
+        self.assertEqual(selected[:4], ["m1", "m2", "m3", "m4"])
+        self.assertIn(selected[-1], candidates[4:])
+
+    def test_probe_candidates_with_budget_early_stop(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_probe_max_candidates = 3
+        oracle.ai_probe_batch_size = 1
+        oracle.ai_probe_early_successes = 1
+        oracle.ai_probe_budget_sec = 60.0
+
+        report = oracle._probe_candidates_with_budget(
+            provider="TestAI",
+            candidates=["m1", "m2", "m3", "m4"],
+            probe_fn=lambda model: (model == "m1", "ok" if model == "m1" else "fail"),
+            classify_fn=lambda reason: "probe_error",
+        )
+        by_model = {row["model"]: row for row in report}
+        self.assertTrue(by_model["m1"]["available"])
+        self.assertEqual(by_model["m2"]["status"], "not_probed_early_stop")
+        self.assertEqual(by_model["m3"]["status"], "not_probed_early_stop")
+        self.assertEqual(by_model["m4"]["status"], "skipped_low_priority")
+
+    def test_probe_candidates_with_budget_marks_budget_exhausted(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_probe_max_candidates = 3
+        oracle.ai_probe_batch_size = 1
+        oracle.ai_probe_early_successes = 1
+        oracle.ai_probe_budget_sec = 0.0
+
+        report = oracle._probe_candidates_with_budget(
+            provider="TestAI",
+            candidates=["m1", "m2", "m3", "m4"],
+            probe_fn=lambda model: (False, "timeout"),
+            classify_fn=lambda reason: "transient_error",
+        )
+        by_model = {row["model"]: row for row in report}
+        self.assertEqual(by_model["m1"]["status"], "not_probed_budget_exhausted")
+        self.assertEqual(by_model["m2"]["status"], "not_probed_budget_exhausted")
+        self.assertEqual(by_model["m3"]["status"], "not_probed_budget_exhausted")
+        self.assertEqual(by_model["m4"]["status"], "skipped_low_priority")
+
 
 if __name__ == "__main__":
     unittest.main()

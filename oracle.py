@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import html
 import json
 import logging
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Dict, Iterable, Optional
@@ -35,6 +38,12 @@ DISCOVERY_SOURCE_MODES = {"external_first", "playwright_first", "external_only"}
 DEFAULT_DISCOVERY_SOURCE_MODE = "external_first"
 DEFAULT_GEMINI_MODEL = "models/gemini-2.0-flash"
 DEFAULT_OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
+DEFAULT_AI_PROBE_MAX_CANDIDATES = 8
+DEFAULT_AI_PROBE_BATCH_SIZE = 3
+DEFAULT_AI_PROBE_BUDGET_SEC = 90.0
+DEFAULT_AI_PROBE_TIMEOUT_SEC = 12.0
+DEFAULT_AI_GENERATION_TIMEOUT_SEC = 20.0
+DEFAULT_OPENROUTER_MODELS_TIMEOUT_SEC = 15.0
 
 
 @dataclass
@@ -63,6 +72,48 @@ class DiscoveryOracle:
         self.openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
         self.openrouter_api_base = (os.getenv("OPENROUTER_API_BASE") or DEFAULT_OPENROUTER_API_BASE).rstrip("/")
         self.openrouter_model_preference = (os.getenv("OPENROUTER_MODEL") or "").strip()
+        self.ai_probe_max_candidates = self._safe_env_int(
+            "AI_PROBE_MAX_CANDIDATES",
+            default=DEFAULT_AI_PROBE_MAX_CANDIDATES,
+            minimum=1,
+            maximum=30,
+        )
+        self.ai_probe_batch_size = self._safe_env_int(
+            "AI_PROBE_BATCH_SIZE",
+            default=DEFAULT_AI_PROBE_BATCH_SIZE,
+            minimum=1,
+            maximum=10,
+        )
+        self.ai_probe_early_successes = self._safe_env_int(
+            "AI_PROBE_EARLY_SUCCESSES",
+            default=1,
+            minimum=1,
+            maximum=5,
+        )
+        self.ai_probe_budget_sec = self._safe_env_float(
+            "AI_PROBE_BUDGET_SEC",
+            default=DEFAULT_AI_PROBE_BUDGET_SEC,
+            minimum=15.0,
+            maximum=240.0,
+        )
+        self.ai_probe_timeout_sec = self._safe_env_float(
+            "AI_PROBE_TIMEOUT_SEC",
+            default=DEFAULT_AI_PROBE_TIMEOUT_SEC,
+            minimum=4.0,
+            maximum=60.0,
+        )
+        self.ai_generation_timeout_sec = self._safe_env_float(
+            "AI_GENERATION_TIMEOUT_SEC",
+            default=DEFAULT_AI_GENERATION_TIMEOUT_SEC,
+            minimum=8.0,
+            maximum=120.0,
+        )
+        self.openrouter_models_timeout_sec = self._safe_env_float(
+            "OPENROUTER_MODELS_TIMEOUT_SEC",
+            default=DEFAULT_OPENROUTER_MODELS_TIMEOUT_SEC,
+            minimum=5.0,
+            maximum=90.0,
+        )
         requested_mode = (os.getenv("DISCOVERY_SOURCE_MODE") or DEFAULT_DISCOVERY_SOURCE_MODE).strip().lower()
         if requested_mode not in DISCOVERY_SOURCE_MODES:
             LOGGER.warning(
@@ -138,6 +189,15 @@ class DiscoveryOracle:
                     "model": "heuristic-ai-v2",
                     "mode": "fallback_no_external_ai",
                 }
+        LOGGER.info(
+            "AI probe tuning | max_candidates=%s batch=%s early_successes=%s budget_sec=%.1f probe_timeout_sec=%.1f gen_timeout_sec=%.1f",
+            self.ai_probe_max_candidates,
+            self.ai_probe_batch_size,
+            self.ai_probe_early_successes,
+            self.ai_probe_budget_sec,
+            self.ai_probe_timeout_sec,
+            self.ai_generation_timeout_sec,
+        )
         LOGGER.info("Discovery source mode configured: %s", self.discovery_source_mode)
 
     def _initialize_gemini_runtime(self) -> None:
@@ -184,6 +244,31 @@ class DiscoveryOracle:
             self.ai_runtime["inventory_available"] = len(available_models)
             self.ai_runtime["probe_report"] = probe_report[:8]
             return
+
+        optimistic_model = next(
+            (
+                row.get("model")
+                for row in probe_report
+                if row.get("status") in {"not_probed_budget_exhausted", "not_probed_early_stop", "not_probed"}
+            ),
+            None,
+        )
+        if optimistic_model and optimistic_model in candidates:
+            optimistic_idx = candidates.index(optimistic_model)
+            self._activate_gemini_model(
+                model_name=optimistic_model,
+                index=optimistic_idx,
+                mode="api_dynamic_optimistic",
+            )
+            if self._model is not None:
+                self.ai_runtime["inventory_total"] = len(candidates)
+                self.ai_runtime["inventory_available"] = 0
+                self.ai_runtime["probe_report"] = probe_report[:8]
+                LOGGER.warning(
+                    "Gemini optimistic activation | model=%s reason=no_probed_available",
+                    optimistic_model,
+                )
+                return
 
         if any(row.get("status") == "quota_exhausted_global" for row in probe_report):
             self._disable_gemini(
@@ -302,55 +387,264 @@ class DiscoveryOracle:
             return cleaned
         return f"models/{cleaned}"
 
-    def _probe_gemini_model(self, model_name: str) -> tuple[bool, str]:
-        if genai is None:
-            return False, "google-generativeai unavailable"
-        try:
-            model = genai.GenerativeModel(model_name)
-            model.generate_content(
-                "Rispondi con una sola parola: ok",
-                generation_config={
-                    "temperature": 0.0,
-                    "max_output_tokens": 16,
-                },
-            )
-            return True, "ok"
-        except Exception as exc:  # noqa: BLE001
-            return False, str(exc)
+    @staticmethod
+    def _safe_env_int(
+        name: str,
+        *,
+        default: int,
+        minimum: Optional[int] = None,
+        maximum: Optional[int] = None,
+    ) -> int:
+        raw = os.getenv(name)
+        if raw is None:
+            value = default
+        else:
+            try:
+                value = int(raw)
+            except ValueError:
+                LOGGER.warning("Invalid int env %s=%r. Using default=%s.", name, raw, default)
+                value = default
 
-    def _probe_all_gemini_candidates(self, candidates: list[str]) -> list[Dict[str, Any]]:
-        report: list[Dict[str, Any]] = []
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    @staticmethod
+    def _safe_env_float(
+        name: str,
+        *,
+        default: float,
+        minimum: Optional[float] = None,
+        maximum: Optional[float] = None,
+    ) -> float:
+        raw = os.getenv(name)
+        if raw is None:
+            value = default
+        else:
+            try:
+                value = float(raw)
+            except ValueError:
+                LOGGER.warning("Invalid float env %s=%r. Using default=%.2f.", name, raw, default)
+                value = default
+
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    @staticmethod
+    def _select_probe_candidates(candidates: list[str], limit: int) -> list[str]:
+        if not candidates or limit <= 0:
+            return []
+        if limit >= len(candidates):
+            return list(candidates)
+
+        # Keep most-capable head models and add sparse tail coverage for diversity.
+        head_count = max(1, int(math.ceil(limit * 0.7)))
+        head = candidates[:head_count]
+        remaining = limit - len(head)
+        if remaining <= 0:
+            return head
+
+        tail = candidates[head_count:]
+        if not tail:
+            return head
+
+        if remaining >= len(tail):
+            return head + tail
+
+        step = len(tail) / float(remaining)
+        selected_tail: list[str] = []
+        used_indices: set[int] = set()
+        for idx in range(remaining):
+            pos = int(round(idx * step))
+            pos = min(pos, len(tail) - 1)
+            while pos in used_indices and pos + 1 < len(tail):
+                pos += 1
+            used_indices.add(pos)
+            selected_tail.append(tail[pos])
+        return head + selected_tail
+
+    def _probe_candidates_with_budget(
+        self,
+        *,
+        provider: str,
+        candidates: list[str],
+        probe_fn,
+        classify_fn,
+    ) -> list[Dict[str, Any]]:
+        if not candidates:
+            return []
+
+        selected = self._select_probe_candidates(candidates, self.ai_probe_max_candidates)
+        selected_set = set(selected)
+        probe_limit = max(1, self.ai_probe_batch_size)
+        report_by_model: Dict[str, Dict[str, Any]] = {}
+        available_count = 0
         global_quota_zero = False
+        budget_exhausted = False
+        started = time.monotonic()
 
+        LOGGER.info(
+            "%s probe start | candidates=%s selected=%s budget_sec=%.1f batch=%s",
+            provider,
+            len(candidates),
+            len(selected),
+            self.ai_probe_budget_sec,
+            probe_limit,
+        )
+
+        for offset in range(0, len(selected), probe_limit):
+            elapsed = time.monotonic() - started
+            if elapsed >= self.ai_probe_budget_sec:
+                budget_exhausted = True
+                break
+            if global_quota_zero or available_count >= self.ai_probe_early_successes:
+                break
+
+            batch = selected[offset : offset + probe_limit]
+            LOGGER.info(
+                "%s probe batch | idx=%s size=%s elapsed=%.2fs",
+                provider,
+                (offset // probe_limit) + 1,
+                len(batch),
+                elapsed,
+            )
+            with ThreadPoolExecutor(max_workers=min(len(batch), probe_limit)) as executor:
+                futures = {executor.submit(probe_fn, model_name): model_name for model_name in batch}
+                for future in as_completed(futures):
+                    model_name = futures[future]
+                    try:
+                        ok, reason = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        ok, reason = False, str(exc)
+                    status = "available" if ok else classify_fn(reason)
+                    report_by_model[model_name] = {
+                        "model": model_name,
+                        "available": ok,
+                        "status": status,
+                        "reason": str(reason)[:220],
+                    }
+                    if ok:
+                        available_count += 1
+                    else:
+                        LOGGER.warning(
+                            "%s model probe failed | model=%s status=%s reason=%s",
+                            provider,
+                            model_name,
+                            status,
+                            reason,
+                        )
+                        if status == "quota_exhausted_global":
+                            global_quota_zero = True
+
+        report: list[Dict[str, Any]] = []
         for model_name in candidates:
+            entry = report_by_model.get(model_name)
+            if entry:
+                report.append(entry)
+                continue
+
+            if model_name not in selected_set:
+                report.append(
+                    {
+                        "model": model_name,
+                        "available": False,
+                        "status": "skipped_low_priority",
+                        "reason": "Skipped by budgeted probe strategy.",
+                    }
+                )
+                continue
+
             if global_quota_zero:
                 report.append(
                     {
                         "model": model_name,
                         "available": False,
                         "status": "quota_exhausted_global",
-                        "reason": "Inherited global quota lock (limit: 0).",
+                        "reason": "Inherited global quota lock.",
                     }
                 )
                 continue
 
-            ok, reason = self._probe_gemini_model(model_name)
-            status = "available" if ok else self._classify_gemini_probe_failure(reason)
+            if budget_exhausted:
+                report.append(
+                    {
+                        "model": model_name,
+                        "available": False,
+                        "status": "not_probed_budget_exhausted",
+                        "reason": "AI probe budget exhausted before testing this model.",
+                    }
+                )
+                continue
+
+            if available_count >= self.ai_probe_early_successes:
+                report.append(
+                    {
+                        "model": model_name,
+                        "available": False,
+                        "status": "not_probed_early_stop",
+                        "reason": "Early-stop after finding available model.",
+                    }
+                )
+                continue
+
             report.append(
                 {
                     "model": model_name,
-                    "available": ok,
-                    "status": status,
-                    "reason": reason[:220],
+                    "available": False,
+                    "status": "not_probed",
+                    "reason": "Model not reached in probe loop.",
                 }
             )
-            if ok:
-                continue
-            LOGGER.warning("Gemini model probe failed | model=%s status=%s reason=%s", model_name, status, reason)
-            if status == "quota_exhausted_global":
-                global_quota_zero = True
 
+        LOGGER.info(
+            "%s probe summary | selected=%s probed=%s available=%s elapsed=%.2fs budget_exhausted=%s early_stop=%s quota_zero=%s",
+            provider,
+            len(selected),
+            len(report_by_model),
+            available_count,
+            time.monotonic() - started,
+            budget_exhausted,
+            available_count >= self.ai_probe_early_successes,
+            global_quota_zero,
+        )
         return report
+
+    def _probe_gemini_model(self, model_name: str) -> tuple[bool, str]:
+        if genai is None:
+            return False, "google-generativeai unavailable"
+        try:
+            model = genai.GenerativeModel(model_name)
+            payload = {
+                "temperature": 0.0,
+                "max_output_tokens": 16,
+            }
+            try:
+                model.generate_content(
+                    "Rispondi con una sola parola: ok",
+                    generation_config=payload,
+                    request_options={"timeout": self.ai_probe_timeout_sec},
+                )
+            except TypeError:
+                model.generate_content(
+                    "Rispondi con una sola parola: ok",
+                    generation_config=payload,
+                )
+            return True, "ok"
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+
+    def _probe_all_gemini_candidates(self, candidates: list[str]) -> list[Dict[str, Any]]:
+        return self._probe_candidates_with_budget(
+            provider="Gemini",
+            candidates=candidates,
+            probe_fn=self._probe_gemini_model,
+            classify_fn=self._classify_gemini_probe_failure,
+        )
 
     @classmethod
     def _classify_gemini_probe_failure(cls, reason: str) -> str:
@@ -484,6 +778,28 @@ class DiscoveryOracle:
             )
             return
 
+        optimistic_model = next(
+            (
+                row.get("model")
+                for row in probe_report
+                if row.get("status") in {"not_probed_budget_exhausted", "not_probed_early_stop", "not_probed"}
+            ),
+            None,
+        )
+        if optimistic_model and optimistic_model in candidates:
+            optimistic_idx = candidates.index(optimistic_model)
+            self._activate_openrouter_model(
+                model_id=optimistic_model,
+                index=optimistic_idx,
+                mode="api_openrouter_optimistic",
+                probe_report=probe_report,
+            )
+            LOGGER.warning(
+                "OpenRouter optimistic activation | model=%s reason=no_probed_available",
+                optimistic_model,
+            )
+            return
+
         if any(row.get("status") == "quota_exhausted_global" for row in probe_report):
             self._disable_openrouter(
                 "fallback_openrouter_quota_exhausted",
@@ -504,7 +820,7 @@ class DiscoveryOracle:
 
         url = f"{self.openrouter_api_base}/models"
         headers = self._openrouter_headers(include_json=False)
-        response = requests.get(url, headers=headers, timeout=40)
+        response = requests.get(url, headers=headers, timeout=self.openrouter_models_timeout_sec)
         if response.status_code >= 400:
             raise RuntimeError(f"OpenRouter model list error {response.status_code}: {response.text[:220]}")
 
@@ -605,36 +921,12 @@ class DiscoveryOracle:
         return True
 
     def _probe_all_openrouter_candidates(self, candidates: list[str]) -> list[Dict[str, Any]]:
-        report: list[Dict[str, Any]] = []
-        global_quota_zero = False
-        for model_id in candidates:
-            if global_quota_zero:
-                report.append(
-                    {
-                        "model": model_id,
-                        "available": False,
-                        "status": "quota_exhausted_global",
-                        "reason": "Inherited global quota lock.",
-                    }
-                )
-                continue
-
-            ok, reason = self._probe_openrouter_model(model_id)
-            status = "available" if ok else self._classify_openrouter_probe_failure(reason)
-            report.append(
-                {
-                    "model": model_id,
-                    "available": ok,
-                    "status": status,
-                    "reason": reason[:220],
-                }
-            )
-            if ok:
-                continue
-            LOGGER.warning("OpenRouter model probe failed | model=%s status=%s reason=%s", model_id, status, reason)
-            if status == "quota_exhausted_global":
-                global_quota_zero = True
-        return report
+        return self._probe_candidates_with_budget(
+            provider="OpenRouter",
+            candidates=candidates,
+            probe_fn=self._probe_openrouter_model,
+            classify_fn=self._classify_openrouter_probe_failure,
+        )
 
     def _probe_openrouter_model(self, model_id: str) -> tuple[bool, str]:
         if requests is None:
@@ -645,6 +937,7 @@ class DiscoveryOracle:
                 messages=[{"role": "user", "content": "Rispondi con una sola parola: ok"}],
                 max_tokens=8,
                 temperature=0.0,
+                request_timeout=self.ai_probe_timeout_sec,
             )
             return True, "ok"
         except Exception as exc:  # noqa: BLE001
@@ -768,6 +1061,7 @@ class DiscoveryOracle:
         messages: list[Dict[str, str]],
         max_tokens: int,
         temperature: float,
+        request_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         if requests is None:
             raise RuntimeError("requests unavailable")
@@ -785,7 +1079,7 @@ class DiscoveryOracle:
             url,
             headers=self._openrouter_headers(include_json=True),
             json=payload,
-            timeout=45,
+            timeout=request_timeout or self.ai_generation_timeout_sec,
         )
         if response.status_code >= 400:
             raise RuntimeError(f"OpenRouter error {response.status_code}: {response.text[:260]}")
@@ -801,7 +1095,7 @@ class DiscoveryOracle:
         data = self._openrouter_chat_completion(
             model_id=self._openrouter_model_id,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=420,
+            max_tokens=220,
             temperature=0.2,
         )
         choices = data.get("choices")
@@ -1727,14 +2021,22 @@ class DiscoveryOracle:
         if self._model is None:
             return "{}"
 
-        response = self._model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": 0.2,
-                "max_output_tokens": 400,
-                "response_mime_type": "application/json",
-            },
-        )
+        generation_config = {
+            "temperature": 0.2,
+            "max_output_tokens": 220,
+            "response_mime_type": "application/json",
+        }
+        try:
+            response = self._model.generate_content(
+                prompt,
+                generation_config=generation_config,
+                request_options={"timeout": self.ai_generation_timeout_sec},
+            )
+        except TypeError:
+            response = self._model.generate_content(
+                prompt,
+                generation_config=generation_config,
+            )
         return (response.text or "").strip()
 
     @staticmethod
