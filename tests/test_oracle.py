@@ -425,6 +425,14 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_model["m3"]["status"], "not_probed_budget_exhausted")
         self.assertEqual(by_model["m4"]["status"], "skipped_low_priority")
 
+    def test_ai_score_collapse_detection_true(self) -> None:
+        ranked = [{"ai_investment_score": score} for score in [50, 50, 50, 49, 51, 50, 50, 49]]
+        self.assertTrue(DiscoveryOracle._is_ai_score_collapse(ranked))
+
+    def test_ai_score_collapse_detection_false_with_wide_spread(self) -> None:
+        ranked = [{"ai_investment_score": score} for score in [35, 42, 55, 61, 73, 67, 58, 49]]
+        self.assertFalse(DiscoveryOracle._is_ai_score_collapse(ranked))
+
 
 if __name__ == "__main__":
     unittest.main()

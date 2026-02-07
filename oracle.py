@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -1278,14 +1279,14 @@ class DiscoveryOracle:
         source_candidates: list[Dict[str, Any]],
         *,
         persist: bool,
+        rerank_attempt: int = 0,
     ) -> list[Dict[str, Any]]:
         if not source_candidates:
             LOGGER.info("Ranking skipped | no source candidates available")
             return []
 
         ranked: list[Dict[str, Any]] = []
-        persisted_opportunities = 0
-        persisted_snapshots = 0
+        opportunities: list[tuple[OpportunityRadarRecord, Dict[str, Any]]] = []
         for candidate in source_candidates:
             ai = await self._get_ai_insight(candidate)
             demand = self._estimate_market_demand(candidate, ai.score)
@@ -1310,29 +1311,53 @@ class DiscoveryOracle:
             payload["market_demand_score"] = demand
             payload["ai_investment_score"] = ai.score
             ranked.append(payload)
+            opportunities.append((opportunity, candidate))
 
-            if not persist:
-                continue
+        if rerank_attempt == 0 and self._is_ai_score_collapse(ranked):
+            switched = False
+            if self._openrouter_model_id:
+                switched = self._advance_openrouter_model(reason="score_collapse_guard")
+            elif self._model is not None:
+                switched = self._advance_gemini_model(reason="score_collapse_guard")
 
-            try:
-                self.repository.upsert_opportunity(opportunity)
-                persisted_opportunities += 1
-                if candidate.get("current_price") is not None:
-                    self.repository.insert_market_snapshot(
-                        MarketTimeSeriesRecord(
-                            set_id=candidate["set_id"],
-                            set_name=candidate["set_name"],
-                            platform="lego" if "lego" in candidate.get("source", "") else "amazon",
-                            listing_type="new",
-                            price=float(candidate["current_price"]),
-                            shipping_cost=0.0,
-                            listing_url=candidate.get("listing_url"),
-                            raw_payload=candidate,
+            if switched:
+                LOGGER.warning(
+                    "AI score collapse detected | candidates=%s spread=%s switching_model=%s rerank_attempt=%s",
+                    len(ranked),
+                    max(int(row.get("ai_investment_score") or 0) for row in ranked)
+                    - min(int(row.get("ai_investment_score") or 0) for row in ranked),
+                    self.ai_runtime.get("model"),
+                    rerank_attempt + 1,
+                )
+                return await self._rank_and_persist_candidates(
+                    source_candidates,
+                    persist=persist,
+                    rerank_attempt=rerank_attempt + 1,
+                )
+
+        persisted_opportunities = 0
+        persisted_snapshots = 0
+        if persist:
+            for opportunity, candidate in opportunities:
+                try:
+                    self.repository.upsert_opportunity(opportunity)
+                    persisted_opportunities += 1
+                    if candidate.get("current_price") is not None:
+                        self.repository.insert_market_snapshot(
+                            MarketTimeSeriesRecord(
+                                set_id=candidate["set_id"],
+                                set_name=candidate["set_name"],
+                                platform="lego" if "lego" in candidate.get("source", "") else "amazon",
+                                listing_type="new",
+                                price=float(candidate["current_price"]),
+                                shipping_cost=0.0,
+                                listing_url=candidate.get("listing_url"),
+                                raw_payload=candidate,
+                            )
                         )
-                    )
-                    persisted_snapshots += 1
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("Failed to persist opportunity %s: %s", candidate.get("set_id"), exc)
+                        persisted_snapshots += 1
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Failed to persist opportunity %s: %s", candidate.get("set_id"), exc)
         LOGGER.info(
             "Ranking completed | candidates=%s persisted_opportunities=%s persisted_snapshots=%s",
             len(source_candidates),
@@ -1340,6 +1365,23 @@ class DiscoveryOracle:
             persisted_snapshots,
         )
         return ranked
+
+    @staticmethod
+    def _is_ai_score_collapse(ranked: list[Dict[str, Any]]) -> bool:
+        if len(ranked) < 6:
+            return False
+
+        scores = [int(row.get("ai_investment_score") or 0) for row in ranked]
+        spread = max(scores) - min(scores)
+        if spread > 8:
+            return False
+
+        mean = sum(scores) / len(scores)
+        if mean < 42 or mean > 58:
+            return False
+
+        dominant = Counter(scores).most_common(1)[0][1]
+        return dominant / len(scores) >= 0.6
 
     async def validate_secondary_deals(self, opportunities: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
         """Fetch Vinted/Subito offers for discovered sets and persist secondary snapshots."""
