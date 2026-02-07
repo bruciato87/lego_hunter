@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from telegram import Bot, BotCommand, Update
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from fiscal import FiscalGuardian
@@ -443,7 +444,12 @@ async def run_scheduled_cycle(
             disable_web_page_preview=True,
         )
     finally:
-        await bot.close()
+        try:
+            await bot.close()
+        except RetryAfter as exc:
+            LOGGER.warning("Telegram flood-control on bot.close(): %s", exc)
+        except TelegramError as exc:
+            LOGGER.warning("Telegram error on bot.close(): %s", exc)
 
 
 def parse_args() -> argparse.Namespace:
