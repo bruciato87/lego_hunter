@@ -70,6 +70,85 @@ class DummyOracle(DiscoveryOracle):
 
 
 class OracleTests(unittest.IsolatedAsyncioTestCase):
+    def test_validate_ai_payload_requires_json_contract(self) -> None:
+        valid = DiscoveryOracle._validate_ai_payload(
+            {
+                "score": 73,
+                "summary": "domanda buona",
+                "predicted_eol_date": "2026-09-01",
+            },
+            candidate=None,
+        )
+        self.assertEqual(valid["score"], 73)
+
+        with self.assertRaises(ValueError):
+            DiscoveryOracle._validate_ai_payload({"summary": "x"}, candidate=None)
+        with self.assertRaises(ValueError):
+            DiscoveryOracle._validate_ai_payload({"score": 101, "summary": "x"}, candidate=None)
+        with self.assertRaises(ValueError):
+            DiscoveryOracle._validate_ai_payload(
+                {"score": 70, "summary": "", "predicted_eol_date": "bad-date"},
+                candidate=None,
+            )
+
+    def test_rank_candidate_models_skips_temporarily_banned(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+
+        oracle._record_model_failure("openrouter", "m1", "timeout 524", phase="probe")
+        ranked = oracle._rank_candidate_models("openrouter", ["m1", "m2"], allow_forced_retry=False)
+        self.assertEqual(ranked, ["m2"])
+
+    def test_record_model_failure_sets_temporary_ban(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_model_ban_sec = 60.0
+        oracle.ai_model_ban_failures = 2
+
+        banned = oracle._record_model_failure("gemini", "models/gemini-2.0-flash", "timeout", phase="scoring")
+        self.assertTrue(banned)
+        self.assertTrue(oracle._is_model_temporarily_banned("gemini", "models/gemini-2.0-flash"))
+
+    def test_openrouter_strict_probe_disables_optimistic_activation(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_gemini_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key="fake", openrouter_api_key="fake-or-key")
+
+        oracle.strict_ai_probe_validation = True
+        oracle._openrouter_inventory_loaded = False
+        oracle._openrouter_model_id = None
+        oracle._openrouter_candidates = []
+        oracle._openrouter_available_candidates = []
+        oracle._openrouter_probe_report = []
+
+        with patch.object(
+            oracle,
+            "_fetch_openrouter_model_payloads",
+            return_value=[
+                {
+                    "id": "vendor/model-a:free",
+                    "pricing": {"prompt": "0", "completion": "0"},
+                    "architecture": {"modality": "text->text"},
+                    "context_length": 32000,
+                }
+            ],
+        ), patch.object(
+            oracle,
+            "_probe_all_openrouter_candidates",
+            return_value=[
+                {
+                    "model": "vendor/model-a:free",
+                    "available": False,
+                    "status": "not_probed_budget_exhausted",
+                    "reason": "budget",
+                }
+            ],
+        ):
+            oracle._initialize_openrouter_runtime()
+
+        self.assertIsNone(oracle._openrouter_model_id)
+        self.assertEqual(oracle.ai_runtime.get("mode"), "fallback_openrouter_no_working_model")
+
     async def test_discover_opportunities_filters_by_min_score(self) -> None:
         repo = FakeRepo()
         now = datetime.now(timezone.utc)

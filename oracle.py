@@ -54,6 +54,11 @@ DEFAULT_AI_CACHE_MAX_ITEMS = 4000
 DEFAULT_OPENROUTER_MALFORMED_LIMIT = 3
 DEFAULT_AI_SCORING_HARD_BUDGET_SEC = 60.0
 DEFAULT_AI_SCORING_ITEM_TIMEOUT_SEC = 18.0
+DEFAULT_AI_MODEL_BAN_SEC = 1800.0
+DEFAULT_AI_MODEL_BAN_FAILURES = 2
+DEFAULT_AI_MODEL_FAILURE_PENALTY = 22
+DEFAULT_AI_MODEL_SUCCESS_REWARD = 3
+DEFAULT_AI_STRICT_PROBE_VALIDATION = True
 DEFAULT_HISTORY_WINDOW_DAYS = 180
 DEFAULT_BACKTEST_LOOKBACK_DAYS = 365
 DEFAULT_BACKTEST_HORIZON_DAYS = 180
@@ -234,6 +239,34 @@ class DiscoveryOracle:
             minimum=4.0,
             maximum=120.0,
         )
+        self.strict_ai_probe_validation = self._safe_env_bool(
+            "AI_STRICT_PROBE_VALIDATION",
+            default=DEFAULT_AI_STRICT_PROBE_VALIDATION,
+        )
+        self.ai_model_ban_sec = self._safe_env_float(
+            "AI_MODEL_BAN_SEC",
+            default=DEFAULT_AI_MODEL_BAN_SEC,
+            minimum=60.0,
+            maximum=86400.0,
+        )
+        self.ai_model_ban_failures = self._safe_env_int(
+            "AI_MODEL_BAN_FAILURES",
+            default=DEFAULT_AI_MODEL_BAN_FAILURES,
+            minimum=1,
+            maximum=20,
+        )
+        self.ai_model_failure_penalty = self._safe_env_int(
+            "AI_MODEL_FAILURE_PENALTY",
+            default=DEFAULT_AI_MODEL_FAILURE_PENALTY,
+            minimum=1,
+            maximum=80,
+        )
+        self.ai_model_success_reward = self._safe_env_int(
+            "AI_MODEL_SUCCESS_REWARD",
+            default=DEFAULT_AI_MODEL_SUCCESS_REWARD,
+            minimum=1,
+            maximum=30,
+        )
         requested_mode = (os.getenv("DISCOVERY_SOURCE_MODE") or DEFAULT_DISCOVERY_SOURCE_MODE).strip().lower()
         if requested_mode not in DISCOVERY_SOURCE_MODES:
             LOGGER.warning(
@@ -256,6 +289,10 @@ class DiscoveryOracle:
         self._openrouter_candidate_index: Optional[int] = None
         self._openrouter_inventory_loaded = False
         self._openrouter_malformed_errors = 0
+        self._model_health: Dict[str, Dict[str, Dict[str, Any]]] = {
+            "gemini": {},
+            "openrouter": {},
+        }
         self._ai_insight_cache: Dict[str, tuple[float, AIInsight]] = {}
         self._ai_failover_lock: Optional[asyncio.Lock] = None
         self._last_ranking_diagnostics: Dict[str, Any] = {}
@@ -318,16 +355,17 @@ class DiscoveryOracle:
             self._apply_auto_tuned_thresholds()
 
         LOGGER.info(
-            "AI probe tuning | max_candidates=%s batch=%s early_successes=%s budget_sec=%.1f probe_timeout_sec=%.1f gen_timeout_sec=%.1f",
+            "AI probe tuning | max_candidates=%s batch=%s early_successes=%s budget_sec=%.1f probe_timeout_sec=%.1f gen_timeout_sec=%.1f strict_json=%s",
             self.ai_probe_max_candidates,
             self.ai_probe_batch_size,
             self.ai_probe_early_successes,
             self.ai_probe_budget_sec,
             self.ai_probe_timeout_sec,
             self.ai_generation_timeout_sec,
+            self.strict_ai_probe_validation,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
             self.ai_cache_ttl_sec,
@@ -335,6 +373,8 @@ class DiscoveryOracle:
             self.openrouter_malformed_limit,
             self.ai_scoring_hard_budget_sec,
             self.ai_scoring_item_timeout_sec,
+            self.ai_model_ban_sec,
+            self.ai_model_ban_failures,
         )
         LOGGER.info(
             "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f",
@@ -385,7 +425,8 @@ class DiscoveryOracle:
         )
 
         if available_models:
-            best_model = available_models[0]
+            ordered = self._rank_candidate_models("gemini", available_models, allow_forced_retry=False) or available_models
+            best_model = ordered[0]
             best_idx = candidates.index(best_model)
             self._activate_gemini_model(model_name=best_model, index=best_idx, mode="api_dynamic_inventory")
             if self._model is None:
@@ -396,6 +437,16 @@ class DiscoveryOracle:
                 return
             self.ai_runtime["inventory_total"] = len(candidates)
             self.ai_runtime["inventory_available"] = len(available_models)
+            self.ai_runtime["probe_report"] = probe_report[:8]
+            return
+
+        if self.strict_ai_probe_validation:
+            self._disable_gemini(
+                "fallback_no_working_model",
+                "Nessun modello Gemini ha superato il probe reale JSON.",
+            )
+            self.ai_runtime["inventory_total"] = len(candidates)
+            self.ai_runtime["inventory_available"] = 0
             self.ai_runtime["probe_report"] = probe_report[:8]
             return
 
@@ -603,6 +654,151 @@ class DiscoveryOracle:
         return default
 
     @staticmethod
+    def _provider_health_key(provider: str) -> str:
+        lowered = str(provider or "").strip().lower()
+        if "openrouter" in lowered:
+            return "openrouter"
+        return "gemini"
+
+    def _get_model_health(self, provider: str, model_name: str) -> Dict[str, Any]:
+        provider_key = self._provider_health_key(provider)
+        model_key = str(model_name or "").strip()
+        bucket = self._model_health.setdefault(provider_key, {})
+        row = bucket.get(model_key)
+        if row is None:
+            row = {
+                "score": 100,
+                "consecutive_failures": 0,
+                "total_failures": 0,
+                "total_successes": 0,
+                "banned_until": 0.0,
+                "last_error": None,
+                "last_event_at": None,
+            }
+            bucket[model_key] = row
+        return row
+
+    def _ban_remaining_sec(self, provider: str, model_name: str) -> float:
+        row = self._get_model_health(provider, model_name)
+        banned_until = float(row.get("banned_until") or 0.0)
+        return max(0.0, banned_until - time.time())
+
+    def _is_model_temporarily_banned(self, provider: str, model_name: str) -> bool:
+        return self._ban_remaining_sec(provider, model_name) > 0.0
+
+    @staticmethod
+    def _is_severe_model_failure_reason(reason: str) -> bool:
+        text = str(reason or "").lower()
+        severe_tokens = (
+            "524",
+            "timeout",
+            "timed out",
+            "missing choices",
+            "missing message",
+            "missing text content",
+            "invalid response payload",
+            "invalid json payload",
+            "invalid ai payload",
+            "payload error",
+            "502",
+            "503",
+            "504",
+        )
+        return any(token in text for token in severe_tokens)
+
+    def _record_model_success(self, provider: str, model_name: str, *, phase: str) -> None:
+        row = self._get_model_health(provider, model_name)
+        row["score"] = min(100, int(row.get("score") or 100) + self.ai_model_success_reward)
+        row["consecutive_failures"] = 0
+        row["total_successes"] = int(row.get("total_successes") or 0) + 1
+        row["banned_until"] = 0.0
+        row["last_event_at"] = datetime.now(timezone.utc).isoformat()
+        if phase == "probe":
+            LOGGER.info(
+                "AI model health success | provider=%s model=%s score=%s",
+                self._provider_health_key(provider),
+                model_name,
+                row["score"],
+            )
+
+    def _record_model_failure(self, provider: str, model_name: str, reason: str, *, phase: str) -> bool:
+        row = self._get_model_health(provider, model_name)
+        severe = self._is_severe_model_failure_reason(reason)
+        penalty = self.ai_model_failure_penalty + (10 if severe else 0)
+        row["score"] = max(1, int(row.get("score") or 100) - penalty)
+        row["consecutive_failures"] = int(row.get("consecutive_failures") or 0) + 1
+        row["total_failures"] = int(row.get("total_failures") or 0) + 1
+        row["last_error"] = str(reason)[:240]
+        row["last_event_at"] = datetime.now(timezone.utc).isoformat()
+
+        should_ban = severe or int(row.get("consecutive_failures") or 0) >= self.ai_model_ban_failures
+        if should_ban:
+            ban_multiplier = min(3, int(row.get("consecutive_failures") or 1))
+            ban_seconds = float(self.ai_model_ban_sec) * float(ban_multiplier)
+            row["banned_until"] = max(float(row.get("banned_until") or 0.0), time.time() + ban_seconds)
+            LOGGER.warning(
+                "AI model temporarily banned | provider=%s model=%s phase=%s ban_sec=%.0f score=%s failures=%s reason=%s",
+                self._provider_health_key(provider),
+                model_name,
+                phase,
+                ban_seconds,
+                row["score"],
+                row["consecutive_failures"],
+                str(reason)[:220],
+            )
+        else:
+            LOGGER.warning(
+                "AI model failure | provider=%s model=%s phase=%s score=%s failures=%s reason=%s",
+                self._provider_health_key(provider),
+                model_name,
+                phase,
+                row["score"],
+                row["consecutive_failures"],
+                str(reason)[:220],
+            )
+        return should_ban
+
+    def _rank_candidate_models(
+        self,
+        provider: str,
+        pool: list[str],
+        *,
+        allow_forced_retry: bool = True,
+    ) -> list[str]:
+        if not pool:
+            return []
+
+        indexed = {model: idx for idx, model in enumerate(pool)}
+        eligible = [model for model in pool if not self._is_model_temporarily_banned(provider, model)]
+        if eligible:
+            return sorted(
+                eligible,
+                key=lambda model: (
+                    -int(self._get_model_health(provider, model).get("score") or 100),
+                    indexed[model],
+                ),
+            )
+
+        if not allow_forced_retry:
+            return []
+        forced = min(pool, key=lambda model: self._ban_remaining_sec(provider, model))
+        LOGGER.warning(
+            "All models banned for provider=%s; forcing retry on model=%s (remaining_ban_sec=%.1f)",
+            self._provider_health_key(provider),
+            forced,
+            self._ban_remaining_sec(provider, forced),
+        )
+        return [forced]
+
+    @staticmethod
+    def _build_ai_probe_prompt() -> str:
+        return (
+            "Analizza un set LEGO TEST e rispondi SOLO con JSON valido nel formato: "
+            '{"score": 1-100, "summary": "max 20 parole", "predicted_eol_date": "YYYY-MM-DD o null"}. '
+            "Set ID: 99999, Nome: Probe Set, Tema: Star Wars, Prezzo: 99.99, Fonte: test."
+        )
+
+    @staticmethod
     def _select_probe_candidates(candidates: list[str], limit: int) -> list[str]:
         if not candidates or limit <= 0:
             return []
@@ -646,6 +842,7 @@ class DiscoveryOracle:
         if not candidates:
             return []
 
+        provider_key = self._provider_health_key(provider)
         selected = self._select_probe_candidates(candidates, self.ai_probe_max_candidates)
         selected_set = set(selected)
         probe_limit = max(1, self.ai_probe_batch_size)
@@ -680,8 +877,25 @@ class DiscoveryOracle:
                 len(batch),
                 elapsed,
             )
-            with ThreadPoolExecutor(max_workers=min(len(batch), probe_limit)) as executor:
-                futures = {executor.submit(probe_fn, model_name): model_name for model_name in batch}
+            allowed_batch: list[str] = []
+            for model_name in batch:
+                if self._is_model_temporarily_banned(provider_key, model_name):
+                    report_by_model[model_name] = {
+                        "model": model_name,
+                        "available": False,
+                        "status": "temporarily_banned",
+                        "reason": (
+                            f"Model in cooldown ({self._ban_remaining_sec(provider_key, model_name):.1f}s remaining)."
+                        ),
+                    }
+                    continue
+                allowed_batch.append(model_name)
+
+            if not allowed_batch:
+                continue
+
+            with ThreadPoolExecutor(max_workers=min(len(allowed_batch), probe_limit)) as executor:
+                futures = {executor.submit(probe_fn, model_name): model_name for model_name in allowed_batch}
                 for future in as_completed(futures):
                     model_name = futures[future]
                     try:
@@ -689,6 +903,10 @@ class DiscoveryOracle:
                     except Exception as exc:  # noqa: BLE001
                         ok, reason = False, str(exc)
                     status = "available" if ok else classify_fn(reason)
+                    if ok:
+                        self._record_model_success(provider_key, model_name, phase="probe")
+                    else:
+                        self._record_model_failure(provider_key, model_name, str(reason), phase="probe")
                     report_by_model[model_name] = {
                         "model": model_name,
                         "available": ok,
@@ -788,19 +1006,25 @@ class DiscoveryOracle:
             model = genai.GenerativeModel(model_name)
             payload = {
                 "temperature": 0.0,
-                "max_output_tokens": 16,
+                "max_output_tokens": 96,
+                "response_mime_type": "application/json",
             }
+            prompt = self._build_ai_probe_prompt()
             try:
-                model.generate_content(
-                    "Rispondi con una sola parola: ok",
+                response = model.generate_content(
+                    prompt,
                     generation_config=payload,
                     request_options={"timeout": self.ai_probe_timeout_sec},
                 )
             except TypeError:
-                model.generate_content(
-                    "Rispondi con una sola parola: ok",
+                response = model.generate_content(
+                    prompt,
                     generation_config=payload,
                 )
+            if self.strict_ai_probe_validation:
+                text = str(getattr(response, "text", "") or "").strip()
+                parsed = self._extract_json(text)
+                self._validate_ai_payload(parsed, candidate=None)
             return True, "ok"
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)
@@ -818,6 +1042,8 @@ class DiscoveryOracle:
         text = str(reason or "").lower()
         if cls._is_global_quota_exhausted(text):
             return "quota_exhausted_global"
+        if "invalid ai payload" in text or "json" in text:
+            return "invalid_output"
         if "quota" in text or "resource exhausted" in text or "429" in text or "rate limit" in text:
             return "quota_limited"
         if any(token in text for token in ("not found", "not supported", "permission denied")):
@@ -863,14 +1089,16 @@ class DiscoveryOracle:
             current_name = None
 
         if self._gemini_available_candidates:
-            fallback_pool = [name for name in self._gemini_available_candidates if name != current_name]
+            pool = [name for name in self._gemini_available_candidates if name != current_name]
         else:
-            fallback_pool = [name for name in self._gemini_candidates if name != current_name]
+            pool = [name for name in self._gemini_candidates if name != current_name]
+        fallback_pool = self._rank_candidate_models("gemini", pool, allow_forced_retry=True)
 
         for model_name in fallback_pool:
             idx = self._gemini_candidates.index(model_name)
             ok, probe_reason = self._probe_gemini_model(model_name)
             if not ok:
+                self._record_model_failure("gemini", model_name, probe_reason, phase="failover_probe")
                 LOGGER.warning(
                     "Gemini candidate rejected during failover | model=%s reason=%s",
                     model_name,
@@ -878,6 +1106,7 @@ class DiscoveryOracle:
                 )
                 continue
 
+            self._record_model_success("gemini", model_name, phase="failover_probe")
             self._activate_gemini_model(
                 model_name=model_name,
                 index=idx,
@@ -935,12 +1164,21 @@ class DiscoveryOracle:
         )
 
         if available_models:
-            best_model = available_models[0]
+            ordered = self._rank_candidate_models("openrouter", available_models, allow_forced_retry=False) or available_models
+            best_model = ordered[0]
             best_idx = candidates.index(best_model)
             self._activate_openrouter_model(
                 model_id=best_model,
                 index=best_idx,
                 mode="api_openrouter_inventory",
+                probe_report=probe_report,
+            )
+            return
+
+        if self.strict_ai_probe_validation:
+            self._disable_openrouter(
+                "fallback_openrouter_no_working_model",
+                "Nessun modello OpenRouter ha superato il probe reale JSON.",
                 probe_report=probe_report,
             )
             return
@@ -1099,13 +1337,17 @@ class DiscoveryOracle:
         if requests is None:
             return False, "requests unavailable"
         try:
-            self._openrouter_chat_completion(
+            response = self._openrouter_chat_completion(
                 model_id=model_id,
-                messages=[{"role": "user", "content": "Rispondi con una sola parola: ok"}],
-                max_tokens=8,
+                messages=[{"role": "user", "content": self._build_ai_probe_prompt()}],
+                max_tokens=96,
                 temperature=0.0,
                 request_timeout=self.ai_probe_timeout_sec,
             )
+            if self.strict_ai_probe_validation:
+                text = self._extract_openrouter_text(response)
+                parsed = self._extract_json(text)
+                self._validate_ai_payload(parsed, candidate=None)
             return True, "ok"
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)
@@ -1115,6 +1357,8 @@ class DiscoveryOracle:
         text = str(reason or "").lower()
         if cls._is_global_quota_exhausted(text):
             return "quota_exhausted_global"
+        if "invalid ai payload" in text or "json" in text:
+            return "invalid_output"
         if "quota" in text or "402" in text or "429" in text or "rate limit" in text:
             return "quota_limited"
         if any(token in text for token in ("not found", "not supported", "permission", "401", "403")):
@@ -1157,16 +1401,19 @@ class DiscoveryOracle:
         if not self._openrouter_candidates:
             return False
         current = self._openrouter_model_id
-        fallback_pool = [name for name in (self._openrouter_available_candidates or self._openrouter_candidates) if name != current]
+        pool = [name for name in (self._openrouter_available_candidates or self._openrouter_candidates) if name != current]
+        fallback_pool = self._rank_candidate_models("openrouter", pool, allow_forced_retry=True)
         for model_id in fallback_pool:
             ok, probe_reason = self._probe_openrouter_model(model_id)
             if not ok:
+                self._record_model_failure("openrouter", model_id, probe_reason, phase="failover_probe")
                 LOGGER.warning(
                     "OpenRouter candidate rejected during failover | model=%s reason=%s",
                     model_id,
                     probe_reason,
                 )
                 continue
+            self._record_model_success("openrouter", model_id, phase="failover_probe")
             idx = self._openrouter_candidates.index(model_id)
             self._activate_openrouter_model(model_id=model_id, index=idx, mode="api_openrouter_failover")
             LOGGER.warning("OpenRouter failover completed | previous_reason=%s new_model=%s", reason, model_id)
@@ -1430,6 +1677,34 @@ class DiscoveryOracle:
             public["probe_report"] = probe[:5]
         return public
 
+    def _model_health_public(self, *, per_provider: int = 4) -> Dict[str, list[Dict[str, Any]]]:
+        snapshot: Dict[str, list[Dict[str, Any]]] = {}
+        now_ts = time.time()
+        for provider, rows in (self._model_health or {}).items():
+            normalized_provider = self._provider_health_key(provider)
+            scored: list[tuple[int, float, str, Dict[str, Any]]] = []
+            for model_name, row in rows.items():
+                model_row = dict(row or {})
+                score = int(model_row.get("score") or 0)
+                remaining = max(0.0, float(model_row.get("banned_until") or 0.0) - now_ts)
+                scored.append((score, remaining, model_name, model_row))
+
+            scored.sort(key=lambda item: (item[1] > 0.0, -item[0], item[2]))
+            preview: list[Dict[str, Any]] = []
+            for score, remaining, model_name, model_row in scored[: max(1, per_provider)]:
+                preview.append(
+                    {
+                        "model": model_name,
+                        "score": score,
+                        "consecutive_failures": int(model_row.get("consecutive_failures") or 0),
+                        "total_failures": int(model_row.get("total_failures") or 0),
+                        "total_successes": int(model_row.get("total_successes") or 0),
+                        "banned_remaining_sec": round(remaining, 1),
+                    }
+                )
+            snapshot[normalized_provider] = preview
+        return snapshot
+
     @staticmethod
     def _backtest_runtime_public(runtime: Dict[str, Any]) -> Dict[str, Any]:
         public = dict(runtime or {})
@@ -1642,6 +1917,7 @@ class DiscoveryOracle:
             "anti_bot_message": source_diagnostics["anti_bot_message"],
             "root_cause_hint": source_diagnostics.get("root_cause_hint"),
             "ai_runtime": self._ai_runtime_public(self.ai_runtime),
+            "model_health": self._model_health_public(),
             "backtest_runtime": self._backtest_runtime_public(self.backtest_runtime),
             "ranking": dict(self._last_ranking_diagnostics or {}),
         }
@@ -1875,6 +2151,8 @@ class DiscoveryOracle:
             "ai_cache_hits": int(ai_stats.get("ai_cache_hits", 0)),
             "ai_cache_misses": int(ai_stats.get("ai_cache_misses", 0)),
             "ai_errors": int(ai_stats.get("ai_errors", 0)),
+            "ai_budget_exhausted": int(ai_stats.get("ai_budget_exhausted", 0)),
+            "ai_timeout_count": int(ai_stats.get("ai_timeout_count", 0)),
             "quant_prep_sec": round(prep_duration, 2),
             "ai_scoring_sec": round(ai_duration, 2),
             "persistence_sec": round(persist_duration, 2),
@@ -2902,27 +3180,47 @@ class DiscoveryOracle:
     async def _get_ai_insight(self, candidate: Dict[str, Any]) -> AIInsight:
         prompt = self._build_gemini_prompt(candidate)
         if self._model is not None:
+            current_gemini_model = str(self.gemini_model or "")
             try:
                 text = await asyncio.to_thread(self._gemini_generate, prompt)
                 payload = self._extract_json(text)
-                return self._payload_to_ai_insight(payload, candidate)
+                insight = self._payload_to_ai_insight(payload, candidate)
+                if current_gemini_model:
+                    self._record_model_success("gemini", current_gemini_model, phase="scoring")
+                return insight
             except Exception as exc:  # noqa: BLE001
+                if current_gemini_model:
+                    self._record_model_failure("gemini", current_gemini_model, str(exc), phase="scoring")
                 rotated = False
-                if self._should_rotate_gemini_model(exc):
+                should_rotate = self._should_rotate_gemini_model(exc) or (
+                    bool(current_gemini_model) and self._is_model_temporarily_banned("gemini", current_gemini_model)
+                )
+                if should_rotate:
                     rotated = await self._advance_gemini_model_locked(reason=str(exc))
                 if rotated:
+                    next_model = str(self.gemini_model or "")
                     try:
                         text = await asyncio.to_thread(self._gemini_generate, prompt)
                         payload = self._extract_json(text)
-                        return self._payload_to_ai_insight(payload, candidate)
+                        insight = self._payload_to_ai_insight(payload, candidate)
+                        if next_model:
+                            self._record_model_success("gemini", next_model, phase="scoring_after_failover")
+                        return insight
                     except Exception as exc_after_switch:  # noqa: BLE001
+                        if next_model:
+                            self._record_model_failure(
+                                "gemini",
+                                next_model,
+                                str(exc_after_switch),
+                                phase="scoring_after_failover",
+                            )
                         self._disable_gemini("fallback_after_gemini_error", str(exc_after_switch))
                         LOGGER.warning(
                             "Gemini scoring failed after failover for %s: %s",
                             candidate.get("set_id"),
                             exc_after_switch,
                         )
-                elif self._should_rotate_gemini_model(exc):
+                elif should_rotate:
                     self._disable_gemini("fallback_after_gemini_error", str(exc))
                 else:
                     LOGGER.warning("Gemini scoring failed for %s: %s", candidate.get("set_id"), exc)
@@ -2931,27 +3229,48 @@ class DiscoveryOracle:
             self._initialize_openrouter_runtime()
 
         if self._openrouter_model_id is not None:
+            current_openrouter_model = str(self._openrouter_model_id or "")
             try:
                 text = await asyncio.to_thread(self._openrouter_generate, prompt)
                 payload = self._extract_json(text)
                 self._openrouter_malformed_errors = 0
-                return self._payload_to_ai_insight(payload, candidate)
+                insight = self._payload_to_ai_insight(payload, candidate)
+                if current_openrouter_model:
+                    self._record_model_success("openrouter", current_openrouter_model, phase="scoring")
+                return insight
             except Exception as exc:  # noqa: BLE001
                 set_id = candidate.get("set_id")
                 malformed = self._is_openrouter_malformed_response_error(exc)
+                if current_openrouter_model:
+                    self._record_model_failure("openrouter", current_openrouter_model, str(exc), phase="scoring")
                 if malformed and self._register_openrouter_malformed_failure(set_id=set_id, reason=str(exc)):
                     return self._heuristic_ai_fallback(candidate)
 
                 rotated = False
-                if self._should_rotate_openrouter_model(exc):
+                should_rotate = self._should_rotate_openrouter_model(exc) or (
+                    bool(current_openrouter_model)
+                    and self._is_model_temporarily_banned("openrouter", current_openrouter_model)
+                )
+                if should_rotate:
                     rotated = await self._advance_openrouter_model_locked(reason=str(exc))
                 if rotated:
+                    next_model = str(self._openrouter_model_id or "")
                     try:
                         text = await asyncio.to_thread(self._openrouter_generate, prompt)
                         payload = self._extract_json(text)
                         self._openrouter_malformed_errors = 0
-                        return self._payload_to_ai_insight(payload, candidate)
+                        insight = self._payload_to_ai_insight(payload, candidate)
+                        if next_model:
+                            self._record_model_success("openrouter", next_model, phase="scoring_after_failover")
+                        return insight
                     except Exception as exc_after_switch:  # noqa: BLE001
+                        if next_model:
+                            self._record_model_failure(
+                                "openrouter",
+                                next_model,
+                                str(exc_after_switch),
+                                phase="scoring_after_failover",
+                            )
                         if self._is_openrouter_malformed_response_error(exc_after_switch):
                             should_disable = self._register_openrouter_malformed_failure(
                                 set_id=set_id,
@@ -2970,7 +3289,7 @@ class DiscoveryOracle:
                             set_id,
                             exc_after_switch,
                         )
-                elif self._should_rotate_openrouter_model(exc):
+                elif should_rotate:
                     if not malformed:
                         self._disable_openrouter("fallback_after_openrouter_error", str(exc))
                     else:
@@ -2984,11 +3303,41 @@ class DiscoveryOracle:
         return self._heuristic_ai_fallback(candidate)
 
     @staticmethod
-    def _payload_to_ai_insight(payload: Dict[str, Any], candidate: Dict[str, Any]) -> AIInsight:
-        score = int(payload.get("score", 50))
+    def _validate_ai_payload(payload: Dict[str, Any], candidate: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError("invalid ai payload: not a JSON object")
+
+        if "score" not in payload:
+            raise ValueError("invalid ai payload: missing score")
+        raw_score = payload.get("score")
+        try:
+            score = int(raw_score)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid ai payload: score is not integer") from exc
+        if score < 1 or score > 100:
+            raise ValueError("invalid ai payload: score out of range")
+
+        summary = payload.get("summary")
+        if summary is None or not str(summary).strip():
+            raise ValueError("invalid ai payload: missing summary")
+
+        predicted = payload.get("predicted_eol_date")
+        if predicted not in (None, "", "null"):
+            text = str(predicted).strip()
+            try:
+                date.fromisoformat(text)
+            except ValueError as exc:
+                raise ValueError("invalid ai payload: predicted_eol_date not ISO date") from exc
+
+        return payload
+
+    @classmethod
+    def _payload_to_ai_insight(cls, payload: Dict[str, Any], candidate: Dict[str, Any]) -> AIInsight:
+        valid_payload = cls._validate_ai_payload(payload, candidate)
+        score = int(valid_payload.get("score", 50))
         score = max(1, min(100, score))
-        summary = str(payload.get("summary") or "No summary")[:1200]
-        predicted_eol_date = payload.get("predicted_eol_date") or candidate.get("eol_date_prediction")
+        summary = str(valid_payload.get("summary") or "No summary")[:1200]
+        predicted_eol_date = valid_payload.get("predicted_eol_date") or candidate.get("eol_date_prediction")
         return AIInsight(
             score=score,
             summary=summary,
