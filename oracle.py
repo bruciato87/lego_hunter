@@ -45,6 +45,11 @@ class DiscoveryOracle:
         self.gemini_model = gemini_model
 
         self._model = None
+        self.ai_runtime = {
+            "engine": "heuristic",
+            "model": "heuristic-v1",
+            "mode": "fallback",
+        }
         self._last_source_diagnostics: Dict[str, Any] = {
             "source_raw_counts": {"lego_retiring": 0, "amazon_bestsellers": 0},
             "source_dedup_counts": {},
@@ -56,13 +61,28 @@ class DiscoveryOracle:
         if self.gemini_api_key and genai is not None:
             genai.configure(api_key=self.gemini_api_key)
             self._model = genai.GenerativeModel(self.gemini_model)
+            self.ai_runtime = {
+                "engine": "gemini",
+                "model": self.gemini_model,
+                "mode": "api",
+            }
         else:
             if not self.gemini_api_key:
                 LOGGER.warning("Gemini API key missing: fallback heuristic scoring will be used")
+                self.ai_runtime = {
+                    "engine": "heuristic",
+                    "model": "heuristic-v1",
+                    "mode": "fallback_no_key",
+                }
             elif genai is None:
                 LOGGER.warning(
                     "google-generativeai package not installed: fallback heuristic scoring will be used"
                 )
+                self.ai_runtime = {
+                    "engine": "heuristic",
+                    "model": "heuristic-v1",
+                    "mode": "fallback_missing_package",
+                }
 
     async def discover_opportunities(
         self,
@@ -145,6 +165,7 @@ class DiscoveryOracle:
             "fallback_used": fallback_used,
             "anti_bot_alert": source_diagnostics["anti_bot_alert"],
             "anti_bot_message": source_diagnostics["anti_bot_message"],
+            "ai_runtime": self.ai_runtime,
         }
 
         if ranked:
@@ -161,11 +182,12 @@ class DiscoveryOracle:
             top_debug = []
 
         LOGGER.info(
-            "Discovery summary | ranked=%s above_threshold=%s fallback_used=%s max_ai=%s top=%s",
+            "Discovery summary | ranked=%s above_threshold=%s fallback_used=%s max_ai=%s ai=%s top=%s",
             diagnostics["ranked_candidates"],
             diagnostics["above_threshold_count"],
             diagnostics["fallback_used"],
             diagnostics["max_ai_score"],
+            diagnostics["ai_runtime"],
             top_debug,
         )
         if diagnostics["anti_bot_alert"]:

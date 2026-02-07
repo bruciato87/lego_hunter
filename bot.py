@@ -315,6 +315,7 @@ class LegoHunterTelegramBot:
     def _format_discovery_report(report: dict[str, Any], *, top_limit: int = 3) -> list[str]:
         selected = list(report.get("selected") or [])[:top_limit]
         diagnostics = report.get("diagnostics") or {}
+        ai_runtime = diagnostics.get("ai_runtime") or {}
 
         lines: list[str] = []
         if diagnostics.get("fallback_used"):
@@ -350,6 +351,10 @@ class LegoHunterTelegramBot:
 
         source_raw = diagnostics.get("source_raw_counts") or {}
         lines.append("<b>Diagnostica Discovery</b>")
+        ai_engine = str(ai_runtime.get("engine") or "unknown")
+        ai_model = str(ai_runtime.get("model") or "unknown")
+        ai_mode = str(ai_runtime.get("mode") or "unknown")
+        lines.append(f"🤖 IA: {html.escape(ai_engine)} | modello: <code>{html.escape(ai_model)}</code> | mode: {html.escape(ai_mode)}")
         lines.append(
             "Lego Retiring: "
             f"{int(source_raw.get('lego_retiring', 0))} | "
@@ -423,16 +428,17 @@ async def run_scheduled_cycle(
         )
         diagnostics = report.get("diagnostics") or {}
         LOGGER.info(
-            "Scheduled discovery diagnostics | raw=%s dedup=%s ranked=%s above_threshold=%s fallback=%s anti_bot=%s",
+            "Scheduled discovery diagnostics | raw=%s dedup=%s ranked=%s above_threshold=%s fallback=%s anti_bot=%s ai=%s",
             diagnostics.get("source_raw_counts"),
             diagnostics.get("dedup_candidates"),
             diagnostics.get("ranked_candidates"),
             diagnostics.get("above_threshold_count"),
             diagnostics.get("fallback_used"),
             diagnostics.get("anti_bot_alert"),
+            diagnostics.get("ai_runtime"),
         )
         lines = [
-            "<b>🧱 LEGO HUNTER</b> <i>Update automatico (ogni 6h)</i>",
+            "<b>🧱 LEGO HUNTER</b> <i>Update automatico (ogni ora)</i>",
             "",
         ]
         lines.extend(LegoHunterTelegramBot._format_discovery_report(report, top_limit=3))
