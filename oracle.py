@@ -47,6 +47,7 @@ DEFAULT_AI_PROBE_BUDGET_SEC = 90.0
 DEFAULT_AI_PROBE_TIMEOUT_SEC = 12.0
 DEFAULT_AI_GENERATION_TIMEOUT_SEC = 20.0
 DEFAULT_OPENROUTER_MODELS_TIMEOUT_SEC = 15.0
+DEFAULT_OPENROUTER_JSON_REPAIR_PROBE_TIMEOUT_SEC = 4.0
 DEFAULT_AI_SCORING_CONCURRENCY = 4
 DEFAULT_AI_RANK_MAX_CANDIDATES = 12
 DEFAULT_AI_CACHE_TTL_SEC = 10800.0
@@ -162,6 +163,7 @@ class DiscoveryOracle:
         self.openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
         self.openrouter_api_base = (os.getenv("OPENROUTER_API_BASE") or DEFAULT_OPENROUTER_API_BASE).rstrip("/")
         self.openrouter_model_preference = (os.getenv("OPENROUTER_MODEL") or "").strip()
+        self.openrouter_json_repair_model_preference = (os.getenv("OPENROUTER_JSON_REPAIR_MODEL") or "").strip()
         self.ai_probe_max_candidates = self._safe_env_int(
             "AI_PROBE_MAX_CANDIDATES",
             default=DEFAULT_AI_PROBE_MAX_CANDIDATES,
@@ -203,6 +205,12 @@ class DiscoveryOracle:
             default=DEFAULT_OPENROUTER_MODELS_TIMEOUT_SEC,
             minimum=5.0,
             maximum=90.0,
+        )
+        self.openrouter_json_repair_probe_timeout_sec = self._safe_env_float(
+            "OPENROUTER_JSON_REPAIR_PROBE_TIMEOUT_SEC",
+            default=DEFAULT_OPENROUTER_JSON_REPAIR_PROBE_TIMEOUT_SEC,
+            minimum=2.0,
+            maximum=12.0,
         )
         self.ai_scoring_concurrency = self._safe_env_int(
             "AI_SCORING_CONCURRENCY",
@@ -336,6 +344,7 @@ class DiscoveryOracle:
         self._openrouter_candidate_index: Optional[int] = None
         self._openrouter_inventory_loaded = False
         self._openrouter_recovery_attempted = False
+        self._openrouter_repair_probe_fail_until: Dict[str, float] = {}
         self._openrouter_malformed_errors = 0
         self._model_health: Dict[str, Dict[str, Dict[str, Any]]] = {
             "gemini": {},
@@ -417,7 +426,7 @@ class DiscoveryOracle:
             self.strict_ai_probe_validation,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
             self.ai_cache_ttl_sec,
@@ -429,6 +438,7 @@ class DiscoveryOracle:
             self.ai_scoring_retry_timeout_sec,
             self.ai_timeout_recovery_probes,
             self.ai_timeout_recovery_probe_timeout_sec,
+            self.openrouter_json_repair_probe_timeout_sec,
             self.ai_model_ban_sec,
             self.ai_model_ban_failures,
             self.openrouter_opportunistic_enabled,
@@ -1690,8 +1700,14 @@ class DiscoveryOracle:
             raise RuntimeError(f"OpenRouter payload error {err_code}: {err_message[:220]}")
         return data
 
-    def _openrouter_generate(self, prompt: str, *, request_timeout: Optional[float] = None) -> str:
-        model_id = str(self._openrouter_model_id or "").strip()
+    def _openrouter_generate(
+        self,
+        prompt: str,
+        *,
+        request_timeout: Optional[float] = None,
+        model_id_override: Optional[str] = None,
+    ) -> str:
+        model_id = str(model_id_override or self._openrouter_model_id or "").strip()
         if not model_id:
             raise RuntimeError("OpenRouter model not active")
 
@@ -1737,6 +1753,50 @@ class DiscoveryOracle:
             f"{clipped}"
         )
 
+    def _resolve_openrouter_json_repair_model(self, *, current_model: str) -> str:
+        pool: list[str] = []
+        preferred = str(self.openrouter_json_repair_model_preference or "").strip()
+        if preferred and preferred != current_model:
+            pool.append(preferred)
+
+        pool.extend(
+            model
+            for model in self._openrouter_available_candidates
+            if model and model != current_model and model not in pool
+        )
+        ranked = self._rank_candidate_models(
+            "openrouter",
+            [model for model in self._openrouter_candidates if model != current_model],
+            allow_forced_retry=False,
+        )
+        pool.extend(model for model in ranked if model not in pool)
+
+        if not pool:
+            return current_model
+
+        now = time.time()
+        probe_timeout = float(self.openrouter_json_repair_probe_timeout_sec)
+        for model_id in pool[:5]:
+            ban_until = float(self._openrouter_repair_probe_fail_until.get(model_id) or 0.0)
+            if ban_until > now:
+                continue
+
+            ok, reason = self._probe_openrouter_model(model_id, timeout_sec=probe_timeout)
+            if ok:
+                self._record_model_success("openrouter", model_id, phase="json_repair_probe")
+                if model_id not in self._openrouter_available_candidates:
+                    self._openrouter_available_candidates.append(model_id)
+                return model_id
+
+            self._record_model_failure("openrouter", model_id, reason, phase="json_repair_probe")
+            self._openrouter_repair_probe_fail_until[model_id] = now + 600.0
+            LOGGER.warning(
+                "OpenRouter JSON repair model probe failed | model=%s reason=%s",
+                model_id,
+                str(reason)[:220],
+            )
+        return current_model
+
     async def _repair_openrouter_non_json_output(
         self,
         *,
@@ -1750,26 +1810,38 @@ class DiscoveryOracle:
 
         repair_prompt = self._build_openrouter_json_repair_prompt(raw_text, candidate)
         repair_timeout = max(3.0, min(8.0, float(timeout_sec)))
+        repair_model = await asyncio.to_thread(
+            self._resolve_openrouter_json_repair_model,
+            current_model=model_id,
+        )
+        if repair_model != model_id:
+            LOGGER.info(
+                "OpenRouter JSON repair switching model | from=%s to=%s set_id=%s",
+                model_id,
+                repair_model,
+                candidate.get("set_id"),
+            )
         try:
             repaired_text = await asyncio.to_thread(
                 self._openrouter_generate,
                 repair_prompt,
                 request_timeout=repair_timeout,
+                model_id_override=repair_model,
             )
             payload = self._extract_json(repaired_text)
             insight = self._payload_to_ai_insight(payload, candidate)
-            self._record_model_success("openrouter", model_id, phase="scoring_json_repair")
+            self._record_model_success("openrouter", repair_model, phase="scoring_json_repair")
             LOGGER.info(
                 "OpenRouter non-JSON repaired to JSON | model=%s set_id=%s",
-                model_id,
+                repair_model,
                 candidate.get("set_id"),
             )
             return insight
         except Exception as exc:  # noqa: BLE001
-            self._record_model_failure("openrouter", model_id, str(exc), phase="scoring_json_repair")
+            self._record_model_failure("openrouter", repair_model, str(exc), phase="scoring_json_repair")
             LOGGER.warning(
                 "OpenRouter JSON repair failed | model=%s set_id=%s error=%s",
-                model_id,
+                repair_model,
                 candidate.get("set_id"),
                 str(exc)[:220],
             )

@@ -57,6 +57,10 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           DISCOVERY_SOURCE_MODE: external_first
+          AI_RANK_MAX_CANDIDATES: "10"
+          AI_SCORING_HARD_BUDGET_SEC: "75"
+          AI_TIMEOUT_RECOVERY_PROBES: "2"
+          OPENROUTER_JSON_REPAIR_PROBE_TIMEOUT_SEC: "4"
           RUN_MODE: scheduled
         run: |
           python bot.py --mode scheduled

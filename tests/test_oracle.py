@@ -998,6 +998,41 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertIsNone(insight.risk_note)
         self.assertEqual(mocked_generate.call_count, 2)
 
+    async def test_openrouter_json_repair_can_use_secondary_model(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle._openrouter_model_id = "vendor/model-a:free"
+        oracle._openrouter_inventory_loaded = True
+
+        candidate = {
+            "set_id": "75367",
+            "set_name": "LEGO Star Wars",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 129.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+
+        with patch.object(
+            oracle,
+            "_resolve_openrouter_json_repair_model",
+            return_value="vendor/model-b:free",
+        ), patch.object(
+            oracle,
+            "_openrouter_generate",
+            return_value='{"score": 89, "summary": "repair ok", "predicted_eol_date": "2026-12-01"}',
+        ) as mocked_generate:
+            insight = await oracle._repair_openrouter_non_json_output(
+                raw_text="testo non json",
+                candidate=candidate,
+                timeout_sec=8.0,
+            )
+
+        self.assertIsNotNone(insight)
+        self.assertEqual(insight.score, 89)
+        self.assertEqual(mocked_generate.call_args.kwargs.get("model_id_override"), "vendor/model-b:free")
+
     def test_probe_openrouter_model_accepts_non_json_scored_text(self) -> None:
         repo = FakeRepo()
         with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
