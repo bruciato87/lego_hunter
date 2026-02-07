@@ -1406,10 +1406,18 @@ class DiscoveryOracle:
                 temperature=0.0,
                 request_timeout=self.ai_probe_timeout_sec,
             )
+            text = self._extract_openrouter_text(response)
             if self.strict_ai_probe_validation:
-                text = self._extract_openrouter_text(response)
-                parsed = self._extract_json(text)
-                self._validate_ai_payload(parsed, candidate=None)
+                try:
+                    parsed = self._extract_json(text)
+                    self._validate_ai_payload(parsed, candidate=None)
+                    return True, "ok_json"
+                except Exception:
+                    # Accept non-JSON outputs if they still expose a usable score:
+                    # this keeps at least one AI model active under provider drift.
+                    if self._extract_unstructured_score(text) is not None:
+                        return True, "ok_text_non_json"
+                    raise
             return True, "ok"
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)
@@ -1669,6 +1677,11 @@ class DiscoveryOracle:
                     content = message.get("content")
                     if isinstance(content, str) and content.strip():
                         return content.strip()
+                    if isinstance(content, dict):
+                        for key in ("text", "content", "value"):
+                            value = content.get(key)
+                            if isinstance(value, str) and value.strip():
+                                return value.strip()
                     if isinstance(content, list):
                         chunks: list[str] = []
                         for part in content:
@@ -1676,8 +1689,31 @@ class DiscoveryOracle:
                                 txt = part.get("text")
                                 if txt:
                                     chunks.append(str(txt))
+                                elif isinstance(part.get("content"), str):
+                                    chunks.append(str(part.get("content")))
+                                elif isinstance(part.get("value"), str):
+                                    chunks.append(str(part.get("value")))
+                            elif isinstance(part, str) and part.strip():
+                                chunks.append(part.strip())
                         if chunks:
                             return " ".join(chunks).strip()
+
+                    tool_calls = message.get("tool_calls")
+                    if isinstance(tool_calls, list):
+                        arg_chunks: list[str] = []
+                        for call in tool_calls:
+                            if not isinstance(call, dict):
+                                continue
+                            function = call.get("function")
+                            if isinstance(function, dict):
+                                arguments = function.get("arguments")
+                                if isinstance(arguments, str) and arguments.strip():
+                                    arg_chunks.append(arguments.strip())
+                            arguments = call.get("arguments")
+                            if isinstance(arguments, str) and arguments.strip():
+                                arg_chunks.append(arguments.strip())
+                        if arg_chunks:
+                            return " ".join(arg_chunks).strip()
                     raise RuntimeError("OpenRouter response missing text content")
 
                 text_value = first.get("text")
@@ -1707,6 +1743,59 @@ class DiscoveryOracle:
                 return " ".join(chunks).strip()
 
         raise RuntimeError("OpenRouter response missing choices")
+
+    @staticmethod
+    def _extract_unstructured_score(raw_text: str) -> Optional[int]:
+        text = str(raw_text or "").strip()
+        if not text:
+            return None
+
+        patterns = [
+            r"(?i)(?:investment[_\s-]?score|score|punteggio|rating|valutazione)\s*[:=]?\s*([1-9]\d?|100)\b",
+            r"(?i)\b([1-9]\d?|100)\s*/\s*100\b",
+            r"(?i)\b([1-9]\d?|100)\s*(?:su|out of)\s*100\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                value = int(match.group(1))
+                return max(1, min(100, value))
+
+        generic = re.search(r"(?<![-\d])([1-9]\d?|100)(?![-\d])", text)
+        if generic:
+            value = int(generic.group(1))
+            return max(1, min(100, value))
+        return None
+
+    @classmethod
+    def _ai_insight_from_unstructured_text(
+        cls,
+        text: str,
+        candidate: Dict[str, Any],
+    ) -> Optional[AIInsight]:
+        score = cls._extract_unstructured_score(text)
+        if score is None:
+            return None
+
+        cleaned = " ".join(str(text or "").split())
+        if not cleaned:
+            return None
+
+        sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+        summary = " ".join(part for part in sentences[:3] if part).strip()
+        if not summary:
+            summary = cleaned[:320]
+        summary = summary[:1200]
+
+        predicted = cls._extract_first_date(cleaned) or candidate.get("eol_date_prediction")
+        return AIInsight(
+            score=score,
+            summary=summary,
+            predicted_eol_date=predicted,
+            fallback_used=False,
+            confidence="LOW_CONFIDENCE",
+            risk_note="Output AI non JSON: score estratto da testo con parsing robusto.",
+        )
 
     @staticmethod
     def _should_rotate_gemini_model(exc: Exception) -> bool:
@@ -3283,7 +3372,27 @@ class DiscoveryOracle:
                     prompt,
                     request_timeout=timeout_sec,
                 )
-                payload = self._extract_json(text)
+                try:
+                    payload = self._extract_json(text)
+                except Exception:
+                    parsed_text_insight = self._ai_insight_from_unstructured_text(text, candidate)
+                    if parsed_text_insight is not None:
+                        self._openrouter_malformed_errors = 0
+                        self._record_model_success("openrouter", current_model, phase="scoring_text_parse")
+                        LOGGER.warning(
+                            "OpenRouter non-JSON output parsed | model=%s set_id=%s",
+                            current_model,
+                            set_id,
+                        )
+                        if attempt > 1:
+                            LOGGER.info(
+                                "OpenRouter opportunistic recovery | set_id=%s attempt=%s model=%s",
+                                set_id,
+                                attempt,
+                                current_model,
+                            )
+                        return parsed_text_insight
+                    raise
                 self._openrouter_malformed_errors = 0
                 insight = self._payload_to_ai_insight(payload, candidate)
                 self._record_model_success("openrouter", current_model, phase="scoring")

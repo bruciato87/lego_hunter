@@ -883,6 +883,73 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(oracle._openrouter_model_id)
         self.assertEqual(oracle.ai_runtime.get("mode"), "fallback_after_openrouter_error")
 
+    async def test_openrouter_non_json_text_is_parsed_into_ai_insight(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle._openrouter_model_id = "vendor/model-pro:free"
+        oracle._openrouter_inventory_loaded = True
+
+        candidate = {
+            "set_id": "75367",
+            "set_name": "LEGO Star Wars",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 129.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+        with patch.object(
+            oracle,
+            "_openrouter_generate",
+            return_value=(
+                "Valutazione investimento a 12 mesi. "
+                "Punteggio: 77/100. "
+                "Set con domanda stabile e buona rivendibilita'."
+            ),
+        ):
+            insight = await oracle._get_ai_insight(candidate)
+
+        self.assertFalse(insight.fallback_used)
+        self.assertEqual(insight.score, 77)
+        self.assertEqual(insight.confidence, "LOW_CONFIDENCE")
+        self.assertIn("non json", str(insight.risk_note or "").lower())
+
+    def test_probe_openrouter_model_accepts_non_json_scored_text(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle.strict_ai_probe_validation = True
+
+        with patch.object(
+            oracle,
+            "_openrouter_chat_completion",
+            return_value={"choices": [{"message": {"content": "Punteggio 74/100, outlook positivo."}}]},
+        ):
+            ok, reason = oracle._probe_openrouter_model("vendor/model-pro:free")
+
+        self.assertTrue(ok)
+        self.assertEqual(reason, "ok_text_non_json")
+
+    def test_extract_openrouter_text_reads_tool_call_arguments(self) -> None:
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "emit_result",
+                                    "arguments": '{"score": 81, "summary": "ok", "predicted_eol_date": null}',
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        text = DiscoveryOracle._extract_openrouter_text(payload)
+        self.assertIn('"score": 81', text)
+
     async def test_ranking_prefilter_limits_ai_scoring_calls(self) -> None:
         repo = FakeRepo()
         now = datetime.now(timezone.utc)
