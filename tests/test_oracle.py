@@ -608,6 +608,40 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"score": 71', text)
         self.assertEqual(mocked_call.call_count, 2)
 
+    async def test_openrouter_malformed_threshold_disables_provider(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle._openrouter_model_id = "vendor/model-pro:free"
+        oracle._openrouter_inventory_loaded = True
+        oracle.openrouter_malformed_limit = 2
+
+        candidate = {
+            "set_id": "75367",
+            "set_name": "LEGO Star Wars",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 129.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+
+        with patch.object(
+            oracle,
+            "_openrouter_generate",
+            side_effect=RuntimeError("OpenRouter response missing text content"),
+        ), patch.object(
+            oracle,
+            "_advance_openrouter_model_locked",
+            new=AsyncMock(return_value=False),
+        ):
+            first = await oracle._get_ai_insight(candidate)
+            second = await oracle._get_ai_insight(candidate)
+
+        self.assertTrue(first.fallback_used)
+        self.assertTrue(second.fallback_used)
+        self.assertIsNone(oracle._openrouter_model_id)
+        self.assertEqual(oracle.ai_runtime.get("mode"), "fallback_openrouter_malformed_payload")
+
     async def test_ranking_prefilter_limits_ai_scoring_calls(self) -> None:
         repo = FakeRepo()
         now = datetime.now(timezone.utc)

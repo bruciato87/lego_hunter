@@ -51,6 +51,7 @@ DEFAULT_AI_SCORING_CONCURRENCY = 4
 DEFAULT_AI_RANK_MAX_CANDIDATES = 12
 DEFAULT_AI_CACHE_TTL_SEC = 10800.0
 DEFAULT_AI_CACHE_MAX_ITEMS = 4000
+DEFAULT_OPENROUTER_MALFORMED_LIMIT = 3
 DEFAULT_HISTORY_WINDOW_DAYS = 180
 DEFAULT_BACKTEST_LOOKBACK_DAYS = 365
 DEFAULT_BACKTEST_HORIZON_DAYS = 180
@@ -213,6 +214,12 @@ class DiscoveryOracle:
             minimum=100,
             maximum=20000,
         )
+        self.openrouter_malformed_limit = self._safe_env_int(
+            "OPENROUTER_MALFORMED_LIMIT",
+            default=DEFAULT_OPENROUTER_MALFORMED_LIMIT,
+            minimum=1,
+            maximum=20,
+        )
         requested_mode = (os.getenv("DISCOVERY_SOURCE_MODE") or DEFAULT_DISCOVERY_SOURCE_MODE).strip().lower()
         if requested_mode not in DISCOVERY_SOURCE_MODES:
             LOGGER.warning(
@@ -234,6 +241,7 @@ class DiscoveryOracle:
         self._openrouter_probe_report: list[Dict[str, Any]] = []
         self._openrouter_candidate_index: Optional[int] = None
         self._openrouter_inventory_loaded = False
+        self._openrouter_malformed_errors = 0
         self._ai_insight_cache: Dict[str, tuple[float, AIInsight]] = {}
         self._ai_failover_lock: Optional[asyncio.Lock] = None
         self._last_ranking_diagnostics: Dict[str, Any] = {}
@@ -305,11 +313,12 @@ class DiscoveryOracle:
             self.ai_generation_timeout_sec,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
             self.ai_cache_ttl_sec,
             self.ai_cache_max_items,
+            self.openrouter_malformed_limit,
         )
         LOGGER.info(
             "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f",
@@ -1108,6 +1117,7 @@ class DiscoveryOracle:
     ) -> None:
         self._openrouter_model_id = model_id
         self._openrouter_candidate_index = index
+        self._openrouter_malformed_errors = 0
         self.ai_runtime = {
             "engine": "openrouter",
             "provider": "openrouter",
@@ -1156,6 +1166,7 @@ class DiscoveryOracle:
     ) -> None:
         self._openrouter_model_id = None
         self._openrouter_candidate_index = None
+        self._openrouter_malformed_errors = 0
         if self._model is None:
             self.ai_runtime = {
                 "engine": "heuristic",
@@ -1216,6 +1227,27 @@ class DiscoveryOracle:
                 "invalid json payload",
             )
         )
+
+    def _register_openrouter_malformed_failure(self, *, set_id: Any, reason: str) -> bool:
+        self._openrouter_malformed_errors += 1
+        LOGGER.warning(
+            "OpenRouter malformed counter | model=%s set_id=%s count=%s/%s reason=%s",
+            self._openrouter_model_id,
+            set_id,
+            self._openrouter_malformed_errors,
+            self.openrouter_malformed_limit,
+            str(reason)[:220],
+        )
+        if self._openrouter_malformed_errors >= self.openrouter_malformed_limit:
+            self._disable_openrouter(
+                "fallback_openrouter_malformed_payload",
+                (
+                    "Soglia payload OpenRouter malformati raggiunta "
+                    f"({self._openrouter_malformed_errors}/{self.openrouter_malformed_limit})."
+                ),
+            )
+            return True
+        return False
 
     def _openrouter_headers(self, *, include_json: bool = True) -> Dict[str, str]:
         headers = {
@@ -2794,8 +2826,14 @@ class DiscoveryOracle:
             try:
                 text = await asyncio.to_thread(self._openrouter_generate, prompt)
                 payload = self._extract_json(text)
+                self._openrouter_malformed_errors = 0
                 return self._payload_to_ai_insight(payload, candidate)
             except Exception as exc:  # noqa: BLE001
+                set_id = candidate.get("set_id")
+                malformed = self._is_openrouter_malformed_response_error(exc)
+                if malformed and self._register_openrouter_malformed_failure(set_id=set_id, reason=str(exc)):
+                    return self._heuristic_ai_fallback(candidate)
+
                 rotated = False
                 if self._should_rotate_openrouter_model(exc):
                     rotated = await self._advance_openrouter_model_locked(reason=str(exc))
@@ -2803,18 +2841,37 @@ class DiscoveryOracle:
                     try:
                         text = await asyncio.to_thread(self._openrouter_generate, prompt)
                         payload = self._extract_json(text)
+                        self._openrouter_malformed_errors = 0
                         return self._payload_to_ai_insight(payload, candidate)
                     except Exception as exc_after_switch:  # noqa: BLE001
-                        self._disable_openrouter("fallback_after_openrouter_error", str(exc_after_switch))
+                        if self._is_openrouter_malformed_response_error(exc_after_switch):
+                            should_disable = self._register_openrouter_malformed_failure(
+                                set_id=set_id,
+                                reason=str(exc_after_switch),
+                            )
+                            if should_disable:
+                                LOGGER.warning(
+                                    "OpenRouter scoring disabled after malformed threshold for %s: %s",
+                                    set_id,
+                                    exc_after_switch,
+                                )
+                        else:
+                            self._disable_openrouter("fallback_after_openrouter_error", str(exc_after_switch))
                         LOGGER.warning(
                             "OpenRouter scoring failed after failover for %s: %s",
-                            candidate.get("set_id"),
+                            set_id,
                             exc_after_switch,
                         )
                 elif self._should_rotate_openrouter_model(exc):
-                    self._disable_openrouter("fallback_after_openrouter_error", str(exc))
+                    if not malformed:
+                        self._disable_openrouter("fallback_after_openrouter_error", str(exc))
+                    else:
+                        LOGGER.warning(
+                            "OpenRouter scoring malformed for %s without failover; using fallback insight.",
+                            set_id,
+                        )
                 else:
-                    LOGGER.warning("OpenRouter scoring failed for %s: %s", candidate.get("set_id"), exc)
+                    LOGGER.warning("OpenRouter scoring failed for %s: %s", set_id, exc)
 
         return self._heuristic_ai_fallback(candidate)
 
