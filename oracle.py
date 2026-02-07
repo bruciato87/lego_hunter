@@ -76,6 +76,10 @@ DEFAULT_AI_STRICT_PROBE_VALIDATION = True
 DEFAULT_OPENROUTER_OPPORTUNISTIC_ENABLED = True
 DEFAULT_OPENROUTER_OPPORTUNISTIC_ATTEMPTS = 3
 DEFAULT_OPENROUTER_OPPORTUNISTIC_TIMEOUT_SEC = 8.0
+DEFAULT_AI_DYNAMIC_SHORTLIST_ENABLED = True
+DEFAULT_AI_DYNAMIC_SHORTLIST_FLOOR = 4
+DEFAULT_AI_DYNAMIC_SHORTLIST_PER_MODEL = 2
+DEFAULT_AI_DYNAMIC_SHORTLIST_BONUS = 1
 DEFAULT_HISTORY_WINDOW_DAYS = 180
 DEFAULT_BACKTEST_LOOKBACK_DAYS = 365
 DEFAULT_BACKTEST_HORIZON_DAYS = 180
@@ -161,6 +165,15 @@ SCARCITY_KEYWORDS = (
     "edizione limitata",
     "retiring soon",
     "last chance",
+)
+SPACE_STEM_KEYWORDS = (
+    "nasa",
+    "apollo",
+    "space",
+    "moon",
+    "lunar",
+    "rover",
+    "astronaut",
 )
 ART_DISPLAY_THEMES = {"Art", "Ideas", "Icons", "Botanicals", "Architecture"}
 LEGO_PRIMARY_SOURCES = {"lego_retiring", "lego_proxy_reader", "lego_http_fallback"}
@@ -326,6 +339,28 @@ class DiscoveryOracle:
             default=DEFAULT_AI_RANK_MAX_CANDIDATES,
             minimum=3,
             maximum=120,
+        )
+        self.ai_dynamic_shortlist_enabled = self._safe_env_bool(
+            "AI_DYNAMIC_SHORTLIST_ENABLED",
+            default=DEFAULT_AI_DYNAMIC_SHORTLIST_ENABLED,
+        )
+        self.ai_dynamic_shortlist_floor = self._safe_env_int(
+            "AI_DYNAMIC_SHORTLIST_FLOOR",
+            default=DEFAULT_AI_DYNAMIC_SHORTLIST_FLOOR,
+            minimum=2,
+            maximum=20,
+        )
+        self.ai_dynamic_shortlist_per_model = self._safe_env_int(
+            "AI_DYNAMIC_SHORTLIST_PER_MODEL",
+            default=DEFAULT_AI_DYNAMIC_SHORTLIST_PER_MODEL,
+            minimum=1,
+            maximum=8,
+        )
+        self.ai_dynamic_shortlist_bonus = self._safe_env_int(
+            "AI_DYNAMIC_SHORTLIST_BONUS",
+            default=DEFAULT_AI_DYNAMIC_SHORTLIST_BONUS,
+            minimum=0,
+            maximum=8,
         )
         self.ai_cache_ttl_sec = self._safe_env_float(
             "AI_INSIGHT_CACHE_TTL_SEC",
@@ -577,9 +612,13 @@ class DiscoveryOracle:
             self.strict_ai_probe_validation,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s per_model=%s bonus=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
+            self.ai_dynamic_shortlist_enabled,
+            self.ai_dynamic_shortlist_floor,
+            self.ai_dynamic_shortlist_per_model,
+            self.ai_dynamic_shortlist_bonus,
             self.ai_cache_ttl_sec,
             self.ai_cache_max_items,
             self.openrouter_malformed_limit,
@@ -2650,6 +2689,10 @@ class DiscoveryOracle:
                     )
 
             pattern_eval = self._evaluate_success_patterns(candidate)
+            effective_pattern_score = self._effective_pattern_score(
+                pattern_eval=pattern_eval,
+                ai_fallback_used=bool(ai.fallback_used),
+            )
             demand = self._estimate_market_demand(
                 candidate,
                 ai.score,
@@ -2660,7 +2703,7 @@ class DiscoveryOracle:
                 ai_score=ai.score,
                 demand_score=demand,
                 forecast_score=forecast.forecast_score,
-                pattern_score=pattern_eval.score,
+                pattern_score=effective_pattern_score,
                 ai_fallback_used=bool(ai.fallback_used),
             )
 
@@ -2692,7 +2735,8 @@ class DiscoveryOracle:
                     "forecast_estimated_months_to_target": forecast.estimated_months_to_target,
                     "forecast_rationale": forecast.rationale,
                     "composite_score": int(composite_score),
-                    "success_pattern_score": int(pattern_eval.score),
+                    "success_pattern_score": int(effective_pattern_score),
+                    "success_pattern_score_raw": int(pattern_eval.score),
                     "success_pattern_confidence": int(pattern_eval.confidence_score),
                     "success_pattern_summary": pattern_eval.summary,
                     "success_patterns": pattern_eval.signals,
@@ -2715,7 +2759,8 @@ class DiscoveryOracle:
             payload["confidence_score"] = int(forecast.confidence_score)
             payload["estimated_months_to_target"] = forecast.estimated_months_to_target
             payload["composite_score"] = composite_score
-            payload["pattern_score"] = int(pattern_eval.score)
+            payload["pattern_score"] = int(effective_pattern_score)
+            payload["pattern_score_raw"] = int(pattern_eval.score)
             payload["pattern_confidence_score"] = int(pattern_eval.confidence_score)
             payload["pattern_summary"] = pattern_eval.summary
             payload["pattern_signals"] = pattern_eval.signals
@@ -2891,12 +2936,46 @@ class DiscoveryOracle:
         if not prepared:
             return [], []
 
-        shortlist_count = min(len(prepared), max(1, self.ai_rank_max_candidates))
+        shortlist_count = self._effective_ai_shortlist_limit(len(prepared))
         shortlist = prepared[:shortlist_count]
         skipped = prepared[shortlist_count:]
         for row in shortlist:
             row["ai_shortlisted"] = True
         return shortlist, skipped
+
+    def _effective_ai_shortlist_limit(self, candidate_count: int) -> int:
+        if candidate_count <= 0:
+            return 0
+
+        base_limit = min(candidate_count, max(1, int(self.ai_rank_max_candidates)))
+        if not self.ai_dynamic_shortlist_enabled:
+            return base_limit
+
+        engine = str(self.ai_runtime.get("engine") or "")
+        if engine != "openrouter":
+            return base_limit
+
+        inventory_available = int(
+            self.ai_runtime.get("inventory_available")
+            or len(self._openrouter_available_candidates)
+            or 0
+        )
+        if inventory_available <= 0:
+            return min(base_limit, max(2, int(self.ai_dynamic_shortlist_floor)))
+
+        dynamic_limit = int(self.ai_dynamic_shortlist_bonus) + (inventory_available * int(self.ai_dynamic_shortlist_per_model))
+        dynamic_limit = max(int(self.ai_dynamic_shortlist_floor), dynamic_limit)
+        effective = min(base_limit, max(2, dynamic_limit))
+        if effective < base_limit:
+            LOGGER.info(
+                "AI shortlist dynamically reduced | candidates=%s base=%s effective=%s inventory_available=%s engine=%s",
+                candidate_count,
+                base_limit,
+                effective,
+                inventory_available,
+                engine,
+            )
+        return effective
 
     def _calculate_prefilter_score(
         self,
@@ -4762,6 +4841,24 @@ class DiscoveryOracle:
                 "Finestra di ritiro vicina: riduzione offerta primaria imminente.",
             )
 
+        if franchise == "Franchise":
+            add_signal(
+                "franchise_strength",
+                "Licenza franchise forte",
+                78,
+                0.63,
+                "IP globale consolidata con domanda secondaria tipicamente resiliente.",
+            )
+
+        if cls._contains_any_keyword(str(candidate.get("set_name") or ""), SPACE_STEM_KEYWORDS):
+            add_signal(
+                "stem_mission_icon",
+                "Icona STEM/missione",
+                79,
+                0.61,
+                "Tema space/STEM con appeal trasversale collezionistico e didattico.",
+            )
+
         if bool(features.get("is_modular_family")) and theme in {"Icons", "City", "Star Wars"}:
             add_signal(
                 "modular_continuity",
@@ -4805,8 +4902,11 @@ class DiscoveryOracle:
                     max(1.0, min(100.0, (sum(float(row.get("confidence", 0.0)) for row in top) / len(top)) * 100.0))
                 )
             )
+            if len(top) == 1 and str(top[0].get("code") or "") == "retiring_window":
+                score = min(score, 72)
+                confidence_score = min(confidence_score, 58)
             labels = [str(row.get("label") or "") for row in top if row.get("label")]
-            summary = ", ".join(labels[:2]) if labels else "Pattern multipli rilevati."
+            summary = " + ".join(labels[:2]) if labels else "Pattern multipli rilevati."
             return PatternEvaluation(
                 score=score,
                 confidence_score=confidence_score,
@@ -4860,6 +4960,26 @@ class DiscoveryOracle:
             + pattern_weight * float(pattern_score)
         )
         return max(1, min(100, int(round(composite))))
+
+    @staticmethod
+    def _effective_pattern_score(
+        *,
+        pattern_eval: PatternEvaluation,
+        ai_fallback_used: bool,
+    ) -> int:
+        score = int(pattern_eval.score)
+        if not ai_fallback_used:
+            return max(1, min(100, score))
+
+        primary_code = ""
+        if pattern_eval.signals:
+            primary_code = str(pattern_eval.signals[0].get("code") or "")
+
+        if primary_code == "retiring_window":
+            factor = 0.72
+        else:
+            factor = 0.84
+        return max(1, min(100, int(round(score * factor))))
 
     def _row_forecast_data_points(self, row: Dict[str, Any]) -> int:
         top_level = row.get("forecast_data_points")

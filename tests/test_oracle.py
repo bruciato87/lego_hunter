@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
-from oracle import AIInsight, DiscoveryOracle
+from oracle import AIInsight, DiscoveryOracle, PatternEvaluation
 from scrapers import MarketListing
 
 
@@ -162,6 +162,50 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
             ai_fallback_used=False,
         )
         self.assertGreater(high_pattern, low_pattern)
+
+    def test_effective_pattern_score_penalizes_fallback_retiring_only(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        pattern_eval = PatternEvaluation(
+            score=83,
+            confidence_score=74,
+            summary="Catalizzatore EOL",
+            signals=[{"code": "retiring_window", "label": "Catalizzatore EOL", "score": 83, "confidence": 0.74}],
+            features={},
+        )
+        effective = oracle._effective_pattern_score(pattern_eval=pattern_eval, ai_fallback_used=True)
+        self.assertLess(effective, 83)
+        self.assertEqual(effective, 60)
+
+    def test_effective_ai_shortlist_limit_scales_with_openrouter_inventory(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_rank_max_candidates = 10
+        oracle.ai_dynamic_shortlist_enabled = True
+        oracle.ai_dynamic_shortlist_floor = 4
+        oracle.ai_dynamic_shortlist_per_model = 2
+        oracle.ai_dynamic_shortlist_bonus = 1
+        oracle.ai_runtime["engine"] = "openrouter"
+        oracle.ai_runtime["inventory_available"] = 2
+
+        limit = oracle._effective_ai_shortlist_limit(41)
+        self.assertEqual(limit, 5)
+
+    def test_success_patterns_summary_uses_top_two_signals(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        candidate = {
+            "set_id": "76281",
+            "set_name": "X-Jet di X-Men",
+            "theme": "Marvel",
+            "source": "lego_proxy_reader",
+            "current_price": 74.99,
+            "eol_date_prediction": "2026-05-16",
+        }
+
+        pattern = oracle._evaluate_success_patterns(candidate)
+        self.assertGreaterEqual(len(pattern.signals), 2)
+        self.assertIn(" + ", pattern.summary)
 
     def test_rank_candidate_models_skips_temporarily_banned(self) -> None:
         repo = FakeRepo()
