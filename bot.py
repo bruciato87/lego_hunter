@@ -367,6 +367,9 @@ class LegoHunterTelegramBot:
             f"Max AI: {int(diagnostics.get('max_ai_score', 0))}"
         )
 
+        if diagnostics.get("fallback_source_used"):
+            lines.append("🛟 Fallback sorgente HTTP attivo (scraper primari a zero).")
+
         failures = list(diagnostics.get("source_failures") or [])
         if failures:
             compact = "; ".join(str(item) for item in failures[:2])
@@ -428,12 +431,13 @@ async def run_scheduled_cycle(
         )
         diagnostics = report.get("diagnostics") or {}
         LOGGER.info(
-            "Scheduled discovery diagnostics | raw=%s dedup=%s ranked=%s above_threshold=%s fallback=%s anti_bot=%s ai=%s",
+            "Scheduled discovery diagnostics | raw=%s dedup=%s ranked=%s above_threshold=%s score_fallback=%s source_fallback=%s anti_bot=%s ai=%s",
             diagnostics.get("source_raw_counts"),
             diagnostics.get("dedup_candidates"),
             diagnostics.get("ranked_candidates"),
             diagnostics.get("above_threshold_count"),
             diagnostics.get("fallback_used"),
+            diagnostics.get("fallback_source_used"),
             diagnostics.get("anti_bot_alert"),
             diagnostics.get("ai_runtime"),
         )

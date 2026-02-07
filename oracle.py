@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -8,17 +9,25 @@ import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Dict, Optional
+from urllib.parse import urljoin
 
 try:
     import google.generativeai as genai
 except Exception:  # noqa: BLE001
     genai = None
 
+try:
+    import requests
+except Exception:  # noqa: BLE001
+    requests = None
+
 from models import LegoHunterRepository, MarketTimeSeriesRecord, OpportunityRadarRecord
 from scrapers import AmazonBestsellerScraper, LegoRetiringScraper, SecondaryMarketValidator
 
 LOGGER = logging.getLogger(__name__)
 JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+TAG_RE = re.compile(r"<[^>]+>")
+SPACE_RE = re.compile(r"\s+")
 
 
 @dataclass
@@ -371,6 +380,26 @@ class DiscoveryOracle:
                 dedup[set_id] = row
 
         dedup_values = list(dedup.values())
+        fallback_source_used = False
+        fallback_notes: list[str] = []
+
+        if not dedup_values:
+            fallback_source_used = True
+            fallback_candidates, fallback_meta = await asyncio.to_thread(self._collect_http_fallback_candidates)
+            if fallback_candidates:
+                LOGGER.warning(
+                    "Primary scrapers returned 0 candidates; activating HTTP fallback source with %s candidates",
+                    len(fallback_candidates),
+                )
+                dedup_values = fallback_candidates
+                for key, value in (fallback_meta.get("source_raw_counts") or {}).items():
+                    source_raw_counts[key] = value
+                for err in fallback_meta.get("errors") or []:
+                    source_failures.append(f"http_fallback: {err}")
+            else:
+                fallback_notes.append("HTTP fallback returned 0 candidates")
+                for err in fallback_meta.get("errors") or []:
+                    source_failures.append(f"http_fallback: {err}")
         source_dedup_counts: Dict[str, int] = {}
         for row in dedup_values:
             source = str(row.get("source") or "unknown")
@@ -394,6 +423,8 @@ class DiscoveryOracle:
             "dedup_candidates": len(dedup_values),
             "anti_bot_alert": anti_bot_alert,
             "anti_bot_message": anti_bot_message,
+            "fallback_source_used": fallback_source_used,
+            "fallback_notes": fallback_notes,
         }
         LOGGER.info(
             "Source collection completed | raw=%s dedup_counts=%s dedup_total=%s failures=%s",
@@ -403,6 +434,181 @@ class DiscoveryOracle:
             source_failures,
         )
         return dedup_values, diagnostics
+
+    def _collect_http_fallback_candidates(self) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
+        if requests is None:
+            return [], {"source_raw_counts": {}, "errors": ["requests package unavailable"]}
+
+        raw_counts: Dict[str, int] = {}
+        errors: list[str] = []
+        candidates: list[Dict[str, Any]] = []
+
+        user_agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        )
+        headers = {"User-Agent": user_agent, "Accept-Language": "it-IT,it;q=0.9,en;q=0.8"}
+
+        try:
+            lego_url = "https://www.lego.com/it-it/categories/retiring-soon"
+            lego_html = requests.get(lego_url, headers=headers, timeout=30).text
+            lego_rows = self._parse_lego_html_fallback(lego_html, base_url="https://www.lego.com", limit=50)
+            raw_counts["lego_http_fallback"] = len(lego_rows)
+            candidates.extend(lego_rows)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"lego_fallback_failed: {exc}")
+
+        try:
+            amazon_url = "https://www.amazon.it/gp/bestsellers/toys/635019031"
+            amazon_html = requests.get(amazon_url, headers=headers, timeout=30).text
+            amazon_rows = self._parse_amazon_html_fallback(
+                amazon_html,
+                base_url="https://www.amazon.it",
+                limit=50,
+            )
+            raw_counts["amazon_http_fallback"] = len(amazon_rows)
+            candidates.extend(amazon_rows)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"amazon_fallback_failed: {exc}")
+
+        dedup: dict[str, Dict[str, Any]] = {}
+        for row in candidates:
+            set_id = str(row.get("set_id") or "").strip()
+            if not set_id:
+                continue
+            if set_id not in dedup:
+                dedup[set_id] = row
+            elif dedup[set_id].get("source") != "lego_http_fallback" and row.get("source") == "lego_http_fallback":
+                dedup[set_id] = row
+
+        return list(dedup.values()), {"source_raw_counts": raw_counts, "errors": errors}
+
+    @classmethod
+    def _parse_lego_html_fallback(cls, html_text: str, *, base_url: str, limit: int) -> list[Dict[str, Any]]:
+        rows: list[Dict[str, Any]] = []
+        pattern = re.compile(r'<a[^>]+href="([^"]*/product/[^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+        for href, inner in pattern.findall(html_text):
+            full_url = urljoin(base_url, href)
+            name = cls._cleanup_html_text(inner)
+            if len(name) < 4:
+                continue
+            set_id = cls._extract_set_id(full_url, name)
+            if not set_id:
+                continue
+            rows.append(
+                {
+                    "set_id": set_id,
+                    "set_name": name,
+                    "theme": cls._guess_theme_from_name(name),
+                    "source": "lego_http_fallback",
+                    "current_price": cls._extract_price_from_text(inner),
+                    "eol_date_prediction": (date.today() + timedelta(days=75)).isoformat(),
+                    "listing_url": full_url,
+                    "metadata": {"fallback": True},
+                }
+            )
+            if len(rows) >= limit:
+                break
+        return rows
+
+    @classmethod
+    def _parse_amazon_html_fallback(cls, html_text: str, *, base_url: str, limit: int) -> list[Dict[str, Any]]:
+        rows: list[Dict[str, Any]] = []
+        pattern = re.compile(
+            r'<a[^>]+href="([^"]*(?:/dp/|/gp/product/)[^"]+)"[^>]*>(.*?)</a>',
+            re.IGNORECASE | re.DOTALL,
+        )
+        seen_links: set[str] = set()
+        for href, inner in pattern.findall(html_text):
+            full_url = urljoin(base_url, href)
+            if full_url in seen_links:
+                continue
+            seen_links.add(full_url)
+
+            name = cls._cleanup_html_text(inner)
+            if len(name) < 4:
+                alt_match = re.search(r'alt="([^"]+)"', inner, re.IGNORECASE)
+                if alt_match:
+                    name = cls._cleanup_html_text(alt_match.group(1))
+            if "lego" not in name.lower():
+                continue
+
+            set_id = cls._extract_set_id(name, full_url)
+            if not set_id:
+                continue
+
+            rows.append(
+                {
+                    "set_id": set_id,
+                    "set_name": name,
+                    "theme": cls._guess_theme_from_name(name),
+                    "source": "amazon_http_fallback",
+                    "current_price": cls._extract_price_from_text(inner),
+                    "eol_date_prediction": None,
+                    "listing_url": full_url,
+                    "metadata": {"fallback": True},
+                }
+            )
+            if len(rows) >= limit:
+                break
+        return rows
+
+    @staticmethod
+    def _cleanup_html_text(raw: str) -> str:
+        text = TAG_RE.sub(" ", raw or "")
+        text = html.unescape(text)
+        return SPACE_RE.sub(" ", text).strip()
+
+    @staticmethod
+    def _extract_set_id(*texts: str) -> Optional[str]:
+        for text in texts:
+            match = re.search(r"\b(\d{4,6})\b", text or "")
+            if match:
+                return match.group(1)
+        return None
+
+    @staticmethod
+    def _extract_price_from_text(raw: str) -> Optional[float]:
+        text = html.unescape(raw or "")
+        match = re.search(
+            r"(?:€|eur)\s*(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)"
+            r"|(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(?:€|eur)",
+            text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        raw_num = (match.group(1) or match.group(2) or "").replace(" ", "")
+        if "," in raw_num and "." in raw_num:
+            if raw_num.rfind(",") > raw_num.rfind("."):
+                raw_num = raw_num.replace(".", "").replace(",", ".")
+            else:
+                raw_num = raw_num.replace(",", "")
+        elif "," in raw_num:
+            raw_num = raw_num.replace(",", ".")
+        try:
+            return float(raw_num)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _guess_theme_from_name(name: str) -> str:
+        lowered = (name or "").lower()
+        mapping = {
+            "star wars": "Star Wars",
+            "technic": "Technic",
+            "city": "City",
+            "icons": "Icons",
+            "harry potter": "Harry Potter",
+            "marvel": "Marvel",
+            "ninjago": "Ninjago",
+            "friends": "Friends",
+            "architecture": "Architecture",
+        }
+        for key, value in mapping.items():
+            if key in lowered:
+                return value
+        return "Unknown"
 
     async def _get_ai_insight(self, candidate: Dict[str, Any]) -> AIInsight:
         if self._model is None:
