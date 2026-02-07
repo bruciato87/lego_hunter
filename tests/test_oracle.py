@@ -721,6 +721,94 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(oracle._openrouter_model_id)
         self.assertEqual(oracle.ai_runtime.get("mode"), "fallback_openrouter_malformed_payload")
 
+    async def test_openrouter_opportunistic_recovers_with_alternate_model(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle._openrouter_model_id = "vendor/model-1:free"
+        oracle._openrouter_inventory_loaded = True
+        oracle._openrouter_candidates = ["vendor/model-1:free", "vendor/model-2:free"]
+        oracle._openrouter_available_candidates = ["vendor/model-1:free", "vendor/model-2:free"]
+        oracle.openrouter_opportunistic_enabled = True
+        oracle.openrouter_opportunistic_attempts = 3
+        oracle.openrouter_opportunistic_timeout_sec = 5.0
+
+        candidate = {
+            "set_id": "75367",
+            "set_name": "LEGO Star Wars",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 129.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+
+        async def rotate(reason: str) -> bool:  # noqa: ARG001
+            oracle._openrouter_model_id = "vendor/model-2:free"
+            return True
+
+        with patch.object(
+            oracle,
+            "_openrouter_generate",
+            side_effect=[
+                RuntimeError("OpenRouter error 429: rate limit"),
+                '{"score": 84, "summary": "ok", "predicted_eol_date": "2026-10-01"}',
+            ],
+        ) as mocked_generate, patch.object(
+            oracle,
+            "_advance_openrouter_model_locked",
+            new=AsyncMock(side_effect=rotate),
+        ):
+            insight = await oracle._get_ai_insight(candidate)
+
+        self.assertFalse(insight.fallback_used)
+        self.assertEqual(insight.score, 84)
+        self.assertEqual(oracle._openrouter_model_id, "vendor/model-2:free")
+        self.assertEqual(mocked_generate.call_count, 2)
+
+    async def test_openrouter_opportunistic_exhaustion_falls_back(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle._openrouter_model_id = "vendor/model-1:free"
+        oracle._openrouter_inventory_loaded = True
+        oracle._openrouter_candidates = ["vendor/model-1:free", "vendor/model-2:free"]
+        oracle._openrouter_available_candidates = ["vendor/model-1:free", "vendor/model-2:free"]
+        oracle.openrouter_opportunistic_enabled = True
+        oracle.openrouter_opportunistic_attempts = 2
+        oracle.openrouter_opportunistic_timeout_sec = 5.0
+
+        candidate = {
+            "set_id": "75367",
+            "set_name": "LEGO Star Wars",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 129.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+
+        async def rotate(reason: str) -> bool:  # noqa: ARG001
+            oracle._openrouter_model_id = "vendor/model-2:free"
+            return True
+
+        with patch.object(
+            oracle,
+            "_openrouter_generate",
+            side_effect=[
+                RuntimeError("OpenRouter error 429: rate limit"),
+                RuntimeError("OpenRouter error 429: rate limit"),
+            ],
+        ) as mocked_generate, patch.object(
+            oracle,
+            "_advance_openrouter_model_locked",
+            new=AsyncMock(side_effect=rotate),
+        ):
+            insight = await oracle._get_ai_insight(candidate)
+
+        self.assertTrue(insight.fallback_used)
+        self.assertEqual(mocked_generate.call_count, 2)
+        self.assertIsNone(oracle._openrouter_model_id)
+        self.assertEqual(oracle.ai_runtime.get("mode"), "fallback_after_openrouter_error")
+
     async def test_ranking_prefilter_limits_ai_scoring_calls(self) -> None:
         repo = FakeRepo()
         now = datetime.now(timezone.utc)
