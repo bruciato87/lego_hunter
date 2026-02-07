@@ -70,10 +70,12 @@ class DiscoveryOracle:
 
         self._model = None
         self._gemini_candidates: list[str] = []
+        self._gemini_available_candidates: list[str] = []
+        self._gemini_probe_report: list[Dict[str, Any]] = []
         self._gemini_candidate_index: Optional[int] = None
         self.ai_runtime = {
             "engine": "heuristic",
-            "model": "heuristic-v1",
+            "model": "heuristic-ai-v2",
             "mode": "fallback",
         }
         self._last_source_diagnostics: Dict[str, Any] = {
@@ -99,7 +101,7 @@ class DiscoveryOracle:
             LOGGER.warning("Gemini API key missing: fallback heuristic scoring will be used")
             self.ai_runtime = {
                 "engine": "heuristic",
-                "model": "heuristic-v1",
+                "model": "heuristic-ai-v2",
                 "mode": "fallback_no_key",
             }
         else:
@@ -108,7 +110,7 @@ class DiscoveryOracle:
             )
             self.ai_runtime = {
                 "engine": "heuristic",
-                "model": "heuristic-v1",
+                "model": "heuristic-ai-v2",
                 "mode": "fallback_missing_package",
             }
         LOGGER.info("Discovery source mode configured: %s", self.discovery_source_mode)
@@ -133,30 +135,48 @@ class DiscoveryOracle:
             return
 
         self._gemini_candidates = candidates
-        max_probe = max(1, min(len(candidates), int(os.getenv("GEMINI_MAX_PROBE_MODELS", "6"))))
-        for idx, model_name in enumerate(candidates[:max_probe]):
-            ok, reason = self._probe_gemini_model(model_name)
-            if ok:
-                self._activate_gemini_model(model_name=model_name, index=idx, mode="api_dynamic")
-                if self._model is None:
-                    continue
-                if idx > 0:
-                    LOGGER.warning(
-                        "Gemini preferred model unavailable. Switched to candidate %s/%s: %s",
-                        idx + 1,
-                        len(candidates),
-                        model_name,
-                    )
+        probe_report = self._probe_all_gemini_candidates(candidates)
+        self._gemini_probe_report = probe_report
+        available_models = [row["model"] for row in probe_report if row.get("available")]
+        self._gemini_available_candidates = available_models
+        LOGGER.info(
+            "Gemini inventory complete | total=%s available=%s",
+            len(candidates),
+            len(available_models),
+        )
+
+        if available_models:
+            best_model = available_models[0]
+            best_idx = candidates.index(best_model)
+            self._activate_gemini_model(model_name=best_model, index=best_idx, mode="api_dynamic_inventory")
+            if self._model is None:
+                self._disable_gemini(
+                    "fallback_after_gemini_error",
+                    "Attivazione modello Gemini non riuscita dopo inventory scan.",
+                )
                 return
-            LOGGER.warning("Gemini model probe failed | model=%s reason=%s", model_name, reason)
-            if self._is_global_quota_exhausted(reason):
-                self._disable_gemini("fallback_quota_exhausted", reason)
-                return
+            self.ai_runtime["inventory_total"] = len(candidates)
+            self.ai_runtime["inventory_available"] = len(available_models)
+            self.ai_runtime["probe_report"] = probe_report[:8]
+            return
+
+        if any(row.get("status") == "quota_exhausted_global" for row in probe_report):
+            self._disable_gemini(
+                "fallback_quota_exhausted",
+                "Quota free-tier Gemini esaurita globalmente (limit: 0).",
+            )
+            self.ai_runtime["inventory_total"] = len(candidates)
+            self.ai_runtime["inventory_available"] = 0
+            self.ai_runtime["probe_report"] = probe_report[:8]
+            return
 
         self._disable_gemini(
             "fallback_no_working_model",
-            "Tutti i modelli Gemini candidati hanno fallito il probe API.",
+            "Nessun modello Gemini disponibile con generateContent + quota.",
         )
+        self.ai_runtime["inventory_total"] = len(candidates)
+        self.ai_runtime["inventory_available"] = 0
+        self.ai_runtime["probe_report"] = probe_report[:8]
 
     def _discover_available_gemini_models(self) -> list[str]:
         if genai is None:
@@ -273,6 +293,53 @@ class DiscoveryOracle:
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)
 
+    def _probe_all_gemini_candidates(self, candidates: list[str]) -> list[Dict[str, Any]]:
+        report: list[Dict[str, Any]] = []
+        global_quota_zero = False
+
+        for model_name in candidates:
+            if global_quota_zero:
+                report.append(
+                    {
+                        "model": model_name,
+                        "available": False,
+                        "status": "quota_exhausted_global",
+                        "reason": "Inherited global quota lock (limit: 0).",
+                    }
+                )
+                continue
+
+            ok, reason = self._probe_gemini_model(model_name)
+            status = "available" if ok else self._classify_gemini_probe_failure(reason)
+            report.append(
+                {
+                    "model": model_name,
+                    "available": ok,
+                    "status": status,
+                    "reason": reason[:220],
+                }
+            )
+            if ok:
+                continue
+            LOGGER.warning("Gemini model probe failed | model=%s status=%s reason=%s", model_name, status, reason)
+            if status == "quota_exhausted_global":
+                global_quota_zero = True
+
+        return report
+
+    @classmethod
+    def _classify_gemini_probe_failure(cls, reason: str) -> str:
+        text = str(reason or "").lower()
+        if cls._is_global_quota_exhausted(text):
+            return "quota_exhausted_global"
+        if "quota" in text or "resource exhausted" in text or "429" in text or "rate limit" in text:
+            return "quota_limited"
+        if any(token in text for token in ("not found", "not supported", "permission denied")):
+            return "unsupported_or_denied"
+        if "deadline" in text or "timeout" in text or "temporarily unavailable" in text:
+            return "transient_error"
+        return "probe_error"
+
     def _activate_gemini_model(self, *, model_name: str, index: int, mode: str) -> None:
         if genai is None:
             self._disable_gemini("fallback_missing_package", "google-generativeai non disponibile")
@@ -304,9 +371,18 @@ class DiscoveryOracle:
         if not self._gemini_candidates:
             return False
 
-        start = (self._gemini_candidate_index + 1) if self._gemini_candidate_index is not None else 0
-        for idx in range(start, len(self._gemini_candidates)):
-            model_name = self._gemini_candidates[idx]
+        if self._gemini_candidate_index is not None and 0 <= self._gemini_candidate_index < len(self._gemini_candidates):
+            current_name = self._gemini_candidates[self._gemini_candidate_index]
+        else:
+            current_name = None
+
+        if self._gemini_available_candidates:
+            fallback_pool = [name for name in self._gemini_available_candidates if name != current_name]
+        else:
+            fallback_pool = [name for name in self._gemini_candidates if name != current_name]
+
+        for model_name in fallback_pool:
+            idx = self._gemini_candidates.index(model_name)
             ok, probe_reason = self._probe_gemini_model(model_name)
             if not ok:
                 LOGGER.warning(
@@ -333,7 +409,7 @@ class DiscoveryOracle:
         self._gemini_candidate_index = None
         self.ai_runtime = {
             "engine": "heuristic",
-            "model": "heuristic-v1",
+            "model": "heuristic-ai-v2",
             "mode": mode,
             "reason": reason[:220],
         }
@@ -362,6 +438,14 @@ class DiscoveryOracle:
             ("quota exceeded" in lowered or "resource exhausted" in lowered)
             and "limit: 0" in lowered
         )
+
+    @staticmethod
+    def _ai_runtime_public(runtime: Dict[str, Any]) -> Dict[str, Any]:
+        public = dict(runtime or {})
+        probe = public.get("probe_report")
+        if isinstance(probe, list):
+            public["probe_report"] = probe[:5]
+        return public
 
     async def discover_opportunities(
         self,
@@ -451,7 +535,7 @@ class DiscoveryOracle:
             "anti_bot_alert": source_diagnostics["anti_bot_alert"],
             "anti_bot_message": source_diagnostics["anti_bot_message"],
             "root_cause_hint": source_diagnostics.get("root_cause_hint"),
-            "ai_runtime": self.ai_runtime,
+            "ai_runtime": self._ai_runtime_public(self.ai_runtime),
         }
 
         if ranked:
@@ -1237,6 +1321,9 @@ class DiscoveryOracle:
         name = str(candidate.get("set_name") or "")
         source = str(candidate.get("source") or "")
         price = float(candidate.get("current_price") or 0.0)
+
+        if self.ai_runtime.get("engine") != "gemini":
+            self.ai_runtime.setdefault("model", "heuristic-ai-v2")
 
         base = 55
         if source in {"lego_retiring", "lego_proxy_reader", "lego_http_fallback"}:

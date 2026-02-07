@@ -7,7 +7,8 @@ Bot Telegram autonomo per discovery e monitoraggio opportunita LEGO con data moa
 - Sorgente primaria discovery: reader esterno cloud (`external_first`)
 - Fallback automatici: Playwright, poi HTTP parser
 - Ranking AI con Gemini (fallback euristico se API non disponibile)
-- Selezione automatica modello Gemini tra quelli realmente disponibili sulla tua API key (con failover automatico)
+- Selezione automatica Gemini: inventory completo dei modelli text-capable + quota-check + scelta del migliore disponibile
+- Garanzia runtime: se nessun modello Gemini ha quota/API disponibili, passa a `heuristic-ai-v2` (fallback sempre operativo)
 - Validazione secondario (Vinted/Subito)
 - Guardia fiscale DAC7 (blocco segnali vendita vicino soglia)
 - Comandi Telegram orientati agli oggetti LEGO: `/scova`, `/radar`, `/cerca`, `/offerte`, `/collezione`, `/vendi`
