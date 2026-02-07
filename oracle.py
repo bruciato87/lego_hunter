@@ -9,7 +9,7 @@ import os
 import re
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional
@@ -896,7 +896,21 @@ class DiscoveryOracle:
 
             with ThreadPoolExecutor(max_workers=min(len(allowed_batch), probe_limit)) as executor:
                 futures = {executor.submit(probe_fn, model_name): model_name for model_name in allowed_batch}
-                for future in as_completed(futures):
+                remaining_budget = max(0.1, self.ai_probe_budget_sec - (time.monotonic() - started))
+                batch_timeout = max(
+                    1.0,
+                    min(
+                        remaining_budget,
+                        (self.ai_probe_timeout_sec * max(1, len(allowed_batch))) + 1.0,
+                    ),
+                )
+                done, pending = wait(
+                    set(futures.keys()),
+                    timeout=batch_timeout,
+                    return_when=ALL_COMPLETED,
+                )
+
+                for future in done:
                     model_name = futures[future]
                     try:
                         ok, reason = future.result()
@@ -925,6 +939,29 @@ class DiscoveryOracle:
                         )
                         if status == "quota_exhausted_global":
                             global_quota_zero = True
+
+                if pending:
+                    for future in pending:
+                        model_name = futures[future]
+                        future.cancel()
+                        timeout_reason = f"probe timeout after {batch_timeout:.1f}s"
+                        status = classify_fn(timeout_reason)
+                        self._record_model_failure(provider_key, model_name, timeout_reason, phase="probe")
+                        report_by_model[model_name] = {
+                            "model": model_name,
+                            "available": False,
+                            "status": status,
+                            "reason": timeout_reason,
+                        }
+                        LOGGER.warning(
+                            "%s model probe timeout | model=%s timeout=%.1fs",
+                            provider,
+                            model_name,
+                            batch_timeout,
+                        )
+                    if (time.monotonic() - started) >= self.ai_probe_budget_sec:
+                        budget_exhausted = True
+                        break
 
         report: list[Dict[str, Any]] = []
         for model_name in candidates:
