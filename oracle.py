@@ -172,8 +172,11 @@ class DiscoveryOracle:
             "below_threshold_count": len(ranked) - len(above_threshold),
             "max_ai_score": max((row["ai_investment_score"] for row in ranked), default=0),
             "fallback_used": fallback_used,
+            "fallback_source_used": source_diagnostics.get("fallback_source_used"),
+            "fallback_notes": source_diagnostics.get("fallback_notes"),
             "anti_bot_alert": source_diagnostics["anti_bot_alert"],
             "anti_bot_message": source_diagnostics["anti_bot_message"],
+            "root_cause_hint": source_diagnostics.get("root_cause_hint"),
             "ai_runtime": self.ai_runtime,
         }
 
@@ -382,22 +385,38 @@ class DiscoveryOracle:
         dedup_values = list(dedup.values())
         fallback_source_used = False
         fallback_notes: list[str] = []
+        root_cause_hint = "primary_scrapers_ok"
+        fallback_meta: Dict[str, Any] = {}
 
         if not dedup_values:
             fallback_source_used = True
+            LOGGER.warning("Primary scrapers produced 0 dedup candidates; trying HTTP fallback")
             fallback_candidates, fallback_meta = await asyncio.to_thread(self._collect_http_fallback_candidates)
+            LOGGER.info(
+                "HTTP fallback result | counts=%s errors=%s signals=%s candidates=%s",
+                fallback_meta.get("source_raw_counts"),
+                fallback_meta.get("errors"),
+                fallback_meta.get("signals"),
+                len(fallback_candidates),
+            )
             if fallback_candidates:
                 LOGGER.warning(
                     "Primary scrapers returned 0 candidates; activating HTTP fallback source with %s candidates",
                     len(fallback_candidates),
                 )
                 dedup_values = fallback_candidates
+                root_cause_hint = "playwright_extraction_issue_or_dynamic_dom_shift"
                 for key, value in (fallback_meta.get("source_raw_counts") or {}).items():
                     source_raw_counts[key] = value
                 for err in fallback_meta.get("errors") or []:
                     source_failures.append(f"http_fallback: {err}")
             else:
                 fallback_notes.append("HTTP fallback returned 0 candidates")
+                signals = fallback_meta.get("signals") or {}
+                if signals.get("lego_robot_markers") or signals.get("amazon_robot_markers"):
+                    root_cause_hint = "anti_bot_or_robot_challenge_detected"
+                else:
+                    root_cause_hint = "dom_shift_or_empty_upstream_payload"
                 for err in fallback_meta.get("errors") or []:
                     source_failures.append(f"http_fallback: {err}")
         source_dedup_counts: Dict[str, int] = {}
@@ -425,6 +444,7 @@ class DiscoveryOracle:
             "anti_bot_message": anti_bot_message,
             "fallback_source_used": fallback_source_used,
             "fallback_notes": fallback_notes,
+            "root_cause_hint": root_cause_hint,
         }
         LOGGER.info(
             "Source collection completed | raw=%s dedup_counts=%s dedup_total=%s failures=%s",
@@ -437,10 +457,15 @@ class DiscoveryOracle:
 
     def _collect_http_fallback_candidates(self) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
         if requests is None:
-            return [], {"source_raw_counts": {}, "errors": ["requests package unavailable"]}
+            return [], {
+                "source_raw_counts": {},
+                "errors": ["requests package unavailable"],
+                "signals": {},
+            }
 
         raw_counts: Dict[str, int] = {}
         errors: list[str] = []
+        signals: Dict[str, Any] = {}
         candidates: list[Dict[str, Any]] = []
 
         user_agent = (
@@ -452,6 +477,12 @@ class DiscoveryOracle:
         try:
             lego_url = "https://www.lego.com/it-it/categories/retiring-soon"
             lego_html = requests.get(lego_url, headers=headers, timeout=30).text
+            lego_lower = lego_html.lower()
+            signals["lego_robot_markers"] = any(
+                marker in lego_lower for marker in ("robot", "captcha", "cloudflare", "access denied")
+            )
+            signals["lego_has_next_data"] = "__next_data__" in lego_lower
+            signals["lego_product_link_count"] = len(re.findall(r"/product/", lego_html, re.IGNORECASE))
             lego_rows = self._parse_lego_html_fallback(lego_html, base_url="https://www.lego.com", limit=50)
             raw_counts["lego_http_fallback"] = len(lego_rows)
             candidates.extend(lego_rows)
@@ -461,6 +492,13 @@ class DiscoveryOracle:
         try:
             amazon_url = "https://www.amazon.it/gp/bestsellers/toys/635019031"
             amazon_html = requests.get(amazon_url, headers=headers, timeout=30).text
+            amazon_lower = amazon_html.lower()
+            signals["amazon_robot_markers"] = any(
+                marker in amazon_lower for marker in ("robot check", "captcha", "sorry", "access denied")
+            )
+            signals["amazon_dp_link_count"] = len(
+                re.findall(r"/(?:dp|gp/product)/", amazon_html, re.IGNORECASE)
+            )
             amazon_rows = self._parse_amazon_html_fallback(
                 amazon_html,
                 base_url="https://www.amazon.it",
@@ -481,7 +519,11 @@ class DiscoveryOracle:
             elif dedup[set_id].get("source") != "lego_http_fallback" and row.get("source") == "lego_http_fallback":
                 dedup[set_id] = row
 
-        return list(dedup.values()), {"source_raw_counts": raw_counts, "errors": errors}
+        return list(dedup.values()), {
+            "source_raw_counts": raw_counts,
+            "errors": errors,
+            "signals": signals,
+        }
 
     @classmethod
     def _parse_lego_html_fallback(cls, html_text: str, *, base_url: str, limit: int) -> list[Dict[str, Any]]:

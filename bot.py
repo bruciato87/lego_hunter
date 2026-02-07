@@ -483,11 +483,9 @@ async def run_scheduled_cycle(
         raise
     finally:
         try:
-            await bot.close()
-        except RetryAfter as exc:
-            LOGGER.warning("Telegram flood-control on bot.close() (non-fatal): %s", exc)
-        except TelegramError as exc:
-            LOGGER.warning("Telegram error on bot.close() (non-fatal): %s", exc)
+            await bot.shutdown()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Bot shutdown warning (non-fatal): %s", exc)
         LOGGER.info("Scheduled cycle finished")
 
 
