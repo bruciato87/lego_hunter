@@ -1339,6 +1339,103 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(len(results), 4)
         self.assertLessEqual(counters["max_active"], 2)
 
+    async def test_score_ai_shortlist_batch_scores_multiple_candidates_with_single_call(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle._openrouter_model_id = "vendor/model-pro:free"
+        oracle.ai_runtime = {
+            "engine": "openrouter",
+            "provider": "openrouter",
+            "model": "vendor/model-pro:free",
+            "mode": "api_openrouter_inventory",
+            "inventory_available": 1,
+        }
+        oracle.ai_batch_scoring_enabled = True
+        oracle.ai_batch_min_candidates = 2
+        oracle.ai_batch_max_candidates = 10
+        oracle.ai_scoring_hard_budget_sec = 8.0
+        oracle.ai_scoring_item_timeout_sec = 2.0
+
+        shortlist = [
+            {
+                "set_id": "75367",
+                "candidate": {
+                    "set_id": "75367",
+                    "set_name": "Set 75367",
+                    "theme": "Star Wars",
+                    "source": "lego_proxy_reader",
+                    "current_price": 99.99,
+                    "eol_date_prediction": "2026-12-01",
+                },
+            },
+            {
+                "set_id": "76281",
+                "candidate": {
+                    "set_id": "76281",
+                    "set_name": "Set 76281",
+                    "theme": "Marvel",
+                    "source": "lego_proxy_reader",
+                    "current_price": 79.99,
+                    "eol_date_prediction": "2026-10-01",
+                },
+            },
+        ]
+
+        batch_json = (
+            '{"results": ['
+            '{"set_id":"75367","score":88,"summary":"ok1","predicted_eol_date":"2026-12-01"},'
+            '{"set_id":"76281","score":81,"summary":"ok2","predicted_eol_date":"2026-10-01"}'
+            "]} "
+        )
+
+        with patch.object(oracle, "_openrouter_generate", return_value=batch_json) as mocked_batch, patch.object(
+            oracle,
+            "_get_ai_insight",
+            new=AsyncMock(side_effect=AssertionError("per-candidate path should not run")),
+        ):
+            results, stats = await oracle._score_ai_shortlist(shortlist)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(int(stats["ai_scored_count"]), 2)
+        self.assertEqual(int(stats["ai_batch_scored_count"]), 2)
+        self.assertEqual(int(stats["ai_errors"]), 0)
+        self.assertEqual(mocked_batch.call_count, 1)
+
+    def test_compute_fast_fail_timeouts_reduces_timeout_when_budget_is_tight(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_fast_fail_enabled = True
+        oracle.ai_scoring_item_timeout_sec = 18.0
+        oracle.ai_scoring_retry_timeout_sec = 7.0
+        oracle.ai_scoring_timeout_retries = 1
+
+        first_timeout, retry_timeout, retries = oracle._compute_fast_fail_timeouts(
+            pending_count=10,
+            budget_left_sec=30.0,
+        )
+
+        self.assertLess(first_timeout, 18.0)
+        self.assertLessEqual(retry_timeout, first_timeout)
+        self.assertLessEqual(retries, 1)
+
+    def test_batch_payload_to_ai_insights_accepts_results_array(self) -> None:
+        candidates = [
+            {"set_id": "75367", "set_name": "Set A", "theme": "Star Wars", "source": "lego_proxy_reader"},
+            {"set_id": "76281", "set_name": "Set B", "theme": "Marvel", "source": "lego_proxy_reader"},
+        ]
+        payload = {
+            "results": [
+                {"set_id": "75367", "score": 90, "summary": "ok", "predicted_eol_date": "2026-11-01"},
+                {"set_id": "76281", "score": 75, "summary": "ok", "predicted_eol_date": None},
+            ]
+        }
+
+        insights = DiscoveryOracle._batch_payload_to_ai_insights(payload, candidates)
+        self.assertEqual(set(insights.keys()), {"75367", "76281"})
+        self.assertEqual(insights["75367"].score, 90)
+        self.assertEqual(insights["76281"].score, 75)
+
     def test_format_exception_for_log_timeout_has_message(self) -> None:
         err_type, err_message = DiscoveryOracle._format_exception_for_log(asyncio.TimeoutError())
         self.assertEqual(err_type, "TimeoutError")

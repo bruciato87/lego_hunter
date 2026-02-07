@@ -322,6 +322,25 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot_mock.shutdown.await_count, 1)
         self.assertGreaterEqual(sleep_mock.await_count, 2)
 
+    async def test_scheduled_cycle_does_not_retry_send_message_on_timeout(self) -> None:
+        bot_mock = AsyncMock()
+        bot_mock.set_my_commands = AsyncMock(return_value=True)
+        bot_mock.send_message = AsyncMock(side_effect=TimedOut("timed out"))
+        bot_mock.shutdown = AsyncMock(return_value=None)
+
+        with patch("bot.Bot", return_value=bot_mock), patch("bot.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            await run_scheduled_cycle(
+                token="token",
+                chat_id="123",
+                oracle=FakeOracle(),
+                repository=FakeRepo(),
+                fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+            )
+
+        self.assertEqual(bot_mock.send_message.await_count, 1)
+        self.assertEqual(bot_mock.shutdown.await_count, 1)
+        self.assertEqual(sleep_mock.await_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -59,6 +59,11 @@ DEFAULT_AI_SCORING_TIMEOUT_RETRIES = 1
 DEFAULT_AI_SCORING_RETRY_TIMEOUT_SEC = 7.0
 DEFAULT_AI_TIMEOUT_RECOVERY_PROBES = 1
 DEFAULT_AI_TIMEOUT_RECOVERY_PROBE_TIMEOUT_SEC = 5.0
+DEFAULT_AI_FAST_FAIL_ENABLED = True
+DEFAULT_AI_BATCH_SCORING_ENABLED = True
+DEFAULT_AI_BATCH_MIN_CANDIDATES = 3
+DEFAULT_AI_BATCH_MAX_CANDIDATES = 12
+DEFAULT_AI_BATCH_TIMEOUT_SEC = 26.0
 DEFAULT_AI_MODEL_BAN_SEC = 1800.0
 DEFAULT_AI_MODEL_BAN_FAILURES = 2
 DEFAULT_AI_MODEL_FAILURE_PENALTY = 22
@@ -278,6 +283,32 @@ class DiscoveryOracle:
             minimum=2.0,
             maximum=12.0,
         )
+        self.ai_fast_fail_enabled = self._safe_env_bool(
+            "AI_FAST_FAIL_ENABLED",
+            default=DEFAULT_AI_FAST_FAIL_ENABLED,
+        )
+        self.ai_batch_scoring_enabled = self._safe_env_bool(
+            "AI_BATCH_SCORING_ENABLED",
+            default=DEFAULT_AI_BATCH_SCORING_ENABLED,
+        )
+        self.ai_batch_min_candidates = self._safe_env_int(
+            "AI_BATCH_MIN_CANDIDATES",
+            default=DEFAULT_AI_BATCH_MIN_CANDIDATES,
+            minimum=2,
+            maximum=20,
+        )
+        self.ai_batch_max_candidates = self._safe_env_int(
+            "AI_BATCH_MAX_CANDIDATES",
+            default=DEFAULT_AI_BATCH_MAX_CANDIDATES,
+            minimum=2,
+            maximum=40,
+        )
+        self.ai_batch_timeout_sec = self._safe_env_float(
+            "AI_BATCH_TIMEOUT_SEC",
+            default=DEFAULT_AI_BATCH_TIMEOUT_SEC,
+            minimum=6.0,
+            maximum=60.0,
+        )
         self.openrouter_opportunistic_enabled = self._safe_env_bool(
             "OPENROUTER_OPPORTUNISTIC_ENABLED",
             default=DEFAULT_OPENROUTER_OPPORTUNISTIC_ENABLED,
@@ -426,7 +457,7 @@ class DiscoveryOracle:
             self.strict_ai_probe_validation,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
             self.ai_cache_ttl_sec,
@@ -438,6 +469,11 @@ class DiscoveryOracle:
             self.ai_scoring_retry_timeout_sec,
             self.ai_timeout_recovery_probes,
             self.ai_timeout_recovery_probe_timeout_sec,
+            self.ai_fast_fail_enabled,
+            self.ai_batch_scoring_enabled,
+            self.ai_batch_min_candidates,
+            self.ai_batch_max_candidates,
+            self.ai_batch_timeout_sec,
             self.openrouter_json_repair_probe_timeout_sec,
             self.ai_model_ban_sec,
             self.ai_model_ban_failures,
@@ -2362,6 +2398,7 @@ class DiscoveryOracle:
                 "ai_shortlist_count": 0,
                 "ai_prefilter_skipped_count": 0,
                 "ai_scored_count": 0,
+                "ai_batch_scored_count": 0,
                 "ai_cache_hits": 0,
                 "ai_cache_misses": 0,
                 "ai_errors": 0,
@@ -2533,6 +2570,7 @@ class DiscoveryOracle:
             "ai_shortlist_count": len(shortlist),
             "ai_prefilter_skipped_count": len(skipped),
             "ai_scored_count": int(ai_stats.get("ai_scored_count", 0)),
+            "ai_batch_scored_count": int(ai_stats.get("ai_batch_scored_count", 0)),
             "ai_cache_hits": int(ai_stats.get("ai_cache_hits", 0)),
             "ai_cache_misses": int(ai_stats.get("ai_cache_misses", 0)),
             "ai_errors": int(ai_stats.get("ai_errors", 0)),
@@ -2679,6 +2717,7 @@ class DiscoveryOracle:
             "ai_errors": 0,
             "ai_budget_exhausted": 0,
             "ai_timeout_count": 0,
+            "ai_batch_scored_count": 0,
         }
         if not shortlist:
             return {}, stats
@@ -2697,18 +2736,80 @@ class DiscoveryOracle:
         started = time.monotonic()
         deadline = started + self.ai_scoring_hard_budget_sec
         entry_by_set: Dict[str, Dict[str, Any]] = {str(row["set_id"]): row for row in shortlist}
+        pending_entries: list[Dict[str, Any]] = []
+
+        # First resolve cache hits in a deterministic pass.
+        for entry in shortlist:
+            set_id = str(entry["set_id"])
+            candidate = entry["candidate"]
+            cached = self._get_cached_ai_insight(candidate)
+            if cached is None:
+                pending_entries.append(entry)
+                continue
+            results[set_id] = cached
+            stats["ai_cache_hits"] += 1
+
+        # Batch scoring pre-pass: one AI call for multiple picks to reduce timeout pressure.
+        if (
+            pending_entries
+            and self.ai_batch_scoring_enabled
+            and len(pending_entries) >= int(self.ai_batch_min_candidates)
+        ):
+            batch_cap = max(int(self.ai_batch_min_candidates), int(self.ai_batch_max_candidates))
+            batch_entries = pending_entries[: min(len(pending_entries), batch_cap)]
+            batch_results, batch_error = await self._score_ai_shortlist_batch(batch_entries, deadline=deadline)
+            if batch_error:
+                non_error_reasons = {"no_external_ai_available", "insufficient_budget_for_batch"}
+                if str(batch_error) in non_error_reasons:
+                    LOGGER.info(
+                        "AI batch scoring skipped | candidates=%s reason=%s",
+                        len(batch_entries),
+                        str(batch_error)[:220],
+                    )
+                else:
+                    stats["ai_errors"] += 1
+                    LOGGER.warning(
+                        "AI batch scoring failed | candidates=%s error=%s",
+                        len(batch_entries),
+                        str(batch_error)[:220],
+                    )
+            for entry in batch_entries:
+                set_id = str(entry["set_id"])
+                ai = batch_results.get(set_id)
+                if ai is None:
+                    continue
+                results[set_id] = ai
+                stats["ai_cache_misses"] += 1
+                if not ai.fallback_used:
+                    stats["ai_scored_count"] += 1
+                    stats["ai_batch_scored_count"] += 1
+                    self._set_cached_ai_insight(entry["candidate"], ai)
+            pending_entries = [entry for entry in pending_entries if str(entry["set_id"]) not in results]
+
+        budget_left = max(1.0, deadline - time.monotonic())
+        item_timeout_sec, retry_timeout_sec, timeout_retries = self._compute_fast_fail_timeouts(
+            pending_count=len(pending_entries),
+            budget_left_sec=budget_left,
+        )
+
+        if pending_entries and self.ai_fast_fail_enabled:
+            LOGGER.info(
+                "AI fast-fail active | pending=%s budget_left=%.1fs item_timeout=%.1fs retry_timeout=%.1fs retries=%s",
+                len(pending_entries),
+                budget_left,
+                item_timeout_sec,
+                retry_timeout_sec,
+                timeout_retries,
+            )
 
         async def worker(entry: Dict[str, Any]) -> tuple[str, AIInsight, bool, Optional[Exception]]:
             candidate = entry["candidate"]
             set_id = entry["set_id"]
-            cached = self._get_cached_ai_insight(candidate)
-            if cached is not None:
-                return set_id, cached, True, None
 
             async with semaphore:
-                retries = max(0, int(self.ai_scoring_timeout_retries))
-                first_timeout = float(self.ai_scoring_item_timeout_sec)
-                retry_timeout = min(first_timeout, float(self.ai_scoring_retry_timeout_sec))
+                retries = max(0, int(timeout_retries))
+                first_timeout = float(item_timeout_sec)
+                retry_timeout = min(first_timeout, float(retry_timeout_sec))
                 attempt_timeouts = [first_timeout] + [retry_timeout] * retries
                 total_attempts = len(attempt_timeouts)
 
@@ -2770,7 +2871,7 @@ class DiscoveryOracle:
 
         tasks_by_set = {
             str(entry["set_id"]): asyncio.create_task(worker(entry))
-            for entry in shortlist
+            for entry in pending_entries
         }
 
         while tasks_by_set:
@@ -2868,9 +2969,10 @@ class DiscoveryOracle:
 
         elapsed = time.monotonic() - started
         LOGGER.info(
-            "AI shortlist scoring summary | candidates=%s scored=%s cache_hits=%s cache_misses=%s errors=%s timeouts=%s budget_exhausted=%s concurrency=%s elapsed=%.2fs budget=%.2fs",
+            "AI shortlist scoring summary | candidates=%s scored=%s batch_scored=%s cache_hits=%s cache_misses=%s errors=%s timeouts=%s budget_exhausted=%s concurrency=%s elapsed=%.2fs budget=%.2fs",
             len(shortlist),
             stats["ai_scored_count"],
+            stats["ai_batch_scored_count"],
             stats["ai_cache_hits"],
             stats["ai_cache_misses"],
             stats["ai_errors"],
@@ -2881,6 +2983,195 @@ class DiscoveryOracle:
             self.ai_scoring_hard_budget_sec,
         )
         return results, stats
+
+    async def _score_ai_shortlist_batch(
+        self,
+        entries: list[Dict[str, Any]],
+        *,
+        deadline: float,
+    ) -> tuple[Dict[str, AIInsight], Optional[str]]:
+        if not entries:
+            return {}, None
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 6.0:
+            return {}, "insufficient_budget_for_batch"
+
+        timeout_sec = min(
+            float(self.ai_batch_timeout_sec),
+            float(self.ai_generation_timeout_sec),
+            max(6.0, remaining - 1.0),
+        )
+        candidates = [entry["candidate"] for entry in entries]
+        prompt = self._build_batch_ai_prompt(candidates)
+
+        if self._model is not None:
+            current_model = str(self.gemini_model or "")
+            try:
+                text = await asyncio.wait_for(
+                    asyncio.to_thread(self._gemini_generate, prompt),
+                    timeout=timeout_sec,
+                )
+                payload = self._extract_json(text)
+                insights = self._batch_payload_to_ai_insights(payload, candidates)
+                if insights:
+                    if current_model:
+                        self._record_model_success("gemini", current_model, phase="batch_scoring")
+                    LOGGER.info(
+                        "AI batch scoring success | provider=gemini model=%s candidates=%s scored=%s",
+                        current_model or "unknown",
+                        len(candidates),
+                        len(insights),
+                    )
+                    return insights, None
+                return {}, "batch_payload_no_valid_rows"
+            except Exception as exc:  # noqa: BLE001
+                if current_model:
+                    self._record_model_failure("gemini", current_model, str(exc), phase="batch_scoring")
+                return {}, str(exc)
+
+        if self._openrouter_model_id is not None:
+            current_model = str(self._openrouter_model_id or "")
+            try:
+                text = await asyncio.to_thread(
+                    self._openrouter_generate,
+                    prompt,
+                    request_timeout=timeout_sec,
+                )
+                payload = self._extract_json(text)
+                insights = self._batch_payload_to_ai_insights(payload, candidates)
+                if insights:
+                    self._record_model_success("openrouter", current_model, phase="batch_scoring")
+                    LOGGER.info(
+                        "AI batch scoring success | provider=openrouter model=%s candidates=%s scored=%s",
+                        current_model,
+                        len(candidates),
+                        len(insights),
+                    )
+                    return insights, None
+                return {}, "batch_payload_no_valid_rows"
+            except Exception as exc:  # noqa: BLE001
+                self._record_model_failure("openrouter", current_model, str(exc), phase="batch_scoring")
+                rotated = await self._advance_openrouter_model_locked(reason=f"batch_scoring:{exc}")
+                if rotated:
+                    rotated_model = str(self._openrouter_model_id or "")
+                    try:
+                        text = await asyncio.to_thread(
+                            self._openrouter_generate,
+                            prompt,
+                            request_timeout=timeout_sec,
+                        )
+                        payload = self._extract_json(text)
+                        insights = self._batch_payload_to_ai_insights(payload, candidates)
+                        if insights:
+                            self._record_model_success("openrouter", rotated_model, phase="batch_scoring_after_failover")
+                            LOGGER.info(
+                                "AI batch scoring success after failover | provider=openrouter model=%s candidates=%s scored=%s",
+                                rotated_model,
+                                len(candidates),
+                                len(insights),
+                            )
+                            return insights, None
+                    except Exception as exc_after_switch:  # noqa: BLE001
+                        self._record_model_failure(
+                            "openrouter",
+                            rotated_model,
+                            str(exc_after_switch),
+                            phase="batch_scoring_after_failover",
+                        )
+                        return {}, str(exc_after_switch)
+                return {}, str(exc)
+
+        return {}, "no_external_ai_available"
+
+    def _compute_fast_fail_timeouts(
+        self,
+        *,
+        pending_count: int,
+        budget_left_sec: float,
+    ) -> tuple[float, float, int]:
+        first_timeout = float(self.ai_scoring_item_timeout_sec)
+        retry_timeout = min(first_timeout, float(self.ai_scoring_retry_timeout_sec))
+        retries = max(0, int(self.ai_scoring_timeout_retries))
+
+        if not self.ai_fast_fail_enabled or pending_count <= 0:
+            return first_timeout, retry_timeout, retries
+
+        per_candidate_budget = max(1.0, float(budget_left_sec)) / max(1, int(pending_count))
+        adaptive_first = min(first_timeout, max(4.0, per_candidate_budget * 1.35))
+        adaptive_retry = min(retry_timeout, max(2.0, adaptive_first * 0.60))
+        reduced = adaptive_first + 1e-9 < first_timeout
+        if reduced:
+            if adaptive_first <= 6.0:
+                retries = 0
+            elif adaptive_first <= 9.0:
+                retries = min(retries, 1)
+
+        return round(adaptive_first, 2), round(adaptive_retry, 2), retries
+
+    @classmethod
+    def _batch_payload_to_ai_insights(
+        cls,
+        payload: Any,
+        candidates: list[Dict[str, Any]],
+    ) -> Dict[str, AIInsight]:
+        candidate_by_set_id = {
+            str(row.get("set_id") or "").strip(): row
+            for row in candidates
+            if str(row.get("set_id") or "").strip()
+        }
+        if not candidate_by_set_id:
+            return {}
+
+        rows: list[Dict[str, Any]] = []
+        if isinstance(payload, list):
+            rows = [row for row in payload if isinstance(row, dict)]
+        elif isinstance(payload, dict):
+            for key in ("results", "items", "picks", "scores"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    rows = [row for row in value if isinstance(row, dict)]
+                    break
+            if not rows:
+                # Accept map-style payload: {"75367": {"score": 80, ...}, ...}
+                for set_id, row in payload.items():
+                    if set_id not in candidate_by_set_id or not isinstance(row, dict):
+                        continue
+                    row_copy = dict(row)
+                    row_copy.setdefault("set_id", set_id)
+                    rows.append(row_copy)
+
+        insights: Dict[str, AIInsight] = {}
+        for row in rows:
+            set_id = str(row.get("set_id") or "").strip()
+            candidate = candidate_by_set_id.get(set_id)
+            if candidate is None:
+                continue
+            try:
+                insight = cls._payload_to_ai_insight(row, candidate)
+            except Exception:
+                continue
+            insights[set_id] = insight
+        return insights
+
+    @staticmethod
+    def _build_batch_ai_prompt(candidates: list[Dict[str, Any]]) -> str:
+        lines = [
+            "Analizza i seguenti set LEGO per investimento a 12 mesi.",
+            "Rispondi SOLO con JSON valido.",
+            'Formato obbligatorio: {"results":[{"set_id":"...", "score":1-100, "summary":"max 2 frasi", "predicted_eol_date":"YYYY-MM-DD o null"}]}',
+            "Non aggiungere testo fuori dal JSON.",
+            "",
+            "SET LIST:",
+        ]
+        for row in candidates:
+            lines.append(
+                f"- set_id={row.get('set_id')} | nome={row.get('set_name')} | tema={row.get('theme')} | "
+                f"fonte={row.get('source')} | prezzo={row.get('current_price')} | eol_hint={row.get('eol_date_prediction')}"
+            )
+        lines.append("")
+        lines.append("Criteri: domanda collezionisti, brand power del tema, rivalutazione attesa, liquidita.")
+        return "\n".join(lines)
 
     @staticmethod
     def _format_exception_for_log(exc: Exception) -> tuple[str, str]:
@@ -4306,7 +4597,7 @@ class DiscoveryOracle:
         return (date.today() + timedelta(days=days)).isoformat()
 
     @staticmethod
-    def _extract_json(raw_text: str) -> Dict[str, Any]:
+    def _extract_json(raw_text: str) -> Any:
         text = raw_text.strip()
         if not text:
             return {}

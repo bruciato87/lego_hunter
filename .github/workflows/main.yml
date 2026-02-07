@@ -60,6 +60,10 @@ jobs:
           AI_RANK_MAX_CANDIDATES: "10"
           AI_SCORING_HARD_BUDGET_SEC: "75"
           AI_TIMEOUT_RECOVERY_PROBES: "2"
+          AI_FAST_FAIL_ENABLED: "true"
+          AI_BATCH_SCORING_ENABLED: "true"
+          AI_BATCH_MIN_CANDIDATES: "2"
+          AI_BATCH_MAX_CANDIDATES: "10"
           OPENROUTER_JSON_REPAIR_PROBE_TIMEOUT_SEC: "4"
           RUN_MODE: scheduled
         run: |

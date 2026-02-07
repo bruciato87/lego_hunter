@@ -33,6 +33,8 @@ async def _telegram_call_with_retry(
     max_attempts: int = 3,
     non_fatal: bool = False,
     base_delay_seconds: float = 1.5,
+    retry_timeouts: bool = True,
+    timeout_assume_delivered: bool = False,
 ) -> Optional[Any]:
     for attempt in range(1, max_attempts + 1):
         try:
@@ -53,6 +55,19 @@ async def _telegram_call_with_retry(
                 raise
             await asyncio.sleep(retry_seconds)
         except (TimedOut, NetworkError) as exc:
+            if isinstance(exc, TimedOut) and not retry_timeouts:
+                if timeout_assume_delivered:
+                    LOGGER.warning(
+                        "Telegram timeout on %s (attempt %s/%s): delivery uncertain, skip retry to avoid duplicates.",
+                        operation_name,
+                        attempt,
+                        max_attempts,
+                    )
+                    return {"delivery": "uncertain_timeout_assumed"}
+                if non_fatal:
+                    LOGGER.warning("Non-fatal Telegram operation timed out: %s", operation_name)
+                    return None
+                raise
             retry_seconds = base_delay_seconds * (2 ** (attempt - 1))
             LOGGER.warning(
                 "Telegram transient error on %s (attempt %s/%s): %s. Retrying in %.1fs",
@@ -643,18 +658,27 @@ async def run_scheduled_cycle(
             len(payload),
             len(holdings),
         )
-        await _telegram_call_with_retry(
+        send_result = await _telegram_call_with_retry(
             operation_name="bot.send_message",
             fn=lambda: bot.send_message(
                 chat_id=chat_id,
                 text=payload,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
+                connect_timeout=15,
+                read_timeout=45,
+                write_timeout=30,
+                pool_timeout=15,
             ),
             max_attempts=4,
             non_fatal=False,
+            retry_timeouts=False,
+            timeout_assume_delivered=True,
         )
-        LOGGER.info("Scheduled Telegram report sent successfully")
+        if isinstance(send_result, dict) and send_result.get("delivery") == "uncertain_timeout_assumed":
+            LOGGER.warning("Scheduled Telegram report delivery uncertain (timeout); duplicate-safe mode prevented retries")
+        else:
+            LOGGER.info("Scheduled Telegram report sent successfully")
     except RetryAfter as exc:
         LOGGER.error("Telegram flood-control while sending scheduled report: %s", exc)
         raise
