@@ -967,6 +967,37 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(insight.confidence, "LOW_CONFIDENCE")
         self.assertIn("non json", str(insight.risk_note or "").lower())
 
+    async def test_openrouter_non_json_uses_repair_prompt_before_text_parse(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle._openrouter_model_id = "vendor/model-pro:free"
+        oracle._openrouter_inventory_loaded = True
+
+        candidate = {
+            "set_id": "75367",
+            "set_name": "LEGO Star Wars",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 129.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+        with patch.object(
+            oracle,
+            "_openrouter_generate",
+            side_effect=[
+                "Analisi descrittiva senza JSON e senza punteggio esplicito.",
+                '{"score": 86, "summary": "Riparato JSON", "predicted_eol_date": "2026-12-01"}',
+            ],
+        ) as mocked_generate:
+            insight = await oracle._get_ai_insight(candidate)
+
+        self.assertFalse(insight.fallback_used)
+        self.assertEqual(insight.score, 86)
+        self.assertEqual(insight.confidence, "HIGH_CONFIDENCE")
+        self.assertIsNone(insight.risk_note)
+        self.assertEqual(mocked_generate.call_count, 2)
+
     def test_probe_openrouter_model_accepts_non_json_scored_text(self) -> None:
         repo = FakeRepo()
         with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
@@ -1174,6 +1205,104 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(int(stats["ai_scored_count"]), 1)
         self.assertEqual(int(stats["ai_errors"]), 0)
         self.assertEqual(int(stats["ai_timeout_count"]), 0)
+
+    async def test_score_ai_shortlist_timeout_recovery_retries_before_fallback(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle.ai_scoring_item_timeout_sec = 0.05
+        oracle.ai_scoring_timeout_retries = 0
+        oracle.ai_scoring_retry_timeout_sec = 0.05
+        oracle.ai_scoring_hard_budget_sec = 2.0
+        oracle._openrouter_model_id = "vendor/model-pro:free"
+        oracle.ai_runtime = {
+            "engine": "openrouter",
+            "provider": "openrouter",
+            "model": "vendor/model-pro:free",
+            "mode": "api_openrouter_inventory",
+            "inventory_available": 1,
+        }
+
+        candidate = {
+            "set_id": "75367",
+            "set_name": "LEGO Star Wars",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 129.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+        shortlist = [{"set_id": "75367", "candidate": candidate}]
+        call_counter = {"value": 0}
+
+        async def fake_insight(_candidate):  # noqa: ANN001
+            call_counter["value"] += 1
+            if call_counter["value"] == 1:
+                await asyncio.sleep(0.2)
+            return AIInsight(score=84, summary="ok", predicted_eol_date="2026-10-01")
+
+        with patch.object(oracle, "_get_ai_insight", new=AsyncMock(side_effect=fake_insight)), patch.object(
+            oracle,
+            "_recover_openrouter_after_timeout",
+            new=AsyncMock(return_value=True),
+        ) as mocked_recovery:
+            results, stats = await oracle._score_ai_shortlist(shortlist)
+
+        self.assertEqual(call_counter["value"], 2)
+        self.assertFalse(results["75367"].fallback_used)
+        self.assertEqual(int(stats["ai_scored_count"]), 1)
+        self.assertEqual(int(stats["ai_errors"]), 0)
+        mocked_recovery.assert_awaited_once()
+
+    async def test_score_ai_shortlist_limits_openrouter_concurrency_with_single_model(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle.ai_scoring_concurrency = 4
+        oracle.ai_scoring_item_timeout_sec = 1.0
+        oracle.ai_scoring_timeout_retries = 0
+        oracle.ai_scoring_hard_budget_sec = 5.0
+        oracle.ai_runtime = {
+            "engine": "openrouter",
+            "provider": "openrouter",
+            "model": "vendor/model-pro:free",
+            "mode": "api_openrouter_inventory",
+            "inventory_available": 1,
+        }
+
+        shortlist = []
+        for idx in range(4):
+            set_id = str(75000 + idx)
+            shortlist.append(
+                {
+                    "set_id": set_id,
+                    "candidate": {
+                        "set_id": set_id,
+                        "set_name": f"Set {set_id}",
+                        "theme": "City",
+                        "source": "lego_proxy_reader",
+                        "current_price": 49.99,
+                        "eol_date_prediction": "2026-10-01",
+                    },
+                }
+            )
+
+        counters = {"active": 0, "max_active": 0}
+        lock = asyncio.Lock()
+
+        async def fake_insight(_candidate):  # noqa: ANN001
+            async with lock:
+                counters["active"] += 1
+                counters["max_active"] = max(counters["max_active"], counters["active"])
+            await asyncio.sleep(0.05)
+            async with lock:
+                counters["active"] -= 1
+            return AIInsight(score=75, summary="ok", predicted_eol_date="2026-10-01")
+
+        with patch.object(oracle, "_get_ai_insight", new=AsyncMock(side_effect=fake_insight)):
+            results, _stats = await oracle._score_ai_shortlist(shortlist)
+
+        self.assertEqual(len(results), 4)
+        self.assertLessEqual(counters["max_active"], 2)
 
     def test_format_exception_for_log_timeout_has_message(self) -> None:
         err_type, err_message = DiscoveryOracle._format_exception_for_log(asyncio.TimeoutError())

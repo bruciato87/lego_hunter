@@ -56,6 +56,8 @@ DEFAULT_AI_SCORING_HARD_BUDGET_SEC = 60.0
 DEFAULT_AI_SCORING_ITEM_TIMEOUT_SEC = 18.0
 DEFAULT_AI_SCORING_TIMEOUT_RETRIES = 1
 DEFAULT_AI_SCORING_RETRY_TIMEOUT_SEC = 7.0
+DEFAULT_AI_TIMEOUT_RECOVERY_PROBES = 1
+DEFAULT_AI_TIMEOUT_RECOVERY_PROBE_TIMEOUT_SEC = 5.0
 DEFAULT_AI_MODEL_BAN_SEC = 1800.0
 DEFAULT_AI_MODEL_BAN_FAILURES = 2
 DEFAULT_AI_MODEL_FAILURE_PENALTY = 22
@@ -256,6 +258,18 @@ class DiscoveryOracle:
             minimum=2.0,
             maximum=60.0,
         )
+        self.ai_timeout_recovery_probes = self._safe_env_int(
+            "AI_TIMEOUT_RECOVERY_PROBES",
+            default=DEFAULT_AI_TIMEOUT_RECOVERY_PROBES,
+            minimum=0,
+            maximum=3,
+        )
+        self.ai_timeout_recovery_probe_timeout_sec = self._safe_env_float(
+            "AI_TIMEOUT_RECOVERY_PROBE_TIMEOUT_SEC",
+            default=DEFAULT_AI_TIMEOUT_RECOVERY_PROBE_TIMEOUT_SEC,
+            minimum=2.0,
+            maximum=12.0,
+        )
         self.openrouter_opportunistic_enabled = self._safe_env_bool(
             "OPENROUTER_OPPORTUNISTIC_ENABLED",
             default=DEFAULT_OPENROUTER_OPPORTUNISTIC_ENABLED,
@@ -403,7 +417,7 @@ class DiscoveryOracle:
             self.strict_ai_probe_validation,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
             self.ai_cache_ttl_sec,
@@ -413,6 +427,8 @@ class DiscoveryOracle:
             self.ai_scoring_item_timeout_sec,
             self.ai_scoring_timeout_retries,
             self.ai_scoring_retry_timeout_sec,
+            self.ai_timeout_recovery_probes,
+            self.ai_timeout_recovery_probe_timeout_sec,
             self.ai_model_ban_sec,
             self.ai_model_ban_failures,
             self.openrouter_opportunistic_enabled,
@@ -1419,7 +1435,12 @@ class DiscoveryOracle:
             classify_fn=self._classify_openrouter_probe_failure,
         )
 
-    def _probe_openrouter_model(self, model_id: str) -> tuple[bool, str]:
+    def _probe_openrouter_model(
+        self,
+        model_id: str,
+        *,
+        timeout_sec: Optional[float] = None,
+    ) -> tuple[bool, str]:
         if requests is None:
             return False, "requests unavailable"
         try:
@@ -1428,7 +1449,7 @@ class DiscoveryOracle:
                 messages=[{"role": "user", "content": self._build_ai_probe_prompt()}],
                 max_tokens=96,
                 temperature=0.0,
-                request_timeout=self.ai_probe_timeout_sec,
+                request_timeout=timeout_sec or self.ai_probe_timeout_sec,
             )
             text = self._extract_openrouter_text(response)
             if self.strict_ai_probe_validation:
@@ -1570,6 +1591,10 @@ class DiscoveryOracle:
                 "missing text content",
                 "invalid response payload",
                 "invalid json payload",
+                "timeout",
+                "timed out",
+                "524",
+                "temporarily unavailable",
             )
         )
 
@@ -1696,6 +1721,110 @@ class DiscoveryOracle:
                     continue
                 raise
         raise RuntimeError("OpenRouter response missing text content")
+
+    @staticmethod
+    def _build_openrouter_json_repair_prompt(raw_text: str, candidate: Dict[str, Any]) -> str:
+        clipped = str(raw_text or "").strip()[:2000]
+        return (
+            "Trasforma il testo seguente in JSON valido, senza alcun testo extra. "
+            "Output SOLO JSON con schema esatto: "
+            '{"score": 1-100, "summary": "max 3 frasi", "predicted_eol_date": "YYYY-MM-DD o null"}.\n'
+            f"Set ID: {candidate.get('set_id')}\n"
+            f"Nome: {candidate.get('set_name')}\n"
+            f"Tema: {candidate.get('theme')}\n"
+            f"Prezzo: {candidate.get('current_price')}\n"
+            "Testo da convertire:\n"
+            f"{clipped}"
+        )
+
+    async def _repair_openrouter_non_json_output(
+        self,
+        *,
+        raw_text: str,
+        candidate: Dict[str, Any],
+        timeout_sec: float,
+    ) -> Optional[AIInsight]:
+        model_id = str(self._openrouter_model_id or "").strip()
+        if not model_id:
+            return None
+
+        repair_prompt = self._build_openrouter_json_repair_prompt(raw_text, candidate)
+        repair_timeout = max(3.0, min(8.0, float(timeout_sec)))
+        try:
+            repaired_text = await asyncio.to_thread(
+                self._openrouter_generate,
+                repair_prompt,
+                request_timeout=repair_timeout,
+            )
+            payload = self._extract_json(repaired_text)
+            insight = self._payload_to_ai_insight(payload, candidate)
+            self._record_model_success("openrouter", model_id, phase="scoring_json_repair")
+            LOGGER.info(
+                "OpenRouter non-JSON repaired to JSON | model=%s set_id=%s",
+                model_id,
+                candidate.get("set_id"),
+            )
+            return insight
+        except Exception as exc:  # noqa: BLE001
+            self._record_model_failure("openrouter", model_id, str(exc), phase="scoring_json_repair")
+            LOGGER.warning(
+                "OpenRouter JSON repair failed | model=%s set_id=%s error=%s",
+                model_id,
+                candidate.get("set_id"),
+                str(exc)[:220],
+            )
+            return None
+
+    async def _recover_openrouter_after_timeout(self, *, set_id: str) -> bool:
+        if self._openrouter_model_id is None:
+            return False
+
+        # First try regular failover path (available candidates + health ranking).
+        rotated = await self._advance_openrouter_model_locked(reason=f"scoring_timeout:{set_id}:failover")
+        if rotated:
+            return True
+
+        max_probes = max(0, int(self.ai_timeout_recovery_probes))
+        if max_probes <= 0:
+            return False
+
+        if self._ai_failover_lock is None:
+            self._ai_failover_lock = asyncio.Lock()
+        async with self._ai_failover_lock:
+            current_model = str(self._openrouter_model_id or "")
+            pool = [name for name in self._openrouter_candidates if name != current_model]
+            ranked_pool = self._rank_candidate_models("openrouter", pool, allow_forced_retry=True)
+            if not ranked_pool:
+                return False
+
+            quick_timeout = float(self.ai_timeout_recovery_probe_timeout_sec)
+            for model_id in ranked_pool[:max_probes]:
+                ok, reason = self._probe_openrouter_model(model_id, timeout_sec=quick_timeout)
+                if ok:
+                    idx = self._openrouter_candidates.index(model_id)
+                    self._record_model_success("openrouter", model_id, phase="timeout_recovery_probe")
+                    if model_id not in self._openrouter_available_candidates:
+                        self._openrouter_available_candidates.append(model_id)
+                    self._activate_openrouter_model(
+                        model_id=model_id,
+                        index=idx,
+                        mode="api_openrouter_timeout_recovery",
+                    )
+                    LOGGER.warning(
+                        "OpenRouter timeout recovery activated | set_id=%s model=%s",
+                        set_id,
+                        model_id,
+                    )
+                    return True
+
+                self._record_model_failure("openrouter", model_id, reason, phase="timeout_recovery_probe")
+                LOGGER.warning(
+                    "OpenRouter timeout recovery probe failed | set_id=%s model=%s reason=%s",
+                    set_id,
+                    model_id,
+                    str(reason)[:220],
+                )
+        return False
 
     @staticmethod
     def _extract_openrouter_text(data: Dict[str, Any]) -> str:
@@ -2482,7 +2611,16 @@ class DiscoveryOracle:
         if not shortlist:
             return {}, stats
 
-        semaphore = asyncio.Semaphore(max(1, self.ai_scoring_concurrency))
+        effective_concurrency = max(1, int(self.ai_scoring_concurrency))
+        if str(self.ai_runtime.get("engine") or "") == "openrouter":
+            inventory_available = int(
+                self.ai_runtime.get("inventory_available")
+                or len(self._openrouter_available_candidates)
+                or 0
+            )
+            if inventory_available <= 1:
+                effective_concurrency = min(effective_concurrency, 2)
+        semaphore = asyncio.Semaphore(effective_concurrency)
         results: Dict[str, AIInsight] = {}
         started = time.monotonic()
         deadline = started + self.ai_scoring_hard_budget_sec
@@ -2527,6 +2665,25 @@ class DiscoveryOracle:
                                     reason=f"scoring_timeout:{set_id}:attempt_{attempt_idx}",
                                 )
                             continue
+                        recovered = await self._recover_openrouter_after_timeout(set_id=str(set_id))
+                        if recovered:
+                            LOGGER.warning(
+                                "AI scoring timeout recovery active | set_id=%s source=%s model=%s",
+                                set_id,
+                                candidate.get("source"),
+                                self.ai_runtime.get("model"),
+                            )
+                            try:
+                                ai = await asyncio.wait_for(
+                                    self._get_ai_insight(candidate),
+                                    timeout=retry_timeout,
+                                )
+                                return set_id, ai, False, None
+                            except Exception as recovery_exc:  # noqa: BLE001
+                                timeout_err = asyncio.TimeoutError(
+                                    f"timeout after recovery (attempt {attempt_idx}/{total_attempts}): {recovery_exc}"
+                                )
+                                return set_id, self._heuristic_ai_fallback(candidate), False, timeout_err
                         timeout_err = asyncio.TimeoutError(
                             f"timeout after {attempt_timeout:.1f}s (attempt {attempt_idx}/{total_attempts})"
                         )
@@ -2639,7 +2796,7 @@ class DiscoveryOracle:
 
         elapsed = time.monotonic() - started
         LOGGER.info(
-            "AI shortlist scoring summary | candidates=%s scored=%s cache_hits=%s cache_misses=%s errors=%s timeouts=%s budget_exhausted=%s elapsed=%.2fs budget=%.2fs",
+            "AI shortlist scoring summary | candidates=%s scored=%s cache_hits=%s cache_misses=%s errors=%s timeouts=%s budget_exhausted=%s concurrency=%s elapsed=%.2fs budget=%.2fs",
             len(shortlist),
             stats["ai_scored_count"],
             stats["ai_cache_hits"],
@@ -2647,6 +2804,7 @@ class DiscoveryOracle:
             stats["ai_errors"],
             stats["ai_timeout_count"],
             stats["ai_budget_exhausted"],
+            effective_concurrency,
             elapsed,
             self.ai_scoring_hard_budget_sec,
         )
@@ -3567,6 +3725,21 @@ class DiscoveryOracle:
                 try:
                     payload = self._extract_json(text)
                 except Exception:
+                    repaired_insight = await self._repair_openrouter_non_json_output(
+                        raw_text=text,
+                        candidate=candidate,
+                        timeout_sec=timeout_sec,
+                    )
+                    if repaired_insight is not None:
+                        self._openrouter_malformed_errors = 0
+                        if attempt > 1:
+                            LOGGER.info(
+                                "OpenRouter opportunistic recovery via JSON repair | set_id=%s attempt=%s model=%s",
+                                set_id,
+                                attempt,
+                                current_model,
+                            )
+                        return repaired_insight
                     parsed_text_insight = self._ai_insight_from_unstructured_text(text, candidate)
                     if parsed_text_insight is not None:
                         self._openrouter_malformed_errors = 0
