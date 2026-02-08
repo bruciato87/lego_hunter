@@ -3071,7 +3071,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(samples, 12)
         self.assertAlmostEqual(win_rate, 14.5, places=2)
         self.assertEqual(support, 40)
-        self.assertEqual(prior, 40)
+        self.assertEqual(prior, 35)
 
     def test_historical_quality_empty_seed_keeps_conservative_softening(self) -> None:
         repo = FakeRepo()

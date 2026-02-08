@@ -121,6 +121,7 @@ jobs:
           HISTORICAL_INCLUDE_UNKNOWN_MARKET: "false"
           HISTORICAL_RECENCY_HALFLIFE_DAYS: "900"
           HISTORICAL_RECENCY_MIN_WEIGHT: "0.20"
+          HISTORICAL_DEGRADED_MIN_PRIOR_SCORE: "35"
           RUN_MODE: scheduled
         run: |
           echo "AI cache debug mode: disable_ai_cache=${{ github.event.inputs.disable_ai_cache || 'false' }}"
