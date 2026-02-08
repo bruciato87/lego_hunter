@@ -2,6 +2,15 @@ name: lego-hunter
 
 on:
   workflow_dispatch:
+    inputs:
+      disable_ai_cache:
+        description: "Disabilita cache AI per questa run (debug live scoring)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
   schedule:
     - cron: "0 */6 * * *"
 
@@ -91,6 +100,8 @@ jobs:
           AI_SINGLE_CALL_SCORING_ENABLED: "true"
           AI_SINGLE_CALL_ALLOW_REPAIR_CALLS: "false"
           AI_SINGLE_CALL_MAX_CANDIDATES: "12"
+          AI_CACHE_TTL_SEC: ${{ github.event.inputs.disable_ai_cache == 'true' && '0' || '10800' }}
+          AI_PERSISTED_CACHE_TTL_SEC: ${{ github.event.inputs.disable_ai_cache == 'true' && '0' || '129600' }}
           AI_SCORE_GUARDRAIL_ENABLED: "true"
           AI_SCORE_SOFT_CAP: "95"
           AI_SCORE_SOFT_CAP_FACTOR: "0.35"
@@ -109,4 +120,7 @@ jobs:
           HISTORICAL_RECENCY_MIN_WEIGHT: "0.20"
           RUN_MODE: scheduled
         run: |
+          echo "AI cache debug mode: disable_ai_cache=${{ github.event.inputs.disable_ai_cache || 'false' }}"
+          echo "AI_CACHE_TTL_SEC=${AI_CACHE_TTL_SEC}"
+          echo "AI_PERSISTED_CACHE_TTL_SEC=${AI_PERSISTED_CACHE_TTL_SEC}"
           python bot.py --mode scheduled
