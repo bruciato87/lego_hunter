@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from telegram.error import TimedOut
 
@@ -156,6 +156,52 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Alias compatibilita'", text)
         self.assertIn("/hunt -> /scova", text)
         self.assertIn("Esempi rapidi", text)
+
+    async def test_help_does_not_initialize_oracle(self) -> None:
+        oracle_factory = Mock(return_value=FakeOracle())
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=None,
+            oracle_factory=oracle_factory,
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate()
+
+        await manager.cmd_help(update, DummyContext())
+
+        oracle_factory.assert_not_called()
+
+    async def test_scova_initializes_oracle_on_demand(self) -> None:
+        oracle_factory = Mock(return_value=FakeOracle())
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=None,
+            oracle_factory=oracle_factory,
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate()
+
+        await manager.cmd_scova(update, DummyContext())
+
+        oracle_factory.assert_called_once()
+
+    async def test_light_commands_do_not_initialize_oracle(self) -> None:
+        oracle_factory = Mock(return_value=FakeOracle())
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=None,
+            oracle_factory=oracle_factory,
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+
+        await manager.cmd_start(DummyUpdate(), DummyContext())
+        await manager.cmd_help(DummyUpdate(), DummyContext())
+        await manager.cmd_radar(DummyUpdate(), DummyContext())
+        await manager.cmd_cerca(DummyUpdate(), DummyContext(args=["Rivendell"]))
+        await manager.cmd_collezione(DummyUpdate(), DummyContext())
+        await manager.cmd_vendi(DummyUpdate(), DummyContext())
+
+        oracle_factory.assert_not_called()
 
     async def test_cerca_returns_results(self) -> None:
         manager = LegoHunterTelegramBot(

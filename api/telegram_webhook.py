@@ -63,11 +63,11 @@ def _has_valid_secret(received_secret: Optional[str]) -> bool:
 
 def _build_manager_from_env() -> LegoHunterTelegramBot:
     repository = LegoHunterRepository.from_env()
-    oracle = DiscoveryOracle(repository=repository)
     fiscal_guardian = FiscalGuardian(repository)
     return LegoHunterTelegramBot(
         repository=repository,
-        oracle=oracle,
+        oracle=None,
+        oracle_factory=lambda: DiscoveryOracle(repository=repository),
         fiscal_guardian=fiscal_guardian,
         allowed_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
     )

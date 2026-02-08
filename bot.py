@@ -96,15 +96,24 @@ class LegoHunterTelegramBot:
     def __init__(
         self,
         repository: LegoHunterRepository,
-        oracle: DiscoveryOracle,
+        oracle: Optional[DiscoveryOracle],
         fiscal_guardian: FiscalGuardian,
         *,
         allowed_chat_id: Optional[str] = None,
+        oracle_factory: Optional[Callable[[], DiscoveryOracle]] = None,
     ) -> None:
         self.repository = repository
-        self.oracle = oracle
+        self._oracle = oracle
+        self._oracle_factory = oracle_factory
         self.fiscal_guardian = fiscal_guardian
         self.allowed_chat_id = str(allowed_chat_id) if allowed_chat_id else None
+
+    def _get_oracle(self) -> DiscoveryOracle:
+        if self._oracle is None:
+            if self._oracle_factory is None:
+                raise RuntimeError("DiscoveryOracle non configurato")
+            self._oracle = self._oracle_factory()
+        return self._oracle
 
     @staticmethod
     def supported_commands() -> list[BotCommand]:
@@ -160,8 +169,9 @@ class LegoHunterTelegramBot:
             return
 
         await update.message.reply_text("Scansione in corso: Lego Retiring Soon + Amazon + ranking AI...")
+        oracle = self._get_oracle()
         try:
-            report = await self.oracle.discover_with_diagnostics(
+            report = await oracle.discover_with_diagnostics(
                 persist=True,
                 top_limit=20,
                 fallback_limit=3,
@@ -257,12 +267,13 @@ class LegoHunterTelegramBot:
             return
 
         await update.message.reply_text("Verifica offerte secondarie (Vinted/Subito) in corso...")
+        oracle = self._get_oracle()
 
         try:
             opportunities = await asyncio.to_thread(self.repository.get_top_opportunities, 6, 50)
             if not opportunities:
-                opportunities = await self.oracle.discover_opportunities(persist=True, top_limit=6)
-            deals = await self.oracle.validate_secondary_deals(opportunities[:6])
+                opportunities = await oracle.discover_opportunities(persist=True, top_limit=6)
+            deals = await oracle.validate_secondary_deals(opportunities[:6])
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("Deal validation failed")
             await update.message.reply_text(f"Errore verifica offerte: {exc}")
@@ -780,13 +791,13 @@ async def main_async() -> None:
         raise RuntimeError("Missing TELEGRAM_TOKEN")
 
     repository = LegoHunterRepository.from_env()
-    oracle = DiscoveryOracle(repository=repository)
     fiscal_guardian = FiscalGuardian(repository)
 
     if args.mode == "scheduled":
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
         if not chat_id:
             raise RuntimeError("Missing TELEGRAM_CHAT_ID for scheduled mode")
+        oracle = DiscoveryOracle(repository=repository)
         await run_scheduled_cycle(
             token=telegram_token,
             chat_id=chat_id,
@@ -798,7 +809,8 @@ async def main_async() -> None:
 
     manager = LegoHunterTelegramBot(
         repository=repository,
-        oracle=oracle,
+        oracle=None,
+        oracle_factory=lambda: DiscoveryOracle(repository=repository),
         fiscal_guardian=fiscal_guardian,
         allowed_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
     )
