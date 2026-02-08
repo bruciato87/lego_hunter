@@ -73,6 +73,7 @@ DEFAULT_AI_BATCH_MAX_CANDIDATES = 12
 DEFAULT_AI_BATCH_TIMEOUT_SEC = 26.0
 DEFAULT_AI_SINGLE_CALL_SCORING_ENABLED = False
 DEFAULT_AI_SINGLE_CALL_ALLOW_REPAIR_CALLS = False
+DEFAULT_AI_SINGLE_CALL_MAX_CANDIDATES = 12
 DEFAULT_BOOTSTRAP_THRESHOLDS_ENABLED = False
 DEFAULT_BOOTSTRAP_MIN_HISTORY_POINTS = 45
 DEFAULT_BOOTSTRAP_MIN_UPSIDE_PROBABILITY = 0.52
@@ -509,6 +510,12 @@ class DiscoveryOracle:
             "AI_SINGLE_CALL_ALLOW_REPAIR_CALLS",
             default=DEFAULT_AI_SINGLE_CALL_ALLOW_REPAIR_CALLS,
         )
+        self.ai_single_call_max_candidates = self._safe_env_int(
+            "AI_SINGLE_CALL_MAX_CANDIDATES",
+            default=DEFAULT_AI_SINGLE_CALL_MAX_CANDIDATES,
+            minimum=3,
+            maximum=40,
+        )
         self.ai_top_pick_rescue_enabled = self._safe_env_bool(
             "AI_TOP_PICK_RESCUE_ENABLED",
             default=DEFAULT_AI_TOP_PICK_RESCUE_ENABLED,
@@ -792,7 +799,7 @@ class DiscoveryOracle:
             self.openrouter_free_tier_only,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s floor_multi_model=%s per_model=%s bonus=%s cache_ttl_sec=%.0f persisted_cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f ai_single_call=%s ai_single_call_allow_repair=%s ai_top_pick_rescue_enabled=%s ai_top_pick_rescue_count=%s ai_top_pick_rescue_timeout_sec=%.1f ai_final_pick_guarantee_count=%s ai_final_pick_guarantee_rounds=%s openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s floor_multi_model=%s per_model=%s bonus=%s cache_ttl_sec=%.0f persisted_cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f ai_single_call=%s ai_single_call_allow_repair=%s ai_single_call_max_candidates=%s ai_top_pick_rescue_enabled=%s ai_top_pick_rescue_count=%s ai_top_pick_rescue_timeout_sec=%.1f ai_final_pick_guarantee_count=%s ai_final_pick_guarantee_rounds=%s openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
             self.ai_dynamic_shortlist_enabled,
@@ -817,6 +824,7 @@ class DiscoveryOracle:
             self.ai_batch_timeout_sec,
             self.ai_single_call_scoring_enabled,
             self.ai_single_call_allow_repair_calls,
+            self.ai_single_call_max_candidates,
             self.ai_top_pick_rescue_enabled,
             self.ai_top_pick_rescue_count,
             self.ai_top_pick_rescue_timeout_sec,
@@ -3635,9 +3643,20 @@ class DiscoveryOracle:
             return [], []
 
         if self.ai_single_call_scoring_enabled:
-            for row in prepared:
+            shortlist_cap = min(len(prepared), max(3, int(self.ai_single_call_max_candidates)))
+            shortlist = prepared[:shortlist_cap]
+            skipped = prepared[shortlist_cap:]
+            for row in shortlist:
                 row["ai_shortlisted"] = True
-            return list(prepared), []
+            if skipped:
+                LOGGER.info(
+                    "AI single-call shortlist cap applied | candidates=%s selected=%s skipped=%s cap=%s",
+                    len(prepared),
+                    len(shortlist),
+                    len(skipped),
+                    self.ai_single_call_max_candidates,
+                )
+            return shortlist, skipped
 
         shortlist_count = self._effective_ai_shortlist_limit(len(prepared))
         shortlist = prepared[:shortlist_count]
@@ -4280,10 +4299,74 @@ class DiscoveryOracle:
         if not text.strip():
             return insights
 
+        candidate_by_set_id = {
+            str(row.get("set_id") or "").strip(): row
+            for row in candidates
+            if str(row.get("set_id") or "").strip()
+        }
+
+        # Pass 0: key-value/pipe rows, e.g. "set_id=76281|score=78|summary=...".
+        for line in text.splitlines():
+            line_text = str(line or "").strip()
+            if not line_text:
+                continue
+
+            set_id = ""
+            score_value: Optional[int] = None
+            summary = ""
+            eol = None
+
+            kv_match = re.search(
+                r"(?is)set[_\s-]?id\s*[:=]\s*(\d{4,6}).{0,180}?score\s*[:=]\s*(100|[1-9]?\d)\b",
+                line_text,
+            )
+            if kv_match:
+                set_id = str(kv_match.group(1))
+                score_value = int(kv_match.group(2))
+                summary_match = re.search(r"(?is)summary\s*[:=]\s*([^|;]+)", line_text)
+                if summary_match:
+                    summary = str(summary_match.group(1) or "").strip()
+                eol = cls._extract_first_date(line_text)
+            else:
+                pipe_match = re.search(
+                    r"(?is)^\s*(?:[-*]\s*)?(?:\d+[\)\.\-:]?\s*)?(\d{4,6})\s*[|;,]\s*(100|[1-9]?\d)\b(.*)$",
+                    line_text,
+                )
+                if pipe_match:
+                    set_id = str(pipe_match.group(1))
+                    score_value = int(pipe_match.group(2))
+                    tail = str(pipe_match.group(3) or "").strip(" |;")
+                    summary = tail
+                    eol = cls._extract_first_date(tail)
+
+            if not set_id or score_value is None:
+                continue
+            if set_id in insights:
+                continue
+            candidate = candidate_by_set_id.get(set_id)
+            if candidate is None:
+                continue
+
+            score = max(1, min(100, int(score_value)))
+            if not summary:
+                summary = f"Output AI non JSON: score {score}/100 estratto da formato key-value."
+            summary = summary[:1200]
+            insights[set_id] = AIInsight(
+                score=score,
+                summary=summary,
+                predicted_eol_date=eol or candidate.get("eol_date_prediction"),
+                fallback_used=False,
+                confidence="LOW_CONFIDENCE",
+                risk_note="Output AI non JSON: score estratto da testo con parsing robusto.",
+            )
+
+        if len(insights) == len(candidate_by_set_id):
+            return insights
+
         # Pass 1: per-candidate extraction anchored on set_id/name snippets.
         for candidate in candidates:
             set_id = str(candidate.get("set_id") or "").strip()
-            if not set_id:
+            if not set_id or set_id in insights:
                 continue
             segment = cls._candidate_unstructured_segment(text, candidate)
             if not segment:
@@ -4300,7 +4383,7 @@ class DiscoveryOracle:
                 risk_note="Output AI non JSON: score estratto da testo con parsing robusto.",
             )
 
-        if len(insights) == len([c for c in candidates if str(c.get("set_id") or "").strip()]):
+        if len(insights) == len(candidate_by_set_id):
             return insights
 
         # Pass 2: strict set_id -> score mapping in free-text.
@@ -4374,14 +4457,19 @@ class DiscoveryOracle:
             "Analizza i seguenti set LEGO per investimento a 12 mesi.",
             "Rispondi SOLO con JSON valido.",
             'Formato obbligatorio: {"results":[{"set_id":"...", "score":1-100, "summary":"max 2 frasi", "predicted_eol_date":"YYYY-MM-DD o null"}]}',
+            (
+                "Se il modello non riesce a produrre JSON valido, usa formato fallback "
+                "una riga per set: set_id=<ID>|score=<1-100>|summary=<max 12 parole>|predicted_eol_date=<YYYY-MM-DD|null>"
+            ),
+            f"Devi restituire esattamente {len(candidates)} risultati (uno per ogni set_id). Non omettere nessun set.",
             "Non aggiungere testo fuori dal JSON.",
             "",
             "SET LIST:",
         ]
-        for row in candidates:
+        for idx, row in enumerate(candidates, start=1):
             lines.append(
-                f"- set_id={row.get('set_id')} | nome={row.get('set_name')} | tema={row.get('theme')} | "
-                f"fonte={row.get('source')} | prezzo={row.get('current_price')} | eol_hint={row.get('eol_date_prediction')}"
+                f"- idx={idx} | set_id={row.get('set_id')} | nome={row.get('set_name')} | tema={row.get('theme')} | "
+                f"prezzo={row.get('current_price')} | eol_hint={row.get('eol_date_prediction')}"
             )
         lines.append("")
         lines.append(

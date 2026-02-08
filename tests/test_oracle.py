@@ -2314,6 +2314,52 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(int(stats["ai_batch_scored_count"]), 3)
         self.assertEqual(mocked_batch.await_count, 1)
 
+    def test_select_ai_shortlist_single_call_applies_cap(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_single_call_scoring_enabled = True
+        oracle.ai_single_call_max_candidates = 2
+
+        prepared = []
+        for idx in range(5):
+            prepared.append(
+                {
+                    "set_id": str(76000 + idx),
+                    "candidate": {
+                        "set_id": str(76000 + idx),
+                        "set_name": f"Set {76000 + idx}",
+                        "theme": "City",
+                        "source": "lego_proxy_reader",
+                        "current_price": 39.99,
+                        "eol_date_prediction": "2026-10-01",
+                    },
+                    "ai_shortlisted": False,
+                }
+            )
+
+        shortlist, skipped = oracle._select_ai_shortlist(prepared)
+        self.assertEqual(len(shortlist), 3)  # minimum safety floor in single-call mode
+        self.assertEqual(len(skipped), 2)
+        self.assertTrue(all(bool(row.get("ai_shortlisted")) for row in shortlist))
+        self.assertTrue(all(not bool(row.get("ai_shortlisted")) for row in skipped))
+
+    def test_batch_insights_from_unstructured_text_parses_key_value_rows(self) -> None:
+        candidates = [
+            {"set_id": "75367", "set_name": "Set A", "theme": "Star Wars", "source": "lego_proxy_reader"},
+            {"set_id": "76281", "set_name": "Set B", "theme": "Marvel", "source": "lego_proxy_reader"},
+            {"set_id": "42182", "set_name": "Set C", "theme": "Technic", "source": "lego_proxy_reader"},
+        ]
+        raw_text = (
+            "set_id=75367|score=88|summary=alta domanda|predicted_eol_date=2026-12-01\n"
+            "set_id=76281|score=74|summary=buon upside|predicted_eol_date=2026-10-01\n"
+            "set_id=42182|score=71|summary=liquidita stabile|predicted_eol_date=2026-09-01"
+        )
+        insights = DiscoveryOracle._batch_insights_from_unstructured_text(raw_text, candidates)
+        self.assertEqual(set(insights.keys()), {"75367", "76281", "42182"})
+        self.assertEqual(insights["75367"].score, 88)
+        self.assertEqual(insights["76281"].score, 74)
+        self.assertEqual(insights["42182"].score, 71)
+
     def test_batch_insights_from_unstructured_text_order_fallback(self) -> None:
         candidates = [
             {"set_id": "75367", "set_name": "Set A", "theme": "Star Wars", "source": "lego_proxy_reader"},
