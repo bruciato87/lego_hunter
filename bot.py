@@ -17,6 +17,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from fiscal import FiscalGuardian
 from models import LegoHunterRepository
 from oracle import DiscoveryOracle
+from scrapers import PLAYWRIGHT_AVAILABLE
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -246,6 +247,13 @@ class LegoHunterTelegramBot:
 
     async def cmd_offerte(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update):
+            return
+
+        if not PLAYWRIGHT_AVAILABLE:
+            await update.message.reply_text(
+                "Il comando /offerte richiede Playwright e non e' disponibile nel runtime webhook leggero. "
+                "Resta attivo nei cicli schedulati cloud."
+            )
             return
 
         await update.message.reply_text("Verifica offerte secondarie (Vinted/Subito) in corso...")
