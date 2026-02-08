@@ -263,6 +263,53 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("super heroes", prior.get("matched_theme_keys") or [])
         self.assertGreaterEqual(int(prior.get("sample_size") or 0), 12)
 
+    def test_historical_prior_uses_alias_when_direct_sample_is_too_small(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_reference_min_samples = 24
+        oracle._historical_reference_cases = []
+        for idx in range(8):
+            oracle._historical_reference_cases.append(
+                {
+                    "set_id": str(90000 + idx),
+                    "theme": "Ideas",
+                    "theme_norm": "ideas",
+                    "set_name": f"Ideas Case {idx}",
+                    "msrp_usd": 200.0 + idx,
+                    "roi_12m_pct": 20.0 + (idx % 3),
+                    "win_12m": 0,
+                    "source_dataset": "seed",
+                    "pattern_tags": "[]",
+                }
+            )
+        for idx in range(30):
+            oracle._historical_reference_cases.append(
+                {
+                    "set_id": str(91000 + idx),
+                    "theme": "Advanced Models",
+                    "theme_norm": "advanced models",
+                    "set_name": f"AM Case {idx}",
+                    "msrp_usd": 210.0 + idx,
+                    "roi_12m_pct": 24.0 + (idx % 6),
+                    "win_12m": 0,
+                    "source_dataset": "seed",
+                    "pattern_tags": "[]",
+                }
+            )
+
+        candidate = {
+            "set_id": "21341",
+            "set_name": "Disney Hocus Pocus: il cottage delle sorelle Sanderson",
+            "theme": "Ideas",
+            "source": "lego_proxy_reader",
+            "current_price": 229.99,
+        }
+        prior = oracle._historical_prior_for_candidate(candidate)
+        self.assertIsNotNone(prior)
+        assert prior is not None
+        self.assertEqual(prior.get("match_mode"), "alias")
+        self.assertGreaterEqual(int(prior.get("sample_size") or 0), 12)
+
     def test_normalize_theme_key_handles_symbols_and_spacing(self) -> None:
         self.assertEqual(DiscoveryOracle._normalize_theme_key("  Marvel / Super-Heroes  "), "marvel super heroes")
 
@@ -278,6 +325,14 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             DiscoveryOracle._guess_theme_from_name("In volo con la Dodo Airlines"),
             "Animal Crossing",
+        )
+        self.assertEqual(
+            DiscoveryOracle._guess_theme_from_name("Disney Hocus Pocus: il cottage delle sorelle Sanderson"),
+            "Ideas",
+        )
+        self.assertEqual(
+            DiscoveryOracle._guess_theme_from_name("Parco giochi degli animali"),
+            "Seasonal",
         )
 
     def test_effective_pattern_score_penalizes_fallback_retiring_only(self) -> None:

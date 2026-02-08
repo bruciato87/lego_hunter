@@ -3987,21 +3987,23 @@ class DiscoveryOracle:
         if not theme:
             return None
 
+        min_required_for_prior = max(8, int(self.historical_reference_min_samples // 2))
         direct_cases = [row for row in self._historical_reference_cases if row.get("theme_norm") == theme]
         match_mode = "direct"
         matched_theme_keys = [theme]
         theme_cases = direct_cases
-        if len(theme_cases) < 6:
+        if len(theme_cases) < min_required_for_prior:
             candidate_keys = self._historical_theme_keys_for_candidate(theme)
             matched_theme_keys = candidate_keys or [theme]
-            theme_cases = [
+            alias_cases = [
                 row
                 for row in self._historical_reference_cases
                 if str(row.get("theme_norm") or "") in set(matched_theme_keys)
             ]
-            if len(theme_cases) >= 6 and len(matched_theme_keys) > 1:
+            if len(alias_cases) >= min_required_for_prior and len(matched_theme_keys) > 1:
+                theme_cases = alias_cases
                 match_mode = "alias"
-            else:
+            elif len(theme_cases) < min_required_for_prior:
                 return None
 
         price_raw = candidate.get("current_price")
@@ -4024,7 +4026,7 @@ class DiscoveryOracle:
                 selected = price_band_cases
 
         rois = [float(row["roi_12m_pct"]) for row in selected if row.get("roi_12m_pct") is not None]
-        if len(rois) < max(8, int(self.historical_reference_min_samples // 2)):
+        if len(rois) < min_required_for_prior:
             return None
 
         wins = [
@@ -5025,6 +5027,17 @@ class DiscoveryOracle:
             ("Botanicals", ("botanical", "botanicals", "narcisi", "fiori", "bouquet", "rose", "orchidea")),
             ("Harry Potter", ("harry potter", "hogwarts")),
             (
+                "Ideas",
+                (
+                    "ideas",
+                    "hocus pocus",
+                    "sanderson",
+                    "typewriter",
+                    "tree house",
+                    "home alone",
+                ),
+            ),
+            (
                 "Marvel",
                 (
                     "marvel",
@@ -5045,6 +5058,18 @@ class DiscoveryOracle:
             ("Ninjago", ("ninjago",)),
             ("Friends", ("friends",)),
             ("Architecture", ("architecture",)),
+            (
+                "Seasonal",
+                (
+                    "parco giochi degli animali",
+                    "animal playground",
+                    "pasqua",
+                    "easter",
+                    "spring",
+                    "natale",
+                    "halloween",
+                ),
+            ),
             (
                 "Animal Crossing",
                 (
