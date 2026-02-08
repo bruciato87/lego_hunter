@@ -8,4 +8,4 @@ htmlcov/
 .env
 .venv/
 data/historical_seed/raw/
-data/historical_seed/bricklink_reference_cases.csv
+data/historical_seed/ebay_reference_cases.csv

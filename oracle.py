@@ -117,7 +117,6 @@ DEFAULT_AI_TOP_PICK_RESCUE_TIMEOUT_SEC = 9.0
 DEFAULT_AI_FINAL_PICK_GUARANTEE_COUNT = 3
 DEFAULT_AI_FINAL_PICK_GUARANTEE_ROUNDS = 2
 DEFAULT_HISTORICAL_REFERENCE_CASES_PATH = "data/historical_seed/historical_reference_cases.csv"
-DEFAULT_HISTORICAL_BRICKLINK_CASES_PATH = "data/historical_seed/bricklink_reference_cases.csv"
 DEFAULT_HISTORICAL_REFERENCE_ENABLED = True
 DEFAULT_HISTORICAL_REFERENCE_MIN_SAMPLES = 24
 DEFAULT_HISTORICAL_PRIOR_WEIGHT = 0.10
@@ -577,20 +576,6 @@ class DiscoveryOracle:
         self.historical_reference_paths = self._split_env_csv(reference_paths_raw)
         if not self.historical_reference_paths:
             self.historical_reference_paths = [DEFAULT_HISTORICAL_REFERENCE_CASES_PATH]
-        self.historical_bricklink_enabled = self._safe_env_bool(
-            "HISTORICAL_BRICKLINK_ENABLED",
-            default=True,
-        )
-        self.historical_bricklink_cases_path = (
-            os.getenv("HISTORICAL_BRICKLINK_CASES_PATH") or DEFAULT_HISTORICAL_BRICKLINK_CASES_PATH
-        ).strip()
-        if (
-            self.historical_bricklink_enabled
-            and self.historical_bricklink_cases_path
-            and self.historical_bricklink_cases_path not in self.historical_reference_paths
-            and Path(self.historical_bricklink_cases_path).exists()
-        ):
-            self.historical_reference_paths.append(self.historical_bricklink_cases_path)
         self.historical_allowed_countries = self._split_env_csv(
             os.getenv("HISTORICAL_ALLOWED_COUNTRIES") or DEFAULT_HISTORICAL_ALLOWED_COUNTRIES,
             upper=True,

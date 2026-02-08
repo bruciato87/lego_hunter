@@ -302,7 +302,6 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
                     "HISTORICAL_ALLOWED_COUNTRIES": "IT",
                     "HISTORICAL_ALLOWED_REGIONS": "EU",
                     "HISTORICAL_INCLUDE_UNKNOWN_MARKET": "false",
-                    "HISTORICAL_BRICKLINK_ENABLED": "false",
                 },
                 clear=False,
             ):
@@ -347,7 +346,7 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
                 "msrp_usd": 60.0,
                 "roi_12m_pct": 70.0,
                 "win_12m": 1,
-                "source_dataset": "bricklink_priceguide_sold_it",
+                "source_dataset": "ebay_sold_it_90d",
                 "pattern_tags": "[]",
                 "end_date": datetime.now(timezone.utc).date().isoformat(),
                 "observation_months": 6,

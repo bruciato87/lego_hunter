@@ -51,23 +51,19 @@ jobs:
           pip install -r requirements.playwright.txt
           python -m playwright install --with-deps chromium
 
-      - name: Sync BrickLink historical seed (optional)
-        if: ${{ secrets.BRICKLINK_CONSUMER_KEY != '' && secrets.BRICKLINK_CONSUMER_SECRET != '' && secrets.BRICKLINK_TOKEN_VALUE != '' && secrets.BRICKLINK_TOKEN_SECRET != '' }}
+      - name: Sync eBay sold historical seed (IT/EU)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          BRICKLINK_CONSUMER_KEY: ${{ secrets.BRICKLINK_CONSUMER_KEY }}
-          BRICKLINK_CONSUMER_SECRET: ${{ secrets.BRICKLINK_CONSUMER_SECRET }}
-          BRICKLINK_TOKEN_VALUE: ${{ secrets.BRICKLINK_TOKEN_VALUE }}
-          BRICKLINK_TOKEN_SECRET: ${{ secrets.BRICKLINK_TOKEN_SECRET }}
+        continue-on-error: true
         run: |
-          python scripts/sync_bricklink_price_guide.py \
-            --out data/historical_seed/bricklink_reference_cases.csv \
-            --countries IT \
+          python scripts/sync_ebay_sold_history.py \
+            --out data/historical_seed/ebay_reference_cases.csv \
+            --markets IT \
             --include-eu-fallback \
             --max-sets 120 \
             --lookback-days 365 \
-            --min-total-quantity 2
+            --min-sold-listings 4
 
       - name: Run scheduled discovery cycle
         env:
@@ -95,13 +91,12 @@ jobs:
           BOOTSTRAP_MIN_UPSIDE_PROBABILITY: "0.52"
           BOOTSTRAP_MIN_CONFIDENCE_SCORE: "50"
           OPENROUTER_JSON_REPAIR_PROBE_TIMEOUT_SEC: "4"
-          HISTORICAL_REFERENCE_CASES_PATH: ${{ secrets.BRICKLINK_CONSUMER_KEY != '' && 'data/historical_seed/historical_reference_cases.csv,data/historical_seed/bricklink_reference_cases.csv' || 'data/historical_seed/historical_reference_cases.csv' }}
+          HISTORICAL_REFERENCE_CASES_PATH: "data/historical_seed/historical_reference_cases.csv,data/historical_seed/ebay_reference_cases.csv"
           HISTORICAL_ALLOWED_COUNTRIES: "IT"
           HISTORICAL_ALLOWED_REGIONS: "EU"
-          HISTORICAL_INCLUDE_UNKNOWN_MARKET: ${{ secrets.BRICKLINK_CONSUMER_KEY != '' && 'false' || 'true' }}
+          HISTORICAL_INCLUDE_UNKNOWN_MARKET: "false"
           HISTORICAL_RECENCY_HALFLIFE_DAYS: "900"
           HISTORICAL_RECENCY_MIN_WEIGHT: "0.20"
-          HISTORICAL_BRICKLINK_ENABLED: ${{ secrets.BRICKLINK_CONSUMER_KEY != '' && 'true' || 'false' }}
           RUN_MODE: scheduled
         run: |
           python bot.py --mode scheduled
