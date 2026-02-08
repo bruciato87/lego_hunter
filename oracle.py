@@ -74,9 +74,15 @@ DEFAULT_AI_BATCH_TIMEOUT_SEC = 26.0
 DEFAULT_AI_SINGLE_CALL_SCORING_ENABLED = False
 DEFAULT_AI_SINGLE_CALL_ALLOW_REPAIR_CALLS = False
 DEFAULT_AI_SINGLE_CALL_MAX_CANDIDATES = 12
+DEFAULT_AI_SINGLE_CALL_DYNAMIC_MAX_CANDIDATES = 16
 DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_ENABLED = True
 DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_MAX_CANDIDATES = 3
 DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_TIMEOUT_SEC = 10.0
+DEFAULT_AI_NON_SHORTLIST_CACHE_RESCUE_ENABLED = True
+DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_ENABLED = True
+DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_MAX_CANDIDATES = 6
+DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_MIN_BUDGET_SEC = 14.0
+DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_TIMEOUT_SEC = 12.0
 DEFAULT_AI_SCORE_GUARDRAIL_ENABLED = True
 DEFAULT_AI_SCORE_SOFT_CAP = 95
 DEFAULT_AI_SCORE_SOFT_CAP_FACTOR = 0.35
@@ -552,6 +558,12 @@ class DiscoveryOracle:
             minimum=3,
             maximum=40,
         )
+        self.ai_single_call_dynamic_max_candidates = self._safe_env_int(
+            "AI_SINGLE_CALL_DYNAMIC_MAX_CANDIDATES",
+            default=DEFAULT_AI_SINGLE_CALL_DYNAMIC_MAX_CANDIDATES,
+            minimum=3,
+            maximum=60,
+        )
         self.ai_single_call_missing_rescue_enabled = self._safe_env_bool(
             "AI_SINGLE_CALL_MISSING_RESCUE_ENABLED",
             default=DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_ENABLED,
@@ -567,6 +579,32 @@ class DiscoveryOracle:
             default=DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_TIMEOUT_SEC,
             minimum=6.0,
             maximum=25.0,
+        )
+        self.ai_non_shortlist_cache_rescue_enabled = self._safe_env_bool(
+            "AI_NON_SHORTLIST_CACHE_RESCUE_ENABLED",
+            default=DEFAULT_AI_NON_SHORTLIST_CACHE_RESCUE_ENABLED,
+        )
+        self.ai_single_call_secondary_batch_enabled = self._safe_env_bool(
+            "AI_SINGLE_CALL_SECONDARY_BATCH_ENABLED",
+            default=DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_ENABLED,
+        )
+        self.ai_single_call_secondary_batch_max_candidates = self._safe_env_int(
+            "AI_SINGLE_CALL_SECONDARY_BATCH_MAX_CANDIDATES",
+            default=DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_MAX_CANDIDATES,
+            minimum=1,
+            maximum=20,
+        )
+        self.ai_single_call_secondary_batch_min_budget_sec = self._safe_env_float(
+            "AI_SINGLE_CALL_SECONDARY_BATCH_MIN_BUDGET_SEC",
+            default=DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_MIN_BUDGET_SEC,
+            minimum=6.0,
+            maximum=60.0,
+        )
+        self.ai_single_call_secondary_batch_timeout_sec = self._safe_env_float(
+            "AI_SINGLE_CALL_SECONDARY_BATCH_TIMEOUT_SEC",
+            default=DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_TIMEOUT_SEC,
+            minimum=6.0,
+            maximum=40.0,
         )
         self.ai_score_guardrail_enabled = self._safe_env_bool(
             "AI_SCORE_GUARDRAIL_ENABLED",
@@ -1051,6 +1089,15 @@ class DiscoveryOracle:
             self.openrouter_opportunistic_enabled,
             self.openrouter_opportunistic_attempts,
             self.openrouter_opportunistic_timeout_sec,
+        )
+        LOGGER.info(
+            "Single-call expansion tuning | dynamic_max=%s non_shortlist_cache_rescue=%s secondary_batch_enabled=%s secondary_batch_max=%s secondary_batch_min_budget_sec=%.1f secondary_batch_timeout_sec=%.1f",
+            self.ai_single_call_dynamic_max_candidates,
+            self.ai_non_shortlist_cache_rescue_enabled,
+            self.ai_single_call_secondary_batch_enabled,
+            self.ai_single_call_secondary_batch_max_candidates,
+            self.ai_single_call_secondary_batch_min_budget_sec,
+            self.ai_single_call_secondary_batch_timeout_sec,
         )
         LOGGER.info(
             "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f bootstrap_enabled=%s bootstrap_min_history=%s bootstrap_min_prob=%.2f bootstrap_min_confidence=%s historical_gate_required=%s historical_min_samples=%s historical_min_win_rate_pct=%.1f historical_min_support_confidence=%s historical_min_prior_score=%s adaptive_hist_thresholds=%s adaptive_quantile=%.2f contextual_hist_gate=%s contextual_pattern_min=%s contextual_win_relax=%.1f contextual_support_relax=%s contextual_prior_relax=%s",
@@ -3285,6 +3332,13 @@ class DiscoveryOracle:
                 "ai_errors": 0,
                 "ai_budget_exhausted": 0,
                 "ai_timeout_count": 0,
+                "ai_skip_cache_primed": 0,
+                "ai_skip_cache_rescued": 0,
+                "ai_secondary_batch_attempted": 0,
+                "ai_secondary_batch_candidates": 0,
+                "ai_secondary_batch_scored": 0,
+                "ai_secondary_batch_errors": 0,
+                "ai_secondary_batch_timeouts": 0,
                 "ai_top_pick_rescue_attempts": 0,
                 "ai_top_pick_rescue_successes": 0,
                 "ai_top_pick_rescue_failures": 0,
@@ -3310,6 +3364,122 @@ class DiscoveryOracle:
 
         ai_started = time.monotonic()
         ai_results, ai_stats = await self._score_ai_shortlist(shortlist)
+        post_shortlist_stats = {
+            "ai_skip_cache_primed": 0,
+            "ai_skip_cache_rescued": 0,
+            "ai_secondary_batch_attempted": 0,
+            "ai_secondary_batch_candidates": 0,
+            "ai_secondary_batch_scored": 0,
+            "ai_secondary_batch_errors": 0,
+            "ai_secondary_batch_timeouts": 0,
+        }
+
+        if skipped and self.ai_non_shortlist_cache_rescue_enabled:
+            skipped_candidates = [row.get("candidate") or {} for row in skipped]
+            post_shortlist_stats["ai_skip_cache_primed"] = int(self._prime_ai_cache_from_repository(skipped_candidates))
+            for row in skipped:
+                set_id = str(row.get("set_id") or "").strip()
+                if not set_id:
+                    continue
+                existing = ai_results.get(set_id)
+                if existing is not None and not bool(existing.fallback_used):
+                    continue
+                cached = self._get_cached_ai_insight(row.get("candidate") or {})
+                if cached is None or bool(cached.fallback_used):
+                    continue
+                ai_results[set_id] = cached
+                row["ai_skip_cache_rescued"] = True
+                post_shortlist_stats["ai_skip_cache_rescued"] += 1
+
+        if skipped and self.ai_single_call_scoring_enabled and self.ai_single_call_secondary_batch_enabled:
+            unresolved_skipped = [
+                row for row in skipped if str(row.get("set_id") or "").strip() and str(row.get("set_id") or "").strip() not in ai_results
+            ]
+            if unresolved_skipped and self._external_ai_available():
+                elapsed_so_far = max(0.0, time.monotonic() - ai_started)
+                budget_left = max(0.0, float(self.ai_scoring_hard_budget_sec) - elapsed_so_far)
+                min_budget = float(self.ai_single_call_secondary_batch_min_budget_sec)
+                if budget_left >= min_budget:
+                    secondary_entries = [
+                        {
+                            "set_id": str(row.get("set_id") or "").strip(),
+                            "candidate": row.get("candidate") or {},
+                        }
+                        for row in unresolved_skipped[: max(1, int(self.ai_single_call_secondary_batch_max_candidates))]
+                    ]
+                    secondary_entries = [row for row in secondary_entries if row["set_id"]]
+                    if secondary_entries:
+                        post_shortlist_stats["ai_secondary_batch_attempted"] = 1
+                        post_shortlist_stats["ai_secondary_batch_candidates"] = len(secondary_entries)
+                        for entry in secondary_entries:
+                            source_row = skipped_set_ids.get(str(entry.get("set_id") or "").strip())
+                            if source_row is not None:
+                                source_row["ai_secondary_batch_attempted"] = True
+                        secondary_timeout = min(
+                            float(self.ai_single_call_secondary_batch_timeout_sec),
+                            max(6.0, budget_left),
+                        )
+                        secondary_deadline = time.monotonic() + secondary_timeout
+                        secondary_results, secondary_error = await self._score_ai_shortlist_batch(
+                            secondary_entries,
+                            deadline=secondary_deadline,
+                            allow_repair_calls=True,
+                            allow_failover_call=True,
+                        )
+                        if secondary_error:
+                            non_error_reasons = {"no_external_ai_available", "insufficient_budget_for_batch"}
+                            if str(secondary_error) not in non_error_reasons:
+                                post_shortlist_stats["ai_secondary_batch_errors"] += 1
+                                if "timeout" in str(secondary_error).lower():
+                                    post_shortlist_stats["ai_secondary_batch_timeouts"] += 1
+                                LOGGER.warning(
+                                    "AI single-call secondary batch failed | candidates=%s error=%s",
+                                    len(secondary_entries),
+                                    str(secondary_error)[:220],
+                                )
+                                for entry in secondary_entries:
+                                    source_row = skipped_set_ids.get(str(entry.get("set_id") or "").strip())
+                                    if source_row is not None:
+                                        source_row["ai_secondary_batch_failed"] = True
+                                        source_row["ai_secondary_batch_reason"] = str(secondary_error)
+                            else:
+                                LOGGER.info(
+                                    "AI single-call secondary batch skipped | candidates=%s reason=%s",
+                                    len(secondary_entries),
+                                    str(secondary_error),
+                                )
+                        for entry in secondary_entries:
+                            set_id = str(entry.get("set_id") or "").strip()
+                            if not set_id:
+                                continue
+                            insight = secondary_results.get(set_id)
+                            if insight is None:
+                                source_row = skipped_set_ids.get(set_id)
+                                if source_row is not None and not source_row.get("ai_secondary_batch_reason"):
+                                    source_row["ai_secondary_batch_failed"] = True
+                                    source_row["ai_secondary_batch_reason"] = "batch_no_result"
+                                continue
+                            ai_results[set_id] = insight
+                            if not bool(insight.fallback_used):
+                                post_shortlist_stats["ai_secondary_batch_scored"] += 1
+                                self._set_cached_ai_insight(entry["candidate"], insight)
+                                source_row = skipped_set_ids.get(set_id)
+                                if source_row is not None:
+                                    source_row["ai_secondary_batch_scored"] = True
+                                    source_row["ai_secondary_batch_failed"] = False
+                                    source_row["ai_secondary_batch_reason"] = "success"
+                            else:
+                                source_row = skipped_set_ids.get(set_id)
+                                if source_row is not None:
+                                    source_row["ai_secondary_batch_failed"] = True
+                                    source_row["ai_secondary_batch_reason"] = "provider_fallback"
+                else:
+                    LOGGER.info(
+                        "AI single-call secondary batch skipped | reason=insufficient_budget budget_left=%.2f min_budget=%.2f unresolved=%s",
+                        budget_left,
+                        min_budget,
+                        len(unresolved_skipped),
+                    )
 
         ranked, opportunities = self._build_ranked_payloads(
             prepared=prepared,
@@ -3485,6 +3655,13 @@ class DiscoveryOracle:
             "ai_errors": int(ai_stats.get("ai_errors", 0)),
             "ai_budget_exhausted": int(ai_stats.get("ai_budget_exhausted", 0)),
             "ai_timeout_count": int(ai_stats.get("ai_timeout_count", 0)),
+            "ai_skip_cache_primed": int(post_shortlist_stats.get("ai_skip_cache_primed", 0)),
+            "ai_skip_cache_rescued": int(post_shortlist_stats.get("ai_skip_cache_rescued", 0)),
+            "ai_secondary_batch_attempted": int(post_shortlist_stats.get("ai_secondary_batch_attempted", 0)),
+            "ai_secondary_batch_candidates": int(post_shortlist_stats.get("ai_secondary_batch_candidates", 0)),
+            "ai_secondary_batch_scored": int(post_shortlist_stats.get("ai_secondary_batch_scored", 0)),
+            "ai_secondary_batch_errors": int(post_shortlist_stats.get("ai_secondary_batch_errors", 0)),
+            "ai_secondary_batch_timeouts": int(post_shortlist_stats.get("ai_secondary_batch_timeouts", 0)),
             "ai_top_pick_rescue_attempts": int(rescue_stats.get("ai_top_pick_rescue_attempts", 0)),
             "ai_top_pick_rescue_successes": int(rescue_stats.get("ai_top_pick_rescue_successes", 0)),
             "ai_top_pick_rescue_failures": int(rescue_stats.get("ai_top_pick_rescue_failures", 0)),
@@ -3502,12 +3679,14 @@ class DiscoveryOracle:
             "total_sec": round(total_duration, 2),
         }
         LOGGER.info(
-            "Ranking completed | candidates=%s shortlisted=%s ai_scored=%s cache_hits=%s persisted_cache_hits=%s rescue_attempts=%s rescue_successes=%s final_pick_guarantee_rounds=%s final_pick_pending=%s historical_prior_applied=%s persisted_opportunities=%s persisted_snapshots=%s durations={prep:%.2fs ai:%.2fs persist:%.2fs total:%.2fs}",
+            "Ranking completed | candidates=%s shortlisted=%s ai_scored=%s cache_hits=%s persisted_cache_hits=%s skip_cache_rescued=%s secondary_batch_scored=%s rescue_attempts=%s rescue_successes=%s final_pick_guarantee_rounds=%s final_pick_pending=%s historical_prior_applied=%s persisted_opportunities=%s persisted_snapshots=%s durations={prep:%.2fs ai:%.2fs persist:%.2fs total:%.2fs}",
             len(source_candidates),
             len(shortlist),
             self._last_ranking_diagnostics["ai_scored_count"],
             self._last_ranking_diagnostics["ai_cache_hits"],
             self._last_ranking_diagnostics["ai_persisted_cache_hits"],
+            self._last_ranking_diagnostics["ai_skip_cache_rescued"],
+            self._last_ranking_diagnostics["ai_secondary_batch_scored"],
             self._last_ranking_diagnostics["ai_top_pick_rescue_attempts"],
             self._last_ranking_diagnostics["ai_top_pick_rescue_successes"],
             self._last_ranking_diagnostics["ai_final_pick_guarantee_rounds"],
@@ -3548,6 +3727,9 @@ class DiscoveryOracle:
                     rescue_attempted = bool(row.get("ai_rescue_attempted"))
                     rescue_failed = bool(row.get("ai_rescue_failed"))
                     rescue_reason = str(row.get("ai_rescue_reason") or "").strip().lower()
+                    secondary_attempted = bool(row.get("ai_secondary_batch_attempted"))
+                    secondary_failed = bool(row.get("ai_secondary_batch_failed"))
+                    secondary_reason = str(row.get("ai_secondary_batch_reason") or "").strip().lower()
                     if rescue_attempted and rescue_failed:
                         if rescue_reason == "timeout":
                             rescue_note = (
@@ -3564,6 +3746,22 @@ class DiscoveryOracle:
                                 "Tentativo AI esterno sui top pick non riuscito nel ciclo corrente: "
                                 "ranking calcolato con fallback euristico."
                             )
+                    elif secondary_attempted and secondary_failed:
+                        if "timeout" in secondary_reason:
+                            rescue_note = (
+                                "Tentativo AI secondario sui set fuori shortlist non riuscito (timeout provider): "
+                                "ranking calcolato con fallback euristico."
+                            )
+                        elif "provider_fallback" in secondary_reason or "provider" in secondary_reason:
+                            rescue_note = (
+                                "Tentativo AI secondario sui set fuori shortlist non riuscito (errore provider): "
+                                "ranking calcolato con fallback euristico."
+                            )
+                        else:
+                            rescue_note = (
+                                "Tentativo AI secondario sui set fuori shortlist non riuscito nel ciclo corrente: "
+                                "ranking calcolato con fallback euristico."
+                            )
                     ai = AIInsight(
                         score=ai.score,
                         summary=(
@@ -3571,15 +3769,21 @@ class DiscoveryOracle:
                             "applicato fallback quantitativo del ciclo."
                             if (rescue_attempted and rescue_failed)
                             else
-                            "AI scoring saltato per ottimizzazione costi/latency; "
-                            "set fuori shortlist quantitativa del ciclo."
+                            (
+                                "Tentativo AI secondario effettuato sui set fuori shortlist ma non riuscito; "
+                                "applicato fallback quantitativo del ciclo."
+                                if (secondary_attempted and secondary_failed)
+                                else
+                                "AI scoring saltato per ottimizzazione costi/latency; "
+                                "set fuori shortlist quantitativa del ciclo."
+                            )
                         ),
                         predicted_eol_date=ai.predicted_eol_date or candidate.get("eol_date_prediction"),
                         fallback_used=True,
                         confidence="LOW_CONFIDENCE",
                         risk_note=(
                             rescue_note
-                            if (rescue_attempted and rescue_failed)
+                            if ((rescue_attempted and rescue_failed) or (secondary_attempted and secondary_failed))
                             else f"AI non eseguita: pre-filter rank #{pre_rank} oltre top {shortlist_count}."
                         ),
                     )
@@ -4087,8 +4291,17 @@ class DiscoveryOracle:
         adaptive_floor = max(3, int(self.ai_dynamic_shortlist_floor))
         if inventory_available >= 2:
             adaptive_floor = max(adaptive_floor, int(self.ai_dynamic_shortlist_multi_model_floor))
-
-        effective = min(candidate_count, max(base_cap, adaptive_floor))
+        effective = max(base_cap, adaptive_floor)
+        # Keep low configured caps stable (mainly test/dev tuning), and only expand
+        # production-like caps where single-call headroom matters.
+        if base_cap >= 10:
+            cap_ceiling = max(base_cap, int(self.ai_single_call_dynamic_max_candidates))
+            dynamic_increment = int(self.ai_dynamic_shortlist_bonus) + (inventory_available * int(self.ai_dynamic_shortlist_per_model))
+            if inventory_available >= 2:
+                dynamic_increment += int(self.ai_dynamic_shortlist_per_model)
+            effective = max(effective, base_cap + max(1, dynamic_increment))
+            effective = min(cap_ceiling, effective)
+        effective = min(candidate_count, effective)
         if effective > base_cap:
             LOGGER.info(
                 "AI single-call shortlist floor raised | candidates=%s base=%s effective=%s inventory_available=%s engine=%s",
