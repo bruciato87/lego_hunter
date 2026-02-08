@@ -80,6 +80,10 @@ DEFAULT_HISTORICAL_HIGH_CONF_MIN_SAMPLES = 24
 DEFAULT_HISTORICAL_HIGH_CONF_MIN_WIN_RATE_PCT = 56.0
 DEFAULT_HISTORICAL_HIGH_CONF_MIN_SUPPORT_CONFIDENCE = 50
 DEFAULT_HISTORICAL_HIGH_CONF_MIN_PRIOR_SCORE = 60
+DEFAULT_ADAPTIVE_HISTORICAL_THRESHOLDS_ENABLED = True
+DEFAULT_ADAPTIVE_HISTORICAL_THRESHOLD_MIN_CASES = 30
+DEFAULT_ADAPTIVE_HISTORICAL_THRESHOLD_MIN_THEMES = 4
+DEFAULT_ADAPTIVE_HISTORICAL_THRESHOLD_QUANTILE = 0.35
 DEFAULT_AI_MODEL_BAN_SEC = 1800.0
 DEFAULT_AI_MODEL_BAN_FAILURES = 2
 DEFAULT_AI_MODEL_FAILURE_PENALTY = 22
@@ -96,6 +100,8 @@ DEFAULT_AI_DYNAMIC_SHORTLIST_BONUS = 1
 DEFAULT_AI_TOP_PICK_RESCUE_ENABLED = True
 DEFAULT_AI_TOP_PICK_RESCUE_COUNT = 3
 DEFAULT_AI_TOP_PICK_RESCUE_TIMEOUT_SEC = 9.0
+DEFAULT_AI_FINAL_PICK_GUARANTEE_COUNT = 3
+DEFAULT_AI_FINAL_PICK_GUARANTEE_ROUNDS = 2
 DEFAULT_HISTORICAL_REFERENCE_CASES_PATH = "data/historical_seed/historical_reference_cases.csv"
 DEFAULT_HISTORICAL_REFERENCE_ENABLED = True
 DEFAULT_HISTORICAL_REFERENCE_MIN_SAMPLES = 24
@@ -509,6 +515,18 @@ class DiscoveryOracle:
             minimum=2.0,
             maximum=20.0,
         )
+        self.ai_final_pick_guarantee_count = self._safe_env_int(
+            "AI_FINAL_PICK_GUARANTEE_COUNT",
+            default=DEFAULT_AI_FINAL_PICK_GUARANTEE_COUNT,
+            minimum=1,
+            maximum=5,
+        )
+        self.ai_final_pick_guarantee_rounds = self._safe_env_int(
+            "AI_FINAL_PICK_GUARANTEE_ROUNDS",
+            default=DEFAULT_AI_FINAL_PICK_GUARANTEE_ROUNDS,
+            minimum=1,
+            maximum=4,
+        )
         self.historical_reference_enabled = self._safe_env_bool(
             "HISTORICAL_REFERENCE_ENABLED",
             default=DEFAULT_HISTORICAL_REFERENCE_ENABLED,
@@ -583,6 +601,28 @@ class DiscoveryOracle:
             default=DEFAULT_HISTORICAL_HIGH_CONF_MIN_PRIOR_SCORE,
             minimum=1,
             maximum=100,
+        )
+        self.adaptive_historical_thresholds_enabled = self._safe_env_bool(
+            "ADAPTIVE_HISTORICAL_THRESHOLDS_ENABLED",
+            default=DEFAULT_ADAPTIVE_HISTORICAL_THRESHOLDS_ENABLED,
+        )
+        self.adaptive_historical_threshold_min_cases = self._safe_env_int(
+            "ADAPTIVE_HISTORICAL_THRESHOLD_MIN_CASES",
+            default=DEFAULT_ADAPTIVE_HISTORICAL_THRESHOLD_MIN_CASES,
+            minimum=10,
+            maximum=1000,
+        )
+        self.adaptive_historical_threshold_min_themes = self._safe_env_int(
+            "ADAPTIVE_HISTORICAL_THRESHOLD_MIN_THEMES",
+            default=DEFAULT_ADAPTIVE_HISTORICAL_THRESHOLD_MIN_THEMES,
+            minimum=2,
+            maximum=50,
+        )
+        self.adaptive_historical_threshold_quantile = self._safe_env_float(
+            "ADAPTIVE_HISTORICAL_THRESHOLD_QUANTILE",
+            default=DEFAULT_ADAPTIVE_HISTORICAL_THRESHOLD_QUANTILE,
+            minimum=0.05,
+            maximum=0.95,
         )
         self.openrouter_opportunistic_enabled = self._safe_env_bool(
             "OPENROUTER_OPPORTUNISTIC_ENABLED",
@@ -660,6 +700,7 @@ class DiscoveryOracle:
         self._ai_failover_lock: Optional[asyncio.Lock] = None
         self._last_ranking_diagnostics: Dict[str, Any] = {}
         self._historical_reference_cases: list[Dict[str, Any]] = []
+        self._adaptive_historical_thresholds: Dict[str, Any] = {}
         self.ai_runtime = {
             "engine": "local_ai",
             "provider": "local",
@@ -720,6 +761,7 @@ class DiscoveryOracle:
                 }
 
         self._historical_reference_cases = self._load_historical_reference_cases()
+        self._adaptive_historical_thresholds = self._compute_adaptive_historical_thresholds()
 
         if self.auto_tune_thresholds:
             self._apply_auto_tuned_thresholds()
@@ -740,7 +782,7 @@ class DiscoveryOracle:
             self.openrouter_free_tier_only,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s floor_multi_model=%s per_model=%s bonus=%s cache_ttl_sec=%.0f persisted_cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f ai_top_pick_rescue_enabled=%s ai_top_pick_rescue_count=%s ai_top_pick_rescue_timeout_sec=%.1f openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s floor_multi_model=%s per_model=%s bonus=%s cache_ttl_sec=%.0f persisted_cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f ai_top_pick_rescue_enabled=%s ai_top_pick_rescue_count=%s ai_top_pick_rescue_timeout_sec=%.1f ai_final_pick_guarantee_count=%s ai_final_pick_guarantee_rounds=%s openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
             self.ai_dynamic_shortlist_enabled,
@@ -766,6 +808,8 @@ class DiscoveryOracle:
             self.ai_top_pick_rescue_enabled,
             self.ai_top_pick_rescue_count,
             self.ai_top_pick_rescue_timeout_sec,
+            self.ai_final_pick_guarantee_count,
+            self.ai_final_pick_guarantee_rounds,
             self.openrouter_json_repair_probe_timeout_sec,
             self.ai_model_ban_sec,
             self.ai_model_ban_failures,
@@ -774,7 +818,7 @@ class DiscoveryOracle:
             self.openrouter_opportunistic_timeout_sec,
         )
         LOGGER.info(
-            "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f bootstrap_enabled=%s bootstrap_min_history=%s bootstrap_min_prob=%.2f bootstrap_min_confidence=%s historical_gate_required=%s historical_min_samples=%s historical_min_win_rate_pct=%.1f historical_min_support_confidence=%s historical_min_prior_score=%s",
+            "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f bootstrap_enabled=%s bootstrap_min_history=%s bootstrap_min_prob=%.2f bootstrap_min_confidence=%s historical_gate_required=%s historical_min_samples=%s historical_min_win_rate_pct=%.1f historical_min_support_confidence=%s historical_min_prior_score=%s adaptive_hist_thresholds=%s adaptive_quantile=%.2f",
             self.min_composite_score,
             self.min_upside_probability,
             self.min_confidence_score,
@@ -789,6 +833,8 @@ class DiscoveryOracle:
             self.historical_high_conf_min_win_rate_pct,
             self.historical_high_conf_min_support_confidence,
             self.historical_high_conf_min_prior_score,
+            self.adaptive_historical_thresholds_enabled,
+            self.adaptive_historical_threshold_quantile,
         )
         LOGGER.info(
             "Backtest tuning | enabled=%s lookback_days=%s horizon_days=%s min_selected=%s profile=%s",
@@ -799,7 +845,7 @@ class DiscoveryOracle:
             self.threshold_profile,
         )
         LOGGER.info(
-            "Historical prior tuning | enabled=%s cases=%s path=%s min_samples=%s weight=%.2f price_tolerance=%.2f high_conf_required=%s high_conf_min_samples=%s high_conf_min_win_rate_pct=%.1f high_conf_min_support_confidence=%s high_conf_min_prior_score=%s",
+            "Historical prior tuning | enabled=%s cases=%s path=%s min_samples=%s weight=%.2f price_tolerance=%.2f high_conf_required=%s high_conf_min_samples=%s high_conf_min_win_rate_pct=%.1f high_conf_min_support_confidence=%s high_conf_min_prior_score=%s adaptive_active=%s adaptive_effective={samples:%s,win_rate:%.1f,support:%s,prior:%s}",
             self.historical_reference_enabled,
             len(self._historical_reference_cases),
             self.historical_reference_path,
@@ -811,6 +857,14 @@ class DiscoveryOracle:
             self.historical_high_conf_min_win_rate_pct,
             self.historical_high_conf_min_support_confidence,
             self.historical_high_conf_min_prior_score,
+            bool(self._adaptive_historical_thresholds.get("active")),
+            int(self._adaptive_historical_thresholds.get("min_samples") or self.historical_high_conf_min_samples),
+            float(self._adaptive_historical_thresholds.get("min_win_rate_pct") or self.historical_high_conf_min_win_rate_pct),
+            int(
+                self._adaptive_historical_thresholds.get("min_support_confidence")
+                or self.historical_high_conf_min_support_confidence
+            ),
+            int(self._adaptive_historical_thresholds.get("min_prior_score") or self.historical_high_conf_min_prior_score),
         )
         LOGGER.info("Discovery source mode configured: %s", self.discovery_source_mode)
 
@@ -2708,6 +2762,13 @@ class DiscoveryOracle:
             for row in above_threshold
             if not self._historical_high_confidence_status(row)[0]
         )
+        (
+            effective_hist_min_samples,
+            effective_hist_min_win_rate_pct,
+            effective_hist_min_support_confidence,
+            effective_hist_min_prior_score,
+            adaptive_hist_active,
+        ) = self._effective_historical_high_confidence_thresholds()
 
         diagnostics = {
             "threshold": self.min_composite_score,
@@ -2724,6 +2785,13 @@ class DiscoveryOracle:
             "historical_high_conf_min_win_rate_pct": self.historical_high_conf_min_win_rate_pct,
             "historical_high_conf_min_support_confidence": self.historical_high_conf_min_support_confidence,
             "historical_high_conf_min_prior_score": self.historical_high_conf_min_prior_score,
+            "historical_high_conf_effective_min_samples": effective_hist_min_samples,
+            "historical_high_conf_effective_min_win_rate_pct": effective_hist_min_win_rate_pct,
+            "historical_high_conf_effective_min_support_confidence": effective_hist_min_support_confidence,
+            "historical_high_conf_effective_min_prior_score": effective_hist_min_prior_score,
+            "adaptive_historical_thresholds_enabled": self.adaptive_historical_thresholds_enabled,
+            "adaptive_historical_thresholds_active": adaptive_hist_active,
+            "adaptive_historical_thresholds": dict(self._adaptive_historical_thresholds or {}),
             "historical_gate_blocked_count": historical_gate_blocked_count,
             "threshold_profile": dict(self.threshold_profile),
             "source_strategy": source_diagnostics.get("source_strategy"),
@@ -2837,6 +2905,9 @@ class DiscoveryOracle:
                 "ai_top_pick_rescue_failures": 0,
                 "ai_top_pick_rescue_timeouts": 0,
                 "ai_top_pick_rescue_cache_hits": 0,
+                "ai_final_pick_guarantee_rounds": 0,
+                "ai_final_pick_guarantee_rescue_sets": 0,
+                "ai_final_pick_guarantee_pending_after_rounds": 0,
                 "historical_prior_applied_count": 0,
                 "quant_prep_sec": 0.0,
                 "ai_scoring_sec": 0.0,
@@ -2868,20 +2939,102 @@ class DiscoveryOracle:
             "ai_top_pick_rescue_failures": 0,
             "ai_top_pick_rescue_timeouts": 0,
             "ai_top_pick_rescue_cache_hits": 0,
+            "ai_final_pick_guarantee_rounds": 0,
+            "ai_final_pick_guarantee_rescue_sets": 0,
+            "ai_final_pick_guarantee_pending_after_rounds": 0,
         }
         if self.ai_top_pick_rescue_enabled and ranked:
-            rescue_stats = await self._rescue_top_pick_ai_scores(
+            initial_rescue_stats = await self._rescue_top_pick_ai_scores(
                 prepared=prepared,
                 ranked=ranked,
                 ai_results=ai_results,
             )
-            if int(rescue_stats.get("ai_top_pick_rescue_attempts") or 0) > 0:
+            for key in rescue_stats:
+                rescue_stats[key] += int(initial_rescue_stats.get(key, 0))
+
+            if int(initial_rescue_stats.get("ai_top_pick_rescue_attempts") or 0) > 0:
                 ranked, opportunities = self._build_ranked_payloads(
                     prepared=prepared,
                     ai_results=ai_results,
                     skipped_set_ids=skipped_set_ids,
                     shortlist_count=len(shortlist),
                 )
+
+            guarantee_count = max(1, int(self.ai_final_pick_guarantee_count))
+            guarantee_rounds = max(1, int(self.ai_final_pick_guarantee_rounds))
+            for _ in range(guarantee_rounds):
+                top_rows = sorted(
+                    ranked,
+                    key=lambda row: (
+                        int(row.get("composite_score") or row.get("ai_investment_score") or 0),
+                        int(row.get("forecast_score") or 0),
+                        int(row.get("market_demand_score") or 0),
+                    ),
+                    reverse=True,
+                )[:guarantee_count]
+                pending_set_ids = []
+                for row in top_rows:
+                    set_id = str(row.get("set_id") or "").strip()
+                    if not set_id:
+                        continue
+                    current_ai = ai_results.get(set_id)
+                    if current_ai is None or bool(current_ai.fallback_used):
+                        pending_set_ids.append(set_id)
+
+                if not pending_set_ids:
+                    rescue_stats["ai_final_pick_guarantee_pending_after_rounds"] = 0
+                    break
+
+                rescue_stats["ai_final_pick_guarantee_rounds"] += 1
+                rescue_stats["ai_final_pick_guarantee_rescue_sets"] += len(pending_set_ids)
+                guarantee_rescue_stats = await self._rescue_top_pick_ai_scores(
+                    prepared=prepared,
+                    ranked=ranked,
+                    ai_results=ai_results,
+                    force_set_ids=pending_set_ids,
+                    top_k_override=0,
+                )
+                for key in (
+                    "ai_top_pick_rescue_attempts",
+                    "ai_top_pick_rescue_successes",
+                    "ai_top_pick_rescue_failures",
+                    "ai_top_pick_rescue_timeouts",
+                    "ai_top_pick_rescue_cache_hits",
+                ):
+                    rescue_stats[key] += int(guarantee_rescue_stats.get(key, 0))
+
+                if int(guarantee_rescue_stats.get("ai_top_pick_rescue_attempts") or 0) == 0:
+                    rescue_stats["ai_final_pick_guarantee_pending_after_rounds"] = len(pending_set_ids)
+                    break
+
+                ranked, opportunities = self._build_ranked_payloads(
+                    prepared=prepared,
+                    ai_results=ai_results,
+                    skipped_set_ids=skipped_set_ids,
+                    shortlist_count=len(shortlist),
+                )
+            else:
+                top_rows = sorted(
+                    ranked,
+                    key=lambda row: (
+                        int(row.get("composite_score") or row.get("ai_investment_score") or 0),
+                        int(row.get("forecast_score") or 0),
+                        int(row.get("market_demand_score") or 0),
+                    ),
+                    reverse=True,
+                )[:guarantee_count]
+                rescue_stats["ai_final_pick_guarantee_pending_after_rounds"] = sum(
+                    1
+                    for row in top_rows
+                    if (
+                        str(row.get("set_id") or "").strip()
+                        and (
+                            ai_results.get(str(row.get("set_id") or "").strip()) is None
+                            or bool(ai_results.get(str(row.get("set_id") or "").strip()).fallback_used)
+                        )
+                    )
+                )
+
         ai_duration = time.monotonic() - ai_started
 
         if rerank_attempt == 0 and self._is_ai_score_collapse(ranked):
@@ -2951,6 +3104,11 @@ class DiscoveryOracle:
             "ai_top_pick_rescue_failures": int(rescue_stats.get("ai_top_pick_rescue_failures", 0)),
             "ai_top_pick_rescue_timeouts": int(rescue_stats.get("ai_top_pick_rescue_timeouts", 0)),
             "ai_top_pick_rescue_cache_hits": int(rescue_stats.get("ai_top_pick_rescue_cache_hits", 0)),
+            "ai_final_pick_guarantee_rounds": int(rescue_stats.get("ai_final_pick_guarantee_rounds", 0)),
+            "ai_final_pick_guarantee_rescue_sets": int(rescue_stats.get("ai_final_pick_guarantee_rescue_sets", 0)),
+            "ai_final_pick_guarantee_pending_after_rounds": int(
+                rescue_stats.get("ai_final_pick_guarantee_pending_after_rounds", 0)
+            ),
             "historical_prior_applied_count": historical_prior_applied,
             "quant_prep_sec": round(prep_duration, 2),
             "ai_scoring_sec": round(ai_duration, 2),
@@ -2958,7 +3116,7 @@ class DiscoveryOracle:
             "total_sec": round(total_duration, 2),
         }
         LOGGER.info(
-            "Ranking completed | candidates=%s shortlisted=%s ai_scored=%s cache_hits=%s persisted_cache_hits=%s rescue_attempts=%s rescue_successes=%s historical_prior_applied=%s persisted_opportunities=%s persisted_snapshots=%s durations={prep:%.2fs ai:%.2fs persist:%.2fs total:%.2fs}",
+            "Ranking completed | candidates=%s shortlisted=%s ai_scored=%s cache_hits=%s persisted_cache_hits=%s rescue_attempts=%s rescue_successes=%s final_pick_guarantee_rounds=%s final_pick_pending=%s historical_prior_applied=%s persisted_opportunities=%s persisted_snapshots=%s durations={prep:%.2fs ai:%.2fs persist:%.2fs total:%.2fs}",
             len(source_candidates),
             len(shortlist),
             self._last_ranking_diagnostics["ai_scored_count"],
@@ -2966,6 +3124,8 @@ class DiscoveryOracle:
             self._last_ranking_diagnostics["ai_persisted_cache_hits"],
             self._last_ranking_diagnostics["ai_top_pick_rescue_attempts"],
             self._last_ranking_diagnostics["ai_top_pick_rescue_successes"],
+            self._last_ranking_diagnostics["ai_final_pick_guarantee_rounds"],
+            self._last_ranking_diagnostics["ai_final_pick_guarantee_pending_after_rounds"],
             self._last_ranking_diagnostics["historical_prior_applied_count"],
             persisted_opportunities,
             persisted_snapshots,
@@ -3149,6 +3309,8 @@ class DiscoveryOracle:
         prepared: list[Dict[str, Any]],
         ranked: list[Dict[str, Any]],
         ai_results: Dict[str, AIInsight],
+        force_set_ids: Optional[list[str]] = None,
+        top_k_override: Optional[int] = None,
     ) -> Dict[str, int]:
         stats = {
             "ai_top_pick_rescue_attempts": 0,
@@ -3160,21 +3322,34 @@ class DiscoveryOracle:
         if not ranked:
             return stats
 
-        top_k = max(1, int(self.ai_top_pick_rescue_count))
-        top_rows = sorted(
-            ranked,
-            key=lambda row: (
-                int(row.get("composite_score") or row.get("ai_investment_score") or 0),
-                int(row.get("forecast_score") or 0),
-                int(row.get("market_demand_score") or 0),
-            ),
-            reverse=True,
-        )[:top_k]
         prepared_by_set = {str(row.get("set_id")): row for row in prepared}
+        requested_set_ids: list[str] = []
+        if force_set_ids:
+            for raw_set_id in force_set_ids:
+                set_id = str(raw_set_id or "").strip()
+                if set_id and set_id not in requested_set_ids:
+                    requested_set_ids.append(set_id)
+
+        top_k = int(self.ai_top_pick_rescue_count) if top_k_override is None else int(top_k_override)
+        top_k = max(0, top_k)
+        if top_k > 0:
+            top_rows = sorted(
+                ranked,
+                key=lambda row: (
+                    int(row.get("composite_score") or row.get("ai_investment_score") or 0),
+                    int(row.get("forecast_score") or 0),
+                    int(row.get("market_demand_score") or 0),
+                ),
+                reverse=True,
+            )[:top_k]
+            for row in top_rows:
+                set_id = str(row.get("set_id") or "").strip()
+                if set_id and set_id not in requested_set_ids:
+                    requested_set_ids.append(set_id)
+
         rescue_candidates: list[Dict[str, Any]] = []
 
-        for row in top_rows:
-            set_id = str(row.get("set_id") or "").strip()
+        for set_id in requested_set_ids:
             if not set_id:
                 continue
             current_ai = ai_results.get(set_id)
@@ -3231,8 +3406,9 @@ class DiscoveryOracle:
 
         if stats["ai_top_pick_rescue_attempts"] > 0:
             LOGGER.info(
-                "Top pick AI rescue summary | top_k=%s candidates=%s attempts=%s successes=%s failures=%s timeouts=%s cache_hits=%s",
+                "Top pick AI rescue summary | top_k=%s forced=%s candidates=%s attempts=%s successes=%s failures=%s timeouts=%s cache_hits=%s",
                 top_k,
+                len(force_set_ids or []),
                 len(rescue_candidates),
                 stats["ai_top_pick_rescue_attempts"],
                 stats["ai_top_pick_rescue_successes"],
@@ -3978,6 +4154,168 @@ class DiscoveryOracle:
     @staticmethod
     def _clamp_score(value: float, *, minimum: float = 1.0, maximum: float = 100.0) -> float:
         return max(float(minimum), min(float(maximum), float(value)))
+
+    @staticmethod
+    def _percentile(values: list[float], quantile: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(float(value) for value in values)
+        q = max(0.0, min(1.0, float(quantile)))
+        if len(ordered) == 1:
+            return ordered[0]
+        pos = (len(ordered) - 1) * q
+        lower = int(math.floor(pos))
+        upper = int(math.ceil(pos))
+        if lower == upper:
+            return ordered[lower]
+        weight = pos - lower
+        return (ordered[lower] * (1.0 - weight)) + (ordered[upper] * weight)
+
+    def _cohort_historical_strength(self, cases: list[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+        rois = [float(row["roi_12m_pct"]) for row in cases if row.get("roi_12m_pct") is not None]
+        if len(rois) < 3:
+            return None
+
+        wins = [
+            int(row.get("win_12m"))
+            for row in cases
+            if row.get("win_12m") in (0, 1)
+        ]
+        sample_size = len(rois)
+        avg_roi = float(statistics.fmean(rois))
+        win_rate = float(statistics.fmean(wins)) if wins else float(
+            statistics.fmean([1 if roi >= float(self.target_roi_pct) else 0 for roi in rois])
+        )
+        roi_stdev = float(statistics.pstdev(rois)) if len(rois) > 1 else 0.0
+        roi_component = self._clamp_score(50.0 + (avg_roi * 0.85))
+        win_component = self._clamp_score(win_rate * 100.0)
+        sample_bonus = min(10.0, math.log2(sample_size + 1.0) * 2.0)
+        prior_score = self._clamp_score((0.55 * win_component) + (0.45 * roi_component) + sample_bonus - 5.0)
+        support_confidence = self._clamp_score(35.0 + (math.log2(sample_size + 1.0) * 12.0) - min(25.0, roi_stdev * 0.25))
+        return {
+            "sample_size": float(sample_size),
+            "win_rate_pct": float(win_rate * 100.0),
+            "support_confidence": float(support_confidence),
+            "prior_score": float(prior_score),
+        }
+
+    def _compute_adaptive_historical_thresholds(self) -> Dict[str, Any]:
+        if not self.adaptive_historical_thresholds_enabled:
+            return {"active": False, "reason": "disabled"}
+        if not self._historical_reference_cases:
+            return {"active": False, "reason": "no_reference_cases"}
+
+        valid_cases = [row for row in self._historical_reference_cases if row.get("roi_12m_pct") is not None]
+        min_cases = int(self.adaptive_historical_threshold_min_cases)
+        if len(valid_cases) < min_cases:
+            return {
+                "active": False,
+                "reason": "insufficient_cases",
+                "cases_considered": len(valid_cases),
+                "required_cases": min_cases,
+            }
+
+        by_theme: Dict[str, list[Dict[str, Any]]] = {}
+        for row in valid_cases:
+            theme_key = str(row.get("theme_norm") or "").strip()
+            if not theme_key:
+                continue
+            by_theme.setdefault(theme_key, []).append(row)
+
+        min_group_samples = max(8, int(self.historical_reference_min_samples // 2))
+        theme_metrics: list[Dict[str, float]] = []
+        for theme_key, theme_cases in by_theme.items():
+            if len(theme_cases) < min_group_samples:
+                continue
+            cohort = self._cohort_historical_strength(theme_cases)
+            if cohort is None:
+                continue
+            theme_metrics.append(cohort)
+
+        min_themes = int(self.adaptive_historical_threshold_min_themes)
+        if len(theme_metrics) < min_themes:
+            return {
+                "active": False,
+                "reason": "insufficient_themes",
+                "themes_considered": len(theme_metrics),
+                "required_themes": min_themes,
+                "cases_considered": len(valid_cases),
+            }
+
+        q = float(self.adaptive_historical_threshold_quantile)
+        sample_values = [float(row["sample_size"]) for row in theme_metrics]
+        win_values = [float(row["win_rate_pct"]) for row in theme_metrics]
+        support_values = [float(row["support_confidence"]) for row in theme_metrics]
+        prior_values = [float(row["prior_score"]) for row in theme_metrics]
+
+        min_samples = int(
+            round(
+                min(
+                    float(self.historical_high_conf_min_samples),
+                    max(12.0, self._percentile(sample_values, q)),
+                )
+            )
+        )
+        min_win_rate_pct = float(
+            min(
+                float(self.historical_high_conf_min_win_rate_pct),
+                max(45.0, self._percentile(win_values, q)),
+            )
+        )
+        min_support_confidence = int(
+            round(
+                min(
+                    float(self.historical_high_conf_min_support_confidence),
+                    max(35.0, self._percentile(support_values, q)),
+                )
+            )
+        )
+        min_prior_score = int(
+            round(
+                min(
+                    float(self.historical_high_conf_min_prior_score),
+                    max(50.0, self._percentile(prior_values, q)),
+                )
+            )
+        )
+
+        return {
+            "active": True,
+            "quantile": q,
+            "cases_considered": len(valid_cases),
+            "themes_considered": len(theme_metrics),
+            "min_samples": int(max(5, min_samples)),
+            "min_win_rate_pct": round(float(min_win_rate_pct), 2),
+            "min_support_confidence": int(max(1, min_support_confidence)),
+            "min_prior_score": int(max(1, min_prior_score)),
+            "static_min_samples": int(self.historical_high_conf_min_samples),
+            "static_min_win_rate_pct": float(self.historical_high_conf_min_win_rate_pct),
+            "static_min_support_confidence": int(self.historical_high_conf_min_support_confidence),
+            "static_min_prior_score": int(self.historical_high_conf_min_prior_score),
+        }
+
+    def _effective_historical_high_confidence_thresholds(self) -> tuple[int, float, int, int, bool]:
+        min_samples = int(self.historical_high_conf_min_samples)
+        min_win_rate_pct = float(self.historical_high_conf_min_win_rate_pct)
+        min_support_confidence = int(self.historical_high_conf_min_support_confidence)
+        min_prior_score = int(self.historical_high_conf_min_prior_score)
+        adaptive_active = False
+
+        adaptive = self._adaptive_historical_thresholds if self.adaptive_historical_thresholds_enabled else {}
+        if adaptive and adaptive.get("active"):
+            min_samples = int(adaptive.get("min_samples") or min_samples)
+            min_win_rate_pct = float(adaptive.get("min_win_rate_pct") or min_win_rate_pct)
+            min_support_confidence = int(adaptive.get("min_support_confidence") or min_support_confidence)
+            min_prior_score = int(adaptive.get("min_prior_score") or min_prior_score)
+            adaptive_active = True
+
+        return (
+            max(5, min_samples),
+            max(1.0, min_win_rate_pct),
+            max(1, min_support_confidence),
+            max(1, min_prior_score),
+            adaptive_active,
+        )
 
     def _historical_prior_for_candidate(self, candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not self._historical_reference_cases:
@@ -5761,15 +6099,22 @@ class DiscoveryOracle:
             return True, []
 
         reasons: list[str] = []
+        (
+            min_samples,
+            min_win_rate_pct,
+            min_support_confidence,
+            min_prior_score,
+            adaptive_active,
+        ) = self._effective_historical_high_confidence_thresholds()
         sample_size_raw = self._row_metric_value(row, "historical_sample_size")
         try:
             sample_size = max(0, int(float(sample_size_raw or 0)))
         except (TypeError, ValueError):
             sample_size = 0
 
-        if sample_size < int(self.historical_high_conf_min_samples):
+        if sample_size < int(min_samples):
             reasons.append(
-                f"Evidenza storica insufficiente ({sample_size} < {self.historical_high_conf_min_samples} campioni)"
+                f"Evidenza storica insufficiente ({sample_size} < {min_samples} campioni)"
             )
             return False, reasons
 
@@ -5778,9 +6123,9 @@ class DiscoveryOracle:
             win_rate_pct = float(win_rate_pct_raw or 0.0)
         except (TypeError, ValueError):
             win_rate_pct = 0.0
-        if win_rate_pct < float(self.historical_high_conf_min_win_rate_pct):
+        if win_rate_pct < float(min_win_rate_pct):
             reasons.append(
-                f"Win-rate storico 12m sotto soglia ({win_rate_pct:.1f}% < {self.historical_high_conf_min_win_rate_pct:.0f}%)"
+                f"Win-rate storico 12m sotto soglia ({win_rate_pct:.1f}% < {min_win_rate_pct:.0f}%)"
             )
 
         support_conf_raw = self._row_metric_value(row, "historical_support_confidence")
@@ -5788,9 +6133,9 @@ class DiscoveryOracle:
             support_conf = max(0, int(float(support_conf_raw or 0)))
         except (TypeError, ValueError):
             support_conf = 0
-        if support_conf < int(self.historical_high_conf_min_support_confidence):
+        if support_conf < int(min_support_confidence):
             reasons.append(
-                f"Confidenza supporto storico sotto soglia ({support_conf} < {self.historical_high_conf_min_support_confidence})"
+                f"Confidenza supporto storico sotto soglia ({support_conf} < {min_support_confidence})"
             )
 
         prior_score_raw = self._row_metric_value(row, "historical_prior_score")
@@ -5798,11 +6143,13 @@ class DiscoveryOracle:
             prior_score = max(0, int(float(prior_score_raw or 0)))
         except (TypeError, ValueError):
             prior_score = 0
-        if prior_score < int(self.historical_high_conf_min_prior_score):
+        if prior_score < int(min_prior_score):
             reasons.append(
-                f"Prior storico sotto soglia ({prior_score} < {self.historical_high_conf_min_prior_score})"
+                f"Prior storico sotto soglia ({prior_score} < {min_prior_score})"
             )
 
+        if reasons and adaptive_active:
+            reasons.insert(0, "Gate storico adattivo attivo")
         return not reasons, reasons
 
     def _is_high_confidence_pick(self, row: Dict[str, Any]) -> bool:

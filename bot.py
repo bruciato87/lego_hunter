@@ -712,6 +712,41 @@ class LegoHunterTelegramBot:
                 lines.append(
                     f"Prob Upside 12m {prob_12m:.1f}% | ROI atteso 12m {roi_12m:+.1f}% | {target_line} | EOL {eol} | Conf {confidence_score}/100"
                 )
+                historical_sample_size = int(
+                    row.get("historical_sample_size")
+                    or metadata.get("historical_sample_size")
+                    or 0
+                )
+                historical_win_rate = row.get("historical_win_rate_12m_pct")
+                if historical_win_rate is None:
+                    historical_win_rate = metadata.get("historical_win_rate_12m_pct")
+                historical_prior_score = row.get("historical_prior_score")
+                if historical_prior_score is None:
+                    historical_prior_score = metadata.get("historical_prior_score")
+                historical_support_confidence = row.get("historical_support_confidence")
+                if historical_support_confidence is None:
+                    historical_support_confidence = metadata.get("historical_support_confidence")
+
+                if historical_sample_size > 0:
+                    try:
+                        historical_win_rate_value = float(historical_win_rate or 0.0)
+                    except (TypeError, ValueError):
+                        historical_win_rate_value = 0.0
+                    try:
+                        historical_prior_value = int(historical_prior_score or 0)
+                    except (TypeError, ValueError):
+                        historical_prior_value = 0
+                    try:
+                        historical_support_value = int(historical_support_confidence or 0)
+                    except (TypeError, ValueError):
+                        historical_support_value = 0
+                    lines.append(
+                        "Storico: "
+                        f"{historical_sample_size} campioni | "
+                        f"Win-rate 12m {historical_win_rate_value:.1f}% | "
+                        f"Prior {historical_prior_value}/100 | "
+                        f"Supporto {historical_support_value}/100"
+                    )
                 if pattern_summary:
                     lines.append(f"Pattern: {html.escape(pattern_summary)}")
                 lines.append(f"Fonte: {source} | Segnale: {strength}")
@@ -764,6 +799,33 @@ class LegoHunterTelegramBot:
             f"Max Score: {int(diagnostics.get('max_composite_score', 0))} | "
             f"Max Prob12m: {float(diagnostics.get('max_probability_upside_12m', 0.0)):.1f}%"
         )
+        if diagnostics.get("historical_high_conf_required"):
+            eff_hist_samples = int(
+                diagnostics.get("historical_high_conf_effective_min_samples")
+                or diagnostics.get("historical_high_conf_min_samples")
+                or 0
+            )
+            eff_hist_win_rate = float(
+                diagnostics.get("historical_high_conf_effective_min_win_rate_pct")
+                or diagnostics.get("historical_high_conf_min_win_rate_pct")
+                or 0.0
+            )
+            eff_hist_support = int(
+                diagnostics.get("historical_high_conf_effective_min_support_confidence")
+                or diagnostics.get("historical_high_conf_min_support_confidence")
+                or 0
+            )
+            eff_hist_prior = int(
+                diagnostics.get("historical_high_conf_effective_min_prior_score")
+                or diagnostics.get("historical_high_conf_min_prior_score")
+                or 0
+            )
+            adaptive_hist_active = bool(diagnostics.get("adaptive_historical_thresholds_active"))
+            adaptive_badge = "adattive" if adaptive_hist_active else "statiche"
+            lines.append(
+                f"📚 Gate storico ({adaptive_badge}): campioni>={eff_hist_samples} | "
+                f"Win-rate>={eff_hist_win_rate:.0f}% | Supporto>={eff_hist_support} | Prior>={eff_hist_prior}"
+            )
         if bootstrap_enabled:
             bootstrap_rows_count = int(diagnostics.get("bootstrap_rows_count") or 0)
             bootstrap_status = "attivo" if bootstrap_rows_count > 0 else "abilitato (non attivo nel ciclo)"

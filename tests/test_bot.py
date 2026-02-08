@@ -368,6 +368,53 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Pattern 84/100", joined)
         self.assertIn("Completismo di serie", joined)
 
+    def test_format_discovery_report_includes_historical_metrics_and_gate_thresholds(self) -> None:
+        report = {
+            "selected": [
+                {
+                    "set_id": "76281",
+                    "set_name": "X-Jet di X-Men",
+                    "source": "lego_proxy_reader",
+                    "signal_strength": "LOW_CONFIDENCE",
+                    "ai_investment_score": 72,
+                    "market_demand_score": 95,
+                    "forecast_probability_upside_12m": 66.2,
+                    "confidence_score": 58,
+                    "current_price": 79.99,
+                    "eol_date_prediction": "2026-05-16",
+                    "historical_sample_size": 33,
+                    "historical_win_rate_12m_pct": 62.4,
+                    "historical_prior_score": 71,
+                    "historical_support_confidence": 59,
+                }
+            ],
+            "diagnostics": {
+                "fallback_used": True,
+                "above_threshold_count": 9,
+                "above_threshold_high_confidence_count": 0,
+                "source_raw_counts": {},
+                "dedup_candidates": 41,
+                "threshold": 60,
+                "max_ai_score": 86,
+                "max_composite_score": 72,
+                "max_probability_upside_12m": 66.2,
+                "source_strategy": "external_first",
+                "selected_source": "external_proxy",
+                "historical_high_conf_required": True,
+                "historical_high_conf_effective_min_samples": 18,
+                "historical_high_conf_effective_min_win_rate_pct": 50.0,
+                "historical_high_conf_effective_min_support_confidence": 50,
+                "historical_high_conf_effective_min_prior_score": 60,
+                "adaptive_historical_thresholds_active": True,
+                "ai_runtime": {"engine": "openrouter", "model": "x/y:free", "mode": "api"},
+            },
+        }
+
+        lines = LegoHunterTelegramBot._format_discovery_report(report, top_limit=3)
+        joined = "\n".join(lines)
+        self.assertIn("Storico: 33 campioni | Win-rate 12m 62.4% | Prior 71/100 | Supporto 59/100", joined)
+        self.assertIn("Gate storico (adattive): campioni>=18", joined)
+
     def test_format_eol_date_parses_iso_datetime(self) -> None:
         self.assertEqual(LegoHunterTelegramBot._format_eol_date("2026-06-01T08:15:30Z"), "01/06/2026")
         self.assertEqual(LegoHunterTelegramBot._format_eol_date(""), "n/d")

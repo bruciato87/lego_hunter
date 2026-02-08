@@ -1806,6 +1806,199 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(int(stats["ai_top_pick_rescue_successes"]), 1)
         self.assertIn("10002", ai_results)
 
+    async def test_top_pick_rescue_can_force_specific_set_ids(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.openrouter_api_key = "test-key"
+        oracle.ai_top_pick_rescue_enabled = True
+        oracle.ai_top_pick_rescue_count = 1
+        oracle.ai_top_pick_rescue_timeout_sec = 3.0
+
+        candidate_primary = {
+            "set_id": "11001",
+            "set_name": "Primary",
+            "theme": "City",
+            "source": "lego_proxy_reader",
+            "current_price": 29.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+        candidate_forced = {
+            "set_id": "11002",
+            "set_name": "Forced",
+            "theme": "Icons",
+            "source": "lego_proxy_reader",
+            "current_price": 99.99,
+            "eol_date_prediction": "2026-06-01",
+        }
+
+        prepared = [
+            {
+                "candidate": candidate_primary,
+                "set_id": "11001",
+                "theme": "City",
+                "forecast": oracle.forecaster.forecast(candidate=candidate_primary, history_rows=[], theme_baseline={}),
+                "history_30": [],
+                "prefilter_score": 90,
+                "prefilter_rank": 1,
+                "ai_shortlisted": True,
+            },
+            {
+                "candidate": candidate_forced,
+                "set_id": "11002",
+                "theme": "Icons",
+                "forecast": oracle.forecaster.forecast(candidate=candidate_forced, history_rows=[], theme_baseline={}),
+                "history_30": [],
+                "prefilter_score": 40,
+                "prefilter_rank": 8,
+                "ai_shortlisted": False,
+            },
+        ]
+        ranked = [
+            {"set_id": "11001", "composite_score": 80, "forecast_score": 70, "market_demand_score": 80, "ai_fallback_used": False},
+            {"set_id": "11002", "composite_score": 64, "forecast_score": 50, "market_demand_score": 70, "ai_fallback_used": True},
+        ]
+        ai_results = {
+            "11001": AIInsight(
+                score=82,
+                summary="ok",
+                predicted_eol_date="2026-05-01",
+                fallback_used=False,
+                confidence="HIGH_CONFIDENCE",
+            )
+        }
+
+        with patch.object(
+            oracle,
+            "_get_ai_insight",
+            new=AsyncMock(
+                return_value=AIInsight(
+                    score=79,
+                    summary="rescued",
+                    predicted_eol_date="2026-06-01",
+                    fallback_used=False,
+                    confidence="HIGH_CONFIDENCE",
+                )
+            ),
+        ) as mocked_get:
+            stats = await oracle._rescue_top_pick_ai_scores(
+                prepared=prepared,
+                ranked=ranked,
+                ai_results=ai_results,
+                force_set_ids=["11002"],
+                top_k_override=0,
+            )
+
+        self.assertEqual(mocked_get.await_count, 1)
+        self.assertEqual(int(stats["ai_top_pick_rescue_attempts"]), 1)
+        self.assertEqual(int(stats["ai_top_pick_rescue_successes"]), 1)
+        self.assertIn("11002", ai_results)
+        self.assertFalse(ai_results["11002"].fallback_used)
+
+    async def test_rank_flow_guarantees_external_ai_attempt_for_final_top_three(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.openrouter_api_key = "test-key"
+        oracle.ai_top_pick_rescue_enabled = True
+        oracle.ai_top_pick_rescue_count = 1
+        oracle.ai_final_pick_guarantee_count = 3
+        oracle.ai_final_pick_guarantee_rounds = 2
+
+        source_candidates = [
+            {
+                "set_id": "12001",
+                "set_name": "Seed candidate",
+                "theme": "City",
+                "source": "amazon_proxy_reader",
+                "current_price": 25.0,
+                "eol_date_prediction": "2026-05-01",
+                "metadata": {},
+            },
+            {
+                "set_id": "12002",
+                "set_name": "Rescue alpha",
+                "theme": "Marvel",
+                "source": "lego_proxy_reader",
+                "current_price": 89.0,
+                "eol_date_prediction": "2026-05-10",
+                "metadata": {},
+            },
+            {
+                "set_id": "12003",
+                "set_name": "Rescue beta",
+                "theme": "Icons",
+                "source": "lego_proxy_reader",
+                "current_price": 109.0,
+                "eol_date_prediction": "2026-05-20",
+                "metadata": {},
+            },
+        ]
+        prepared: list[dict] = []
+        for idx, candidate in enumerate(source_candidates, start=1):
+            forecast = oracle.forecaster.forecast(candidate=candidate, history_rows=[], theme_baseline={})
+            prepared.append(
+                {
+                    "candidate": candidate,
+                    "set_id": candidate["set_id"],
+                    "theme": candidate["theme"],
+                    "forecast": forecast,
+                    "history_30": [],
+                    "prefilter_score": 100 - (idx * 10),
+                    "prefilter_rank": idx,
+                    "ai_shortlisted": idx == 1,
+                }
+            )
+
+        shortlist = [prepared[0]]
+        skipped = [prepared[1], prepared[2]]
+
+        async def fake_get_ai_insight(candidate):  # noqa: ANN001
+            set_id = str(candidate.get("set_id"))
+            return AIInsight(
+                score=84 if set_id == "12002" else 81,
+                summary=f"rescued {set_id}",
+                predicted_eol_date=str(candidate.get("eol_date_prediction")),
+                fallback_used=False,
+                confidence="HIGH_CONFIDENCE",
+            )
+
+        ai_stats = {
+            "ai_scored_count": 1,
+            "ai_batch_scored_count": 0,
+            "ai_cache_hits": 0,
+            "ai_cache_misses": 1,
+            "ai_persisted_cache_hits": 0,
+            "ai_errors": 0,
+            "ai_budget_exhausted": 0,
+            "ai_timeout_count": 0,
+        }
+        initial_ai_results = {
+            "12001": AIInsight(
+                score=40,
+                summary="seed",
+                predicted_eol_date="2026-05-01",
+                fallback_used=False,
+                confidence="HIGH_CONFIDENCE",
+            )
+        }
+
+        with (
+            patch.object(oracle, "_prepare_quantitative_context", return_value=prepared),
+            patch.object(oracle, "_select_ai_shortlist", return_value=(shortlist, skipped)),
+            patch.object(oracle, "_score_ai_shortlist", new=AsyncMock(return_value=(initial_ai_results, ai_stats))),
+            patch.object(oracle, "_get_ai_insight", new=AsyncMock(side_effect=fake_get_ai_insight)) as mocked_get,
+            patch.object(oracle, "_is_ai_score_collapse", return_value=False),
+        ):
+            ranked = await oracle._rank_and_persist_candidates(source_candidates, persist=False)
+
+        ranked_by_set = {str(row.get("set_id")): row for row in ranked}
+        self.assertIn("12002", ranked_by_set)
+        self.assertIn("12003", ranked_by_set)
+        self.assertFalse(bool(ranked_by_set["12002"].get("ai_fallback_used")))
+        self.assertFalse(bool(ranked_by_set["12003"].get("ai_fallback_used")))
+        self.assertGreaterEqual(mocked_get.await_count, 2)
+        self.assertGreaterEqual(int(oracle._last_ranking_diagnostics.get("ai_top_pick_rescue_attempts") or 0), 2)
+        self.assertEqual(int(oracle._last_ranking_diagnostics.get("ai_final_pick_guarantee_pending_after_rounds") or 0), 0)
+
     async def test_score_ai_shortlist_limits_openrouter_concurrency_with_single_model(self) -> None:
         repo = FakeRepo()
         with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
@@ -2056,9 +2249,61 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertIn("50.0% < 52%", note)
         self.assertIn("45 < 50", note)
 
+    def test_adaptive_historical_thresholds_relax_gate_using_reference_distribution(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_high_conf_required = True
+        oracle.historical_high_conf_min_samples = 24
+        oracle.historical_high_conf_min_win_rate_pct = 56.0
+        oracle.historical_high_conf_min_support_confidence = 50
+        oracle.historical_high_conf_min_prior_score = 60
+        oracle.min_upside_probability = 0.60
+        oracle.min_confidence_score = 68
+        oracle.min_composite_score = 60
+        oracle.adaptive_historical_thresholds_enabled = True
+        oracle._historical_reference_cases = []
+
+        themes = ["city", "ninjago", "friends", "technic", "icons", "star wars"]
+        for theme_idx, theme in enumerate(themes):
+            for idx in range(18):
+                oracle._historical_reference_cases.append(
+                    {
+                        "set_id": str(95000 + (theme_idx * 100) + idx),
+                        "theme": theme.title(),
+                        "theme_norm": theme,
+                        "set_name": f"{theme} case {idx}",
+                        "msrp_usd": 40.0 + float(idx),
+                        "roi_12m_pct": 18.0 + float((idx + theme_idx) % 6),
+                        "win_12m": 1 if (idx % 2) else 0,
+                        "source_dataset": "seed",
+                        "pattern_tags": "[]",
+                    }
+                )
+
+        oracle._adaptive_historical_thresholds = oracle._compute_adaptive_historical_thresholds()
+        self.assertTrue(bool(oracle._adaptive_historical_thresholds.get("active")))
+
+        row = {
+            "set_id": "76281",
+            "ai_fallback_used": False,
+            "composite_score": 74,
+            "forecast_probability_upside_12m": 64.0,
+            "confidence_score": 72,
+            "forecast_data_points": 120,
+            "historical_sample_size": 18,
+            "historical_win_rate_12m_pct": 52.0,
+            "historical_support_confidence": 60,
+            "historical_prior_score": 65,
+        }
+
+        self.assertTrue(oracle._is_high_confidence_pick(row))
+        oracle.adaptive_historical_thresholds_enabled = False
+        self.assertFalse(oracle._is_high_confidence_pick(row))
+
     def test_high_confidence_requires_historical_evidence(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.adaptive_historical_thresholds_enabled = False
         oracle.historical_high_conf_required = True
         oracle.historical_high_conf_min_samples = 24
         oracle.historical_high_conf_min_win_rate_pct = 56.0
@@ -2088,6 +2333,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
     def test_high_confidence_passes_when_historical_evidence_is_strong(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.adaptive_historical_thresholds_enabled = False
         oracle.historical_high_conf_required = True
         oracle.historical_high_conf_min_samples = 24
         oracle.historical_high_conf_min_win_rate_pct = 56.0
