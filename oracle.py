@@ -3010,6 +3010,16 @@ class DiscoveryOracle:
             for row, strength in above_threshold_with_strength
             if str(strength).startswith("HIGH_CONFIDENCE")
         ]
+        above_threshold_high_conf_strict = [
+            (row, strength)
+            for row, strength in above_threshold_with_strength
+            if str(strength) in {"HIGH_CONFIDENCE", "HIGH_CONFIDENCE_STRICT"}
+        ]
+        above_threshold_high_conf_bootstrap = [
+            (row, strength)
+            for row, strength in above_threshold_with_strength
+            if str(strength) == "HIGH_CONFIDENCE_BOOTSTRAP"
+        ]
         above_threshold_low_conf = [
             row
             for row, strength in above_threshold_with_strength
@@ -3108,6 +3118,8 @@ class DiscoveryOracle:
             "ranked_candidates": len(ranked),
             "above_threshold_count": len(above_threshold),
             "above_threshold_high_confidence_count": len(above_threshold_high_conf),
+            "above_threshold_high_confidence_strict_count": len(above_threshold_high_conf_strict),
+            "above_threshold_high_confidence_bootstrap_count": len(above_threshold_high_conf_bootstrap),
             "above_threshold_low_confidence_count": len(above_threshold_low_conf),
             "fallback_scored_count": sum(1 for row in ranked if row.get("ai_fallback_used")),
             "below_threshold_count": len(ranked) - len(above_threshold),
@@ -3160,7 +3172,22 @@ class DiscoveryOracle:
             "model_health": self._model_health_public(),
             "backtest_runtime": self._backtest_runtime_public(self.backtest_runtime),
             "ranking": dict(self._last_ranking_diagnostics or {}),
+            "ai_non_json_count": sum(
+                1
+                for row in ranked
+                if self._is_non_json_ai_note(
+                    str(row.get("risk_note") or row.get("metadata", {}).get("ai_risk_note") or "")
+                )
+            ),
         }
+
+        ranked_count = max(1, len(ranked))
+        diagnostics["fallback_rate"] = round(float(diagnostics["fallback_scored_count"]) / ranked_count, 4)
+        diagnostics["non_json_rate"] = round(float(diagnostics["ai_non_json_count"]) / ranked_count, 4)
+        diagnostics["strict_pass_rate"] = round(
+            float(diagnostics["above_threshold_high_confidence_strict_count"]) / max(1, int(diagnostics["above_threshold_count"])),
+            4,
+        )
 
         if ranked:
             top_debug = [
@@ -3530,13 +3557,19 @@ class DiscoveryOracle:
                 pattern_eval=pattern_eval,
                 ai_fallback_used=bool(ai.fallback_used),
             )
+            historical_prior = self._historical_prior_for_candidate(candidate)
+            effective_confidence_score = self._effective_confidence_score(
+                forecast=forecast,
+                historical_prior=historical_prior,
+                ai=ai,
+                pattern_eval=pattern_eval,
+            )
             demand = self._estimate_market_demand(
                 candidate,
                 ai.score,
                 forecast=forecast,
                 recent_prices=history_30,
             )
-            historical_prior = self._historical_prior_for_candidate(candidate)
             historical_score = (
                 int(historical_prior.get("prior_score"))
                 if historical_prior is not None and historical_prior.get("prior_score") is not None
@@ -3581,7 +3614,8 @@ class DiscoveryOracle:
                     "expected_roi_12m_pct": round(float(forecast.expected_roi_12m_pct), 2),
                     "forecast_interval_low_pct": round(float(forecast.interval_low_pct), 2),
                     "forecast_interval_high_pct": round(float(forecast.interval_high_pct), 2),
-                    "forecast_confidence_score": int(forecast.confidence_score),
+                    "forecast_confidence_score": int(effective_confidence_score),
+                    "forecast_confidence_score_base": int(forecast.confidence_score),
                     "forecast_data_points": int(forecast.data_points),
                     "forecast_target_roi_pct": round(float(forecast.target_roi_pct), 2),
                     "forecast_estimated_months_to_target": forecast.estimated_months_to_target,
@@ -3639,7 +3673,8 @@ class DiscoveryOracle:
             payload["expected_roi_12m_pct"] = round(float(forecast.expected_roi_12m_pct), 2)
             payload["forecast_interval_low_pct"] = round(float(forecast.interval_low_pct), 2)
             payload["forecast_interval_high_pct"] = round(float(forecast.interval_high_pct), 2)
-            payload["confidence_score"] = int(forecast.confidence_score)
+            payload["confidence_score"] = int(effective_confidence_score)
+            payload["confidence_score_base"] = int(forecast.confidence_score)
             payload["estimated_months_to_target"] = forecast.estimated_months_to_target
             payload["composite_score"] = composite_score
             payload["pattern_score"] = int(effective_pattern_score)
@@ -4842,8 +4877,8 @@ class DiscoveryOracle:
                 continue
             lines_with_scores.append(line_text)
 
-        if len(lines_with_scores) >= len(missing):
-            for idx, candidate in enumerate(missing):
+        if lines_with_scores:
+            for idx, candidate in enumerate(missing[: len(lines_with_scores)]):
                 segment = lines_with_scores[idx]
                 parsed = cls._ai_insight_from_unstructured_text(segment, candidate)
                 if parsed is None:
@@ -7374,6 +7409,52 @@ class DiscoveryOracle:
         else:
             factor = 0.84
         return max(1, min(100, int(round(score * factor))))
+
+    def _effective_confidence_score(
+        self,
+        *,
+        forecast: ForecastInsight,
+        historical_prior: Optional[Dict[str, Any]],
+        ai: AIInsight,
+        pattern_eval: PatternEvaluation,
+    ) -> int:
+        base = max(1, min(100, int(forecast.confidence_score)))
+        if ai.fallback_used:
+            return max(1, min(100, base - 6))
+
+        support_conf = 0
+        prior_score = 0
+        effective_sample = 0.0
+        if historical_prior:
+            try:
+                support_conf = max(0, min(100, int(historical_prior.get("support_confidence") or 0)))
+            except (TypeError, ValueError):
+                support_conf = 0
+            try:
+                prior_score = max(0, min(100, int(historical_prior.get("prior_score") or 0)))
+            except (TypeError, ValueError):
+                prior_score = 0
+            try:
+                effective_sample = max(0.0, float(historical_prior.get("effective_sample_size") or 0.0))
+            except (TypeError, ValueError):
+                effective_sample = 0.0
+
+        bonus = 0.0
+        bonus += max(0.0, float(support_conf - 60)) * 0.25
+        bonus += max(0.0, float(prior_score - 35)) * 0.20
+        bonus += max(0.0, float(effective_sample - 10.0)) * 0.50
+
+        if pattern_eval.signals and int(pattern_eval.confidence_score) >= 70:
+            bonus += min(2.0, 0.6 * float(len(pattern_eval.signals)))
+
+        if self._is_non_json_ai_note(ai.risk_note):
+            bonus -= 2.0
+
+        if self.historical_quality_guard_enabled and bool(self._historical_quality_profile.get("degraded")):
+            bonus *= 0.85
+
+        bonus = max(-8.0, min(12.0, bonus))
+        return max(1, min(100, int(round(base + bonus))))
 
     def _row_forecast_data_points(self, row: Dict[str, Any]) -> int:
         top_level = row.get("forecast_data_points")

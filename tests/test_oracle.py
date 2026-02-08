@@ -9,6 +9,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
+from forecast import ForecastInsight
 from oracle import AIInsight, DiscoveryOracle, PatternEvaluation
 from scrapers import MarketListing
 
@@ -2651,6 +2652,111 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(set(insights.keys()), {"75367", "76281"})
         self.assertEqual(insights["75367"].score, 88)
         self.assertEqual(insights["76281"].score, 74)
+
+    def test_batch_insights_from_unstructured_text_order_fallback_can_parse_partial_cardinality(self) -> None:
+        candidates = [
+            {"set_id": "75367", "set_name": "Set A", "theme": "Star Wars", "source": "lego_proxy_reader"},
+            {"set_id": "76281", "set_name": "Set B", "theme": "Marvel", "source": "lego_proxy_reader"},
+            {"set_id": "42182", "set_name": "Set C", "theme": "Technic", "source": "lego_proxy_reader"},
+        ]
+        raw_text = "1) Score 88/100, forte domanda.\n2) Score 74/100, upside moderato."
+        insights = DiscoveryOracle._batch_insights_from_unstructured_text(raw_text, candidates)
+        self.assertEqual(set(insights.keys()), {"75367", "76281"})
+        self.assertEqual(insights["75367"].score, 88)
+        self.assertEqual(insights["76281"].score, 74)
+        self.assertNotIn("42182", insights)
+
+    def test_effective_confidence_score_boosts_with_historical_support(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_quality_guard_enabled = True
+        oracle._historical_quality_profile = {"degraded": True}
+
+        forecast = ForecastInsight(
+            forecast_score=58,
+            probability_upside_12m=0.64,
+            expected_roi_12m_pct=42.5,
+            interval_low_pct=12.0,
+            interval_high_pct=58.0,
+            target_roi_pct=30.0,
+            estimated_months_to_target=8,
+            confidence_score=58,
+            data_points=40,
+            rationale="test",
+        )
+        historical_prior = {
+            "support_confidence": 80,
+            "prior_score": 50,
+            "effective_sample_size": 18.0,
+        }
+        ai = AIInsight(score=82, summary="ok", fallback_used=False, confidence="HIGH_CONFIDENCE")
+        pattern_eval = PatternEvaluation(
+            score=83,
+            confidence_score=75,
+            summary="Pattern forti",
+            signals=[{"code": "retiring_window"}, {"code": "series_completism"}],
+            features={},
+        )
+
+        effective = oracle._effective_confidence_score(
+            forecast=forecast,
+            historical_prior=historical_prior,
+            ai=ai,
+            pattern_eval=pattern_eval,
+        )
+        self.assertGreaterEqual(effective, 68)
+
+    def test_effective_confidence_score_penalizes_non_json_ai_output(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle._historical_quality_profile = {"degraded": True}
+
+        forecast = ForecastInsight(
+            forecast_score=57,
+            probability_upside_12m=0.65,
+            expected_roi_12m_pct=44.1,
+            interval_low_pct=10.0,
+            interval_high_pct=56.0,
+            target_roi_pct=30.0,
+            estimated_months_to_target=8,
+            confidence_score=58,
+            data_points=40,
+            rationale="test",
+        )
+        historical_prior = {
+            "support_confidence": 80,
+            "prior_score": 50,
+            "effective_sample_size": 18.0,
+        }
+        pattern_eval = PatternEvaluation(
+            score=83,
+            confidence_score=75,
+            summary="Pattern forti",
+            signals=[{"code": "retiring_window"}, {"code": "series_completism"}],
+            features={},
+        )
+        ai_json = AIInsight(score=82, summary="ok", fallback_used=False, confidence="HIGH_CONFIDENCE")
+        ai_non_json = AIInsight(
+            score=82,
+            summary="ok",
+            fallback_used=False,
+            confidence="LOW_CONFIDENCE",
+            risk_note="Output AI non JSON: score estratto da testo con parsing robusto.",
+        )
+
+        boosted = oracle._effective_confidence_score(
+            forecast=forecast,
+            historical_prior=historical_prior,
+            ai=ai_json,
+            pattern_eval=pattern_eval,
+        )
+        penalized = oracle._effective_confidence_score(
+            forecast=forecast,
+            historical_prior=historical_prior,
+            ai=ai_non_json,
+            pattern_eval=pattern_eval,
+        )
+        self.assertLess(penalized, boosted)
 
     def test_compute_fast_fail_timeouts_reduces_timeout_when_budget_is_tight(self) -> None:
         repo = FakeRepo()

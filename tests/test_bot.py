@@ -553,6 +553,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 "max_ai_score": 78,
                 "max_ai_model_raw_score": 99,
                 "ai_guardrail_applied_count": 2,
+                "strict_pass_rate": 0.14,
+                "non_json_rate": 0.21,
+                "fallback_rate": 0.33,
                 "source_strategy": "external_first",
                 "selected_source": "external_proxy",
                 "bootstrap_thresholds_enabled": True,
@@ -568,6 +571,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         joined = "\n".join(lines)
         self.assertIn("solo <b>HIGH_CONFIDENCE_BOOTSTRAP</b>", joined)
         self.assertIn("Segnale: HIGH_CONFIDENCE_BOOTSTRAP (preliminare)", joined)
+        self.assertIn("🧪 Qualita AI: strict-pass 14% | non-JSON 21% | fallback 33%", joined)
         self.assertIn("🛡️ AI guardrail: 2 score normalizzati | Max AI raw 99", joined)
 
     async def test_scheduled_cycle_continues_when_command_sync_times_out(self) -> None:
