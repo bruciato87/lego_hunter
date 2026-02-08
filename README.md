@@ -23,9 +23,15 @@ Bot Telegram autonomo per discovery e monitoraggio opportunita LEGO con data moa
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+pip install -r requirements.ai.txt
+pip install -r requirements.playwright.txt
 python -m playwright install chromium
 python -m unittest discover -s tests -v
 ```
+
+Nota deploy:
+- `requirements.txt` contiene solo dipendenze core leggere (compatibile Vercel webhook).
+- `requirements.ai.txt` e `requirements.playwright.txt` sono extra usati nei job schedulati GitHub e in locale full-stack.
 
 ## Esecuzione
 ```bash
