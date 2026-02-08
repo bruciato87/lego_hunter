@@ -3159,16 +3159,43 @@ class DiscoveryOracle:
                 ai = self._heuristic_ai_fallback(candidate)
                 if set_id in skipped_set_ids:
                     pre_rank = int(skipped_set_ids[set_id].get("prefilter_rank") or 0)
+                    rescue_attempted = bool(row.get("ai_rescue_attempted"))
+                    rescue_failed = bool(row.get("ai_rescue_failed"))
+                    rescue_reason = str(row.get("ai_rescue_reason") or "").strip().lower()
+                    if rescue_attempted and rescue_failed:
+                        if rescue_reason == "timeout":
+                            rescue_note = (
+                                "Tentativo AI esterno sui top pick non riuscito (timeout provider): "
+                                "ranking calcolato con fallback euristico."
+                            )
+                        elif rescue_reason in {"provider_error", "provider_fallback"}:
+                            rescue_note = (
+                                "Tentativo AI esterno sui top pick non riuscito (errore provider): "
+                                "ranking calcolato con fallback euristico."
+                            )
+                        else:
+                            rescue_note = (
+                                "Tentativo AI esterno sui top pick non riuscito nel ciclo corrente: "
+                                "ranking calcolato con fallback euristico."
+                            )
                     ai = AIInsight(
                         score=ai.score,
                         summary=(
+                            "Tentativo AI esterno effettuato sui top pick ma non riuscito; "
+                            "applicato fallback quantitativo del ciclo."
+                            if (rescue_attempted and rescue_failed)
+                            else
                             "AI scoring saltato per ottimizzazione costi/latency; "
                             "set fuori shortlist quantitativa del ciclo."
                         ),
                         predicted_eol_date=ai.predicted_eol_date or candidate.get("eol_date_prediction"),
                         fallback_used=True,
                         confidence="LOW_CONFIDENCE",
-                        risk_note=f"AI non eseguita: pre-filter rank #{pre_rank} oltre top {shortlist_count}.",
+                        risk_note=(
+                            rescue_note
+                            if (rescue_attempted and rescue_failed)
+                            else f"AI non eseguita: pre-filter rank #{pre_rank} oltre top {shortlist_count}."
+                        ),
                     )
 
             pattern_eval = self._evaluate_success_patterns(candidate)
@@ -3358,6 +3385,7 @@ class DiscoveryOracle:
             prepared_row = prepared_by_set.get(set_id)
             if prepared_row is None:
                 continue
+            prepared_row["ai_rescue_attempted"] = True
             rescue_candidates.append(prepared_row["candidate"])
 
         if not rescue_candidates:
@@ -3373,8 +3401,16 @@ class DiscoveryOracle:
             cached = self._get_cached_ai_insight(candidate)
             if cached is not None and not cached.fallback_used:
                 ai_results[set_id] = cached
+                prepared_row = prepared_by_set.get(set_id)
+                if prepared_row is not None:
+                    prepared_row["ai_rescue_failed"] = False
+                    prepared_row["ai_rescue_reason"] = "cache_hit"
                 continue
             if not external_available:
+                prepared_row = prepared_by_set.get(set_id)
+                if prepared_row is not None:
+                    prepared_row["ai_rescue_failed"] = True
+                    prepared_row["ai_rescue_reason"] = "no_external_ai"
                 continue
 
             stats["ai_top_pick_rescue_attempts"] += 1
@@ -3386,6 +3422,10 @@ class DiscoveryOracle:
             except asyncio.TimeoutError:
                 stats["ai_top_pick_rescue_failures"] += 1
                 stats["ai_top_pick_rescue_timeouts"] += 1
+                prepared_row = prepared_by_set.get(set_id)
+                if prepared_row is not None:
+                    prepared_row["ai_rescue_failed"] = True
+                    prepared_row["ai_rescue_reason"] = "timeout"
                 LOGGER.warning(
                     "Top pick AI rescue timeout | set_id=%s timeout_sec=%.1f",
                     set_id,
@@ -3394,15 +3434,27 @@ class DiscoveryOracle:
                 continue
             except Exception as exc:  # noqa: BLE001
                 stats["ai_top_pick_rescue_failures"] += 1
+                prepared_row = prepared_by_set.get(set_id)
+                if prepared_row is not None:
+                    prepared_row["ai_rescue_failed"] = True
+                    prepared_row["ai_rescue_reason"] = "provider_error"
                 LOGGER.warning("Top pick AI rescue failed | set_id=%s error=%s", set_id, exc)
                 continue
 
             ai_results[set_id] = insight
             if insight.fallback_used:
                 stats["ai_top_pick_rescue_failures"] += 1
+                prepared_row = prepared_by_set.get(set_id)
+                if prepared_row is not None:
+                    prepared_row["ai_rescue_failed"] = True
+                    prepared_row["ai_rescue_reason"] = "provider_fallback"
                 continue
             self._set_cached_ai_insight(candidate, insight)
             stats["ai_top_pick_rescue_successes"] += 1
+            prepared_row = prepared_by_set.get(set_id)
+            if prepared_row is not None:
+                prepared_row["ai_rescue_failed"] = False
+                prepared_row["ai_rescue_reason"] = "success"
 
         if stats["ai_top_pick_rescue_attempts"] > 0:
             LOGGER.info(

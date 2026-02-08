@@ -1999,6 +1999,44 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertGreaterEqual(int(oracle._last_ranking_diagnostics.get("ai_top_pick_rescue_attempts") or 0), 2)
         self.assertEqual(int(oracle._last_ranking_diagnostics.get("ai_final_pick_guarantee_pending_after_rounds") or 0), 0)
 
+    def test_build_ranked_payloads_uses_rescue_failure_note_instead_of_prefilter_note(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        candidate = {
+            "set_id": "13001",
+            "set_name": "Fallback test",
+            "theme": "City",
+            "source": "lego_proxy_reader",
+            "current_price": 49.99,
+            "eol_date_prediction": "2026-06-15",
+            "metadata": {},
+        }
+        forecast = oracle.forecaster.forecast(candidate=candidate, history_rows=[], theme_baseline={})
+        prepared = [
+            {
+                "candidate": candidate,
+                "set_id": "13001",
+                "theme": "City",
+                "forecast": forecast,
+                "history_30": [],
+                "prefilter_score": 40,
+                "prefilter_rank": 7,
+                "ai_shortlisted": False,
+                "ai_rescue_attempted": True,
+                "ai_rescue_failed": True,
+                "ai_rescue_reason": "timeout",
+            }
+        ]
+        ranked, _opportunities = oracle._build_ranked_payloads(
+            prepared=prepared,
+            ai_results={},
+            skipped_set_ids={"13001": {"prefilter_rank": 7}},
+            shortlist_count=4,
+        )
+        note = str(ranked[0].get("risk_note") or "")
+        self.assertIn("Tentativo AI esterno sui top pick non riuscito", note)
+        self.assertNotIn("pre-filter rank", note.lower())
+
     async def test_score_ai_shortlist_limits_openrouter_concurrency_with_single_model(self) -> None:
         repo = FakeRepo()
         with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
