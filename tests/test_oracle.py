@@ -266,6 +266,20 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
     def test_normalize_theme_key_handles_symbols_and_spacing(self) -> None:
         self.assertEqual(DiscoveryOracle._normalize_theme_key("  Marvel / Super-Heroes  "), "marvel super heroes")
 
+    def test_guess_theme_from_name_covers_recent_catalog_patterns(self) -> None:
+        self.assertEqual(
+            DiscoveryOracle._guess_theme_from_name("Rover lunare NASA Apollo - LRV"),
+            "Technic",
+        )
+        self.assertEqual(
+            DiscoveryOracle._guess_theme_from_name("X-Jet di X-Men"),
+            "Marvel",
+        )
+        self.assertEqual(
+            DiscoveryOracle._guess_theme_from_name("In volo con la Dodo Airlines"),
+            "Animal Crossing",
+        )
+
     def test_effective_pattern_score_penalizes_fallback_retiring_only(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)

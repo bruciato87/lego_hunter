@@ -5005,15 +5005,58 @@ class DiscoveryOracle:
         lowered = (name or "").lower()
         keyword_map = [
             ("Star Wars", ("star wars", "guerre stellari")),
-            ("Technic", ("technic", "ingranaggi", "escavatore", "gru")),
+            (
+                "Technic",
+                (
+                    "technic",
+                    "ingranaggi",
+                    "escavatore",
+                    "gru",
+                    "liebherr",
+                    "rover lunare",
+                    "lrv",
+                    "apollo",
+                    "nasa",
+                    "xlt",
+                ),
+            ),
             ("City", ("city", "citta", "polizia", "vigili del fuoco", "ambulanza")),
             ("Icons", ("icons", "creator expert", "modular", "medieval", "castello")),
             ("Botanicals", ("botanical", "botanicals", "narcisi", "fiori", "bouquet", "rose", "orchidea")),
             ("Harry Potter", ("harry potter", "hogwarts")),
-            ("Marvel", ("marvel", "avengers", "spider-man", "spiderman")),
+            (
+                "Marvel",
+                (
+                    "marvel",
+                    "avengers",
+                    "spider-man",
+                    "spiderman",
+                    "x-men",
+                    "x jet",
+                    "x-jet",
+                    "goblin",
+                    "iron man",
+                    "captain america",
+                    "thor",
+                    "hulk",
+                    "venom",
+                ),
+            ),
             ("Ninjago", ("ninjago",)),
             ("Friends", ("friends",)),
             ("Architecture", ("architecture",)),
+            (
+                "Animal Crossing",
+                (
+                    "animal crossing",
+                    "dodo airlines",
+                    "isabelle",
+                    "tom nook",
+                    "k.k.",
+                    "blatero",
+                    "fuffi",
+                ),
+            ),
         ]
         for theme, keywords in keyword_map:
             if any(keyword in lowered for keyword in keywords):
