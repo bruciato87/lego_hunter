@@ -87,6 +87,11 @@ DEFAULT_ADAPTIVE_HISTORICAL_THRESHOLDS_ENABLED = True
 DEFAULT_ADAPTIVE_HISTORICAL_THRESHOLD_MIN_CASES = 30
 DEFAULT_ADAPTIVE_HISTORICAL_THRESHOLD_MIN_THEMES = 4
 DEFAULT_ADAPTIVE_HISTORICAL_THRESHOLD_QUANTILE = 0.35
+DEFAULT_HISTORICAL_CONTEXTUAL_GATE_ENABLED = True
+DEFAULT_HISTORICAL_CONTEXT_STRONG_PATTERN_MIN_SCORE = 75
+DEFAULT_HISTORICAL_CONTEXT_MAX_WIN_RATE_RELAX_PCT = 10.0
+DEFAULT_HISTORICAL_CONTEXT_MAX_SUPPORT_RELAX = 6
+DEFAULT_HISTORICAL_CONTEXT_MAX_PRIOR_RELAX = 10
 DEFAULT_AI_MODEL_BAN_SEC = 1800.0
 DEFAULT_AI_MODEL_BAN_FAILURES = 2
 DEFAULT_AI_MODEL_FAILURE_PENALTY = 22
@@ -641,6 +646,34 @@ class DiscoveryOracle:
             minimum=0.05,
             maximum=0.95,
         )
+        self.historical_contextual_gate_enabled = self._safe_env_bool(
+            "HISTORICAL_CONTEXTUAL_GATE_ENABLED",
+            default=DEFAULT_HISTORICAL_CONTEXTUAL_GATE_ENABLED,
+        )
+        self.historical_context_strong_pattern_min_score = self._safe_env_int(
+            "HISTORICAL_CONTEXT_STRONG_PATTERN_MIN_SCORE",
+            default=DEFAULT_HISTORICAL_CONTEXT_STRONG_PATTERN_MIN_SCORE,
+            minimum=55,
+            maximum=95,
+        )
+        self.historical_context_max_win_rate_relax_pct = self._safe_env_float(
+            "HISTORICAL_CONTEXT_MAX_WIN_RATE_RELAX_PCT",
+            default=DEFAULT_HISTORICAL_CONTEXT_MAX_WIN_RATE_RELAX_PCT,
+            minimum=0.0,
+            maximum=20.0,
+        )
+        self.historical_context_max_support_relax = self._safe_env_int(
+            "HISTORICAL_CONTEXT_MAX_SUPPORT_RELAX",
+            default=DEFAULT_HISTORICAL_CONTEXT_MAX_SUPPORT_RELAX,
+            minimum=0,
+            maximum=25,
+        )
+        self.historical_context_max_prior_relax = self._safe_env_int(
+            "HISTORICAL_CONTEXT_MAX_PRIOR_RELAX",
+            default=DEFAULT_HISTORICAL_CONTEXT_MAX_PRIOR_RELAX,
+            minimum=0,
+            maximum=30,
+        )
         self.openrouter_opportunistic_enabled = self._safe_env_bool(
             "OPENROUTER_OPPORTUNISTIC_ENABLED",
             default=DEFAULT_OPENROUTER_OPPORTUNISTIC_ENABLED,
@@ -838,7 +871,7 @@ class DiscoveryOracle:
             self.openrouter_opportunistic_timeout_sec,
         )
         LOGGER.info(
-            "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f bootstrap_enabled=%s bootstrap_min_history=%s bootstrap_min_prob=%.2f bootstrap_min_confidence=%s historical_gate_required=%s historical_min_samples=%s historical_min_win_rate_pct=%.1f historical_min_support_confidence=%s historical_min_prior_score=%s adaptive_hist_thresholds=%s adaptive_quantile=%.2f",
+            "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f bootstrap_enabled=%s bootstrap_min_history=%s bootstrap_min_prob=%.2f bootstrap_min_confidence=%s historical_gate_required=%s historical_min_samples=%s historical_min_win_rate_pct=%.1f historical_min_support_confidence=%s historical_min_prior_score=%s adaptive_hist_thresholds=%s adaptive_quantile=%.2f contextual_hist_gate=%s contextual_pattern_min=%s contextual_win_relax=%.1f contextual_support_relax=%s contextual_prior_relax=%s",
             self.min_composite_score,
             self.min_upside_probability,
             self.min_confidence_score,
@@ -855,6 +888,11 @@ class DiscoveryOracle:
             self.historical_high_conf_min_prior_score,
             self.adaptive_historical_thresholds_enabled,
             self.adaptive_historical_threshold_quantile,
+            self.historical_contextual_gate_enabled,
+            self.historical_context_strong_pattern_min_score,
+            self.historical_context_max_win_rate_relax_pct,
+            self.historical_context_max_support_relax,
+            self.historical_context_max_prior_relax,
         )
         LOGGER.info(
             "Backtest tuning | enabled=%s lookback_days=%s horizon_days=%s min_selected=%s profile=%s",
@@ -6521,6 +6559,144 @@ class DiscoveryOracle:
             return meta.get(key)
         return None
 
+    def _row_pattern_signals(self, row: Dict[str, Any]) -> list[Dict[str, Any]]:
+        raw = row.get("pattern_signals")
+        if raw is None:
+            raw = self._row_metric_value(row, "success_patterns")
+        if not isinstance(raw, list):
+            return []
+        return [item for item in raw if isinstance(item, dict)]
+
+    def _row_pattern_strength_score(self, row: Dict[str, Any]) -> int:
+        direct_raw = row.get("pattern_score")
+        if direct_raw is None:
+            direct_raw = self._row_metric_value(row, "success_pattern_score")
+        try:
+            direct_score = max(0, int(float(direct_raw or 0)))
+        except (TypeError, ValueError):
+            direct_score = 0
+
+        signals = self._row_pattern_signals(row)
+        if not signals:
+            return min(100, direct_score)
+
+        ranked = sorted(
+            signals,
+            key=lambda item: (float(item.get("score") or 0.0) * float(item.get("confidence") or 0.0)),
+            reverse=True,
+        )[:3]
+        total_conf = sum(max(0.05, float(item.get("confidence") or 0.0)) for item in ranked)
+        if total_conf <= 0:
+            return min(100, direct_score)
+        weighted = sum(
+            max(1.0, float(item.get("score") or 0.0)) * max(0.05, float(item.get("confidence") or 0.0))
+            for item in ranked
+        ) / total_conf
+        signal_score = int(round(max(1.0, min(100.0, weighted))))
+        if direct_score > 0:
+            return max(min(100, direct_score), signal_score)
+        return signal_score
+
+    def _historical_contextual_thresholds_for_row(
+        self,
+        *,
+        row: Dict[str, Any],
+        min_samples: int,
+        min_win_rate_pct: float,
+        min_support_confidence: int,
+        min_prior_score: int,
+    ) -> tuple[int, float, int, int, bool, Optional[str]]:
+        if not self.historical_contextual_gate_enabled:
+            return min_samples, min_win_rate_pct, min_support_confidence, min_prior_score, False, None
+
+        signals = self._row_pattern_signals(row)
+        pattern_strength = self._row_pattern_strength_score(row)
+        if not signals or pattern_strength < int(self.historical_context_strong_pattern_min_score):
+            return min_samples, min_win_rate_pct, min_support_confidence, min_prior_score, False, None
+
+        strong_codes = {
+            "exclusive_cult_license",
+            "series_completism",
+            "adult_display_value",
+            "flagship_collector",
+            "modular_continuity",
+            "nostalgia_vehicle",
+            "stem_mission_icon",
+            "accessible_license_entry",
+        }
+        strong_signal_count = sum(
+            1
+            for signal in signals
+            if str(signal.get("code") or "") in strong_codes
+            and float(signal.get("confidence") or 0.0) >= 0.6
+        )
+        if strong_signal_count <= 0:
+            return min_samples, min_win_rate_pct, min_support_confidence, min_prior_score, False, None
+
+        sample_raw = self._row_metric_value(row, "historical_sample_size")
+        support_raw = self._row_metric_value(row, "historical_support_confidence")
+        prior_raw = self._row_metric_value(row, "historical_prior_score")
+        avg_roi_raw = self._row_metric_value(row, "historical_avg_roi_12m_pct")
+        try:
+            sample_size = max(0, int(float(sample_raw or 0)))
+        except (TypeError, ValueError):
+            sample_size = 0
+        try:
+            support_conf = max(0, int(float(support_raw or 0)))
+        except (TypeError, ValueError):
+            support_conf = 0
+        try:
+            prior_score = max(0, int(float(prior_raw or 0)))
+        except (TypeError, ValueError):
+            prior_score = 0
+        try:
+            avg_roi_pct = float(avg_roi_raw) if avg_roi_raw is not None else None
+        except (TypeError, ValueError):
+            avg_roi_pct = None
+
+        if sample_size < int(min_samples) or support_conf < int(min_support_confidence):
+            return min_samples, min_win_rate_pct, min_support_confidence, min_prior_score, False, None
+        if prior_score <= 0:
+            return min_samples, min_win_rate_pct, min_support_confidence, min_prior_score, False, None
+        if avg_roi_pct is not None and avg_roi_pct < max(6.0, float(self.target_roi_pct) * 0.30):
+            return min_samples, min_win_rate_pct, min_support_confidence, min_prior_score, False, None
+
+        sample_factor = min(1.0, max(0.0, (sample_size - float(min_samples)) / max(8.0, float(min_samples) * 0.8)))
+        support_factor = min(
+            1.0,
+            max(0.0, (support_conf - float(min_support_confidence)) / max(8.0, float(100 - min_support_confidence))),
+        )
+        pattern_factor = min(
+            1.0,
+            max(
+                0.0,
+                (pattern_strength - float(self.historical_context_strong_pattern_min_score)) / 25.0,
+            ),
+        )
+        if avg_roi_pct is None:
+            roi_factor = 0.45
+        else:
+            roi_factor = min(1.0, max(0.0, avg_roi_pct / max(1.0, float(self.target_roi_pct))))
+
+        relax_strength = max(0.15, min(1.0, (sample_factor + support_factor + pattern_factor + roi_factor) / 4.0))
+        win_relax = int(round(float(self.historical_context_max_win_rate_relax_pct) * relax_strength))
+        support_relax = int(round(float(self.historical_context_max_support_relax) * relax_strength))
+        prior_relax = int(round(float(self.historical_context_max_prior_relax) * relax_strength))
+
+        if win_relax <= 0 and support_relax <= 0 and prior_relax <= 0:
+            return min_samples, min_win_rate_pct, min_support_confidence, min_prior_score, False, None
+
+        adjusted_win_rate = max(35.0, float(min_win_rate_pct) - float(win_relax))
+        adjusted_support = max(35, int(min_support_confidence) - int(support_relax))
+        adjusted_prior = max(40, int(min_prior_score) - int(prior_relax))
+
+        reason = (
+            "Gate storico contestuale attivo "
+            f"(pattern forte + coorte robusta: win-rate>={adjusted_win_rate:.0f}%, "
+            f"supporto>={adjusted_support}, prior>={adjusted_prior})."
+        )
+        return min_samples, adjusted_win_rate, adjusted_support, adjusted_prior, True, reason
+
     def _historical_high_confidence_status(self, row: Dict[str, Any]) -> tuple[bool, list[str]]:
         if not self.historical_high_conf_required:
             return True, []
@@ -6533,6 +6709,20 @@ class DiscoveryOracle:
             min_prior_score,
             adaptive_active,
         ) = self._effective_historical_high_confidence_thresholds()
+        (
+            min_samples,
+            min_win_rate_pct,
+            min_support_confidence,
+            min_prior_score,
+            contextual_active,
+            contextual_reason,
+        ) = self._historical_contextual_thresholds_for_row(
+            row=row,
+            min_samples=min_samples,
+            min_win_rate_pct=min_win_rate_pct,
+            min_support_confidence=min_support_confidence,
+            min_prior_score=min_prior_score,
+        )
         sample_size_raw = self._row_metric_value(row, "historical_sample_size")
         try:
             sample_size = max(0, int(float(sample_size_raw or 0)))
@@ -6575,6 +6765,8 @@ class DiscoveryOracle:
                 f"Prior storico sotto soglia ({prior_score} < {min_prior_score})"
             )
 
+        if reasons and contextual_active and contextual_reason:
+            reasons.insert(0, contextual_reason)
         if reasons and adaptive_active:
             reasons.insert(0, "Gate storico adattivo attivo")
         return not reasons, reasons

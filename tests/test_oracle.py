@@ -2569,6 +2569,84 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
 
         self.assertTrue(oracle._is_high_confidence_pick(row))
 
+    def test_contextual_historical_gate_relaxes_threshold_for_strong_pattern(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.adaptive_historical_thresholds_enabled = False
+        oracle.historical_high_conf_required = True
+        oracle.historical_high_conf_min_samples = 24
+        oracle.historical_high_conf_min_win_rate_pct = 56.0
+        oracle.historical_high_conf_min_support_confidence = 50
+        oracle.historical_high_conf_min_prior_score = 60
+        oracle.historical_contextual_gate_enabled = True
+        oracle.historical_context_strong_pattern_min_score = 75
+        oracle.historical_context_max_win_rate_relax_pct = 10.0
+        oracle.historical_context_max_support_relax = 6
+        oracle.historical_context_max_prior_relax = 10
+        oracle.min_upside_probability = 0.60
+        oracle.min_confidence_score = 68
+        oracle.min_composite_score = 60
+
+        row = {
+            "set_id": "76281",
+            "theme": "Marvel",
+            "ai_fallback_used": False,
+            "composite_score": 75,
+            "forecast_probability_upside_12m": 65.0,
+            "confidence_score": 72,
+            "forecast_data_points": 120,
+            "historical_sample_size": 48,
+            "historical_win_rate_12m_pct": 49.0,
+            "historical_support_confidence": 72,
+            "historical_prior_score": 56,
+            "historical_avg_roi_12m_pct": 35.0,
+            "pattern_score": 86,
+            "pattern_signals": [
+                {"code": "exclusive_cult_license", "score": 95, "confidence": 0.88},
+                {"code": "series_completism", "score": 85, "confidence": 0.82},
+            ],
+        }
+
+        self.assertTrue(oracle._is_high_confidence_pick(row))
+
+    def test_contextual_historical_gate_does_not_relax_weak_pattern(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.adaptive_historical_thresholds_enabled = False
+        oracle.historical_high_conf_required = True
+        oracle.historical_high_conf_min_samples = 24
+        oracle.historical_high_conf_min_win_rate_pct = 56.0
+        oracle.historical_high_conf_min_support_confidence = 50
+        oracle.historical_high_conf_min_prior_score = 60
+        oracle.historical_contextual_gate_enabled = True
+        oracle.historical_context_strong_pattern_min_score = 75
+        oracle.min_upside_probability = 0.60
+        oracle.min_confidence_score = 68
+        oracle.min_composite_score = 60
+
+        row = {
+            "set_id": "77051",
+            "theme": "Animal Crossing",
+            "ai_fallback_used": False,
+            "composite_score": 73,
+            "forecast_probability_upside_12m": 64.0,
+            "confidence_score": 72,
+            "forecast_data_points": 120,
+            "historical_sample_size": 44,
+            "historical_win_rate_12m_pct": 49.0,
+            "historical_support_confidence": 71,
+            "historical_prior_score": 56,
+            "historical_avg_roi_12m_pct": 33.0,
+            "pattern_score": 72,
+            "pattern_signals": [
+                {"code": "retiring_window", "score": 83, "confidence": 0.74},
+            ],
+        }
+
+        self.assertFalse(oracle._is_high_confidence_pick(row))
+        note = oracle._build_low_confidence_note(row)
+        self.assertIn("Win-rate storico 12m sotto soglia", note)
+
     def test_format_exception_for_log_timeout_has_message(self) -> None:
         err_type, err_message = DiscoveryOracle._format_exception_for_log(asyncio.TimeoutError())
         self.assertEqual(err_type, "TimeoutError")
