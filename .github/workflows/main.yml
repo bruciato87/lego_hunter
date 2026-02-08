@@ -56,6 +56,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GEMINI_FREE_TIER_ONLY: "true"
+          OPENROUTER_FREE_TIER_ONLY: "true"
           DISCOVERY_SOURCE_MODE: external_first
           AI_RANK_MAX_CANDIDATES: "10"
           AI_SCORING_HARD_BUDGET_SEC: "75"

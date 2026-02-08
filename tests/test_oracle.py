@@ -849,6 +849,12 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         )
         self.assertEqual(ranked[0], "models/gemini-2.0-flash")
 
+    def test_gemini_free_tier_name_filter(self) -> None:
+        self.assertTrue(DiscoveryOracle._is_gemini_free_tier_model_name("models/gemini-2.0-flash"))
+        self.assertTrue(DiscoveryOracle._is_gemini_free_tier_model_name("models/gemini-2.0-flash-lite"))
+        self.assertFalse(DiscoveryOracle._is_gemini_free_tier_model_name("models/gemini-2.5-pro"))
+        self.assertFalse(DiscoveryOracle._is_gemini_free_tier_model_name("models/gemini-3-ultra"))
+
     def test_should_rotate_gemini_model_for_quota_or_404(self) -> None:
         self.assertTrue(
             DiscoveryOracle._should_rotate_gemini_model(Exception("404 model not found"))
@@ -885,6 +891,25 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         }
         self.assertTrue(DiscoveryOracle._is_openrouter_free_model(free_payload))
         self.assertFalse(DiscoveryOracle._is_openrouter_free_model(paid_payload))
+
+    def test_openrouter_free_model_detection_requires_suffix_when_enabled(self) -> None:
+        zero_pricing_no_suffix = {
+            "id": "vendor/model-zero-pricing",
+            "pricing": {"prompt": "0", "completion": "0"},
+            "architecture": {"modality": "text->text"},
+        }
+        self.assertFalse(
+            DiscoveryOracle._is_openrouter_free_model(
+                zero_pricing_no_suffix,
+                require_suffix_free=True,
+            )
+        )
+        self.assertTrue(
+            DiscoveryOracle._is_openrouter_free_model(
+                zero_pricing_no_suffix,
+                require_suffix_free=False,
+            )
+        )
 
     def test_openrouter_candidate_ranking(self) -> None:
         payloads = [

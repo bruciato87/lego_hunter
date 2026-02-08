@@ -46,6 +46,8 @@ python bot.py --mode scheduled
 - `GEMINI_MODEL` (opzionale: modello preferito; il bot fa comunque auto-detect/failover)
 - `OPENROUTER_MODEL` (opzionale: modello OpenRouter preferito)
 - `OPENROUTER_API_BASE` (opzionale, default `https://openrouter.ai/api/v1`)
+- `GEMINI_FREE_TIER_ONLY` (opzionale, default `true`: usa solo candidati Gemini flash/lite, esclude pro/ultra)
+- `OPENROUTER_FREE_TIER_ONLY` (opzionale, default `true`: usa solo modelli OpenRouter con suffisso `:free`)
 - `DISCOVERY_SOURCE_MODE` (opzionale, default `external_first`; valori: `external_first`, `playwright_first`, `external_only`)
 - `MIN_COMPOSITE_SCORE` (opzionale, default `60`)
 - `MIN_UPSIDE_PROBABILITY` (opzionale, default `0.60`, scala 0-1)

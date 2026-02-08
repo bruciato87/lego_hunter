@@ -44,6 +44,8 @@ DISCOVERY_SOURCE_MODES = {"external_first", "playwright_first", "external_only"}
 DEFAULT_DISCOVERY_SOURCE_MODE = "external_first"
 DEFAULT_GEMINI_MODEL = "models/gemini-2.0-flash"
 DEFAULT_OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
+DEFAULT_GEMINI_FREE_TIER_ONLY = True
+DEFAULT_OPENROUTER_FREE_TIER_ONLY = True
 DEFAULT_AI_PROBE_MAX_CANDIDATES = 8
 DEFAULT_AI_PROBE_BATCH_SIZE = 3
 DEFAULT_AI_PROBE_BUDGET_SEC = 90.0
@@ -289,8 +291,16 @@ class DiscoveryOracle:
         self.backtest_runtime: Dict[str, Any] = {}
         self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
         self.gemini_model = self._normalize_model_name(os.getenv("GEMINI_MODEL") or gemini_model)
+        self.gemini_free_tier_only = self._safe_env_bool(
+            "GEMINI_FREE_TIER_ONLY",
+            default=DEFAULT_GEMINI_FREE_TIER_ONLY,
+        )
         self.openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
         self.openrouter_api_base = (os.getenv("OPENROUTER_API_BASE") or DEFAULT_OPENROUTER_API_BASE).rstrip("/")
+        self.openrouter_free_tier_only = self._safe_env_bool(
+            "OPENROUTER_FREE_TIER_ONLY",
+            default=DEFAULT_OPENROUTER_FREE_TIER_ONLY,
+        )
         self.openrouter_model_preference = (os.getenv("OPENROUTER_MODEL") or "").strip()
         self.openrouter_json_repair_model_preference = (os.getenv("OPENROUTER_JSON_REPAIR_MODEL") or "").strip()
         self.ai_probe_max_candidates = self._safe_env_int(
@@ -681,6 +691,11 @@ class DiscoveryOracle:
             self.strict_ai_probe_validation,
         )
         LOGGER.info(
+            "AI free-tier policy | gemini_free_only=%s openrouter_free_only=%s",
+            self.gemini_free_tier_only,
+            self.openrouter_free_tier_only,
+        )
+        LOGGER.info(
             "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s floor_multi_model=%s per_model=%s bonus=%s cache_ttl_sec=%.0f persisted_cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f ai_top_pick_rescue_enabled=%s ai_top_pick_rescue_count=%s ai_top_pick_rescue_timeout_sec=%.1f openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
@@ -874,9 +889,20 @@ class DiscoveryOracle:
             methods = [str(item).lower() for item in (getattr(model, "supported_generation_methods", None) or [])]
             if "generatecontent" not in methods:
                 continue
+            if self.gemini_free_tier_only and not self._is_gemini_free_tier_model_name(normalized):
+                continue
             available.append(normalized)
 
         return sorted(set(available))
+
+    @staticmethod
+    def _is_gemini_free_tier_model_name(model_name: str) -> bool:
+        lowered = str(model_name or "").strip().lower()
+        if not lowered.startswith("models/gemini"):
+            return False
+        if any(token in lowered for token in ("pro", "ultra")):
+            return False
+        return any(token in lowered for token in ("flash", "lite"))
 
     @classmethod
     def _sort_gemini_model_candidates(
@@ -1539,7 +1565,11 @@ class DiscoveryOracle:
         except Exception as exc:  # noqa: BLE001
             self._disable_openrouter("fallback_openrouter_unavailable", str(exc))
             return
-        candidates = self._sort_openrouter_model_candidates(model_payloads, preferred_model=self.openrouter_model_preference)
+        candidates = self._sort_openrouter_model_candidates(
+            model_payloads,
+            preferred_model=self.openrouter_model_preference,
+            require_suffix_free=self.openrouter_free_tier_only,
+        )
         self._openrouter_candidates = candidates
         if not candidates:
             self._disable_openrouter("fallback_no_openrouter_models", "Nessun modello OpenRouter free-tier text-capable.")
@@ -1635,6 +1665,7 @@ class DiscoveryOracle:
         model_payloads: list[Dict[str, Any]],
         *,
         preferred_model: Optional[str] = None,
+        require_suffix_free: bool = True,
     ) -> list[str]:
         ranked_rows: list[tuple[int, str]] = []
         for row in model_payloads:
@@ -1643,7 +1674,7 @@ class DiscoveryOracle:
                 continue
             if not cls._is_openrouter_text_model(row):
                 continue
-            if not cls._is_openrouter_free_model(row):
+            if not cls._is_openrouter_free_model(row, require_suffix_free=require_suffix_free):
                 continue
             ranked_rows.append((cls._score_openrouter_model_payload(row), model_id))
 
@@ -1694,10 +1725,13 @@ class DiscoveryOracle:
         return not any(token in model_id for token in ("image", "tts", "speech", "audio", "vision"))
 
     @staticmethod
-    def _is_openrouter_free_model(payload: Dict[str, Any]) -> bool:
+    def _is_openrouter_free_model(payload: Dict[str, Any], *, require_suffix_free: bool = True) -> bool:
         model_id = str(payload.get("id") or "").lower()
-        if model_id.endswith(":free") or ":free" in model_id:
+        has_suffix_free = model_id.endswith(":free") or ":free" in model_id
+        if has_suffix_free:
             return True
+        if require_suffix_free:
+            return False
         pricing = payload.get("pricing")
         if not isinstance(pricing, dict):
             return False
@@ -1953,6 +1987,8 @@ class DiscoveryOracle:
             raise RuntimeError("requests unavailable")
         if not self.openrouter_api_key:
             raise RuntimeError("OPENROUTER_API_KEY missing")
+        if self.openrouter_free_tier_only and ":free" not in str(model_id or "").lower():
+            raise RuntimeError(f"OpenRouter free-tier policy violation: {model_id}")
 
         url = f"{self.openrouter_api_base}/chat/completions"
         payload = {
@@ -2053,7 +2089,7 @@ class DiscoveryOracle:
     def _resolve_openrouter_json_repair_model(self, *, current_model: str) -> str:
         pool: list[str] = []
         preferred = str(self.openrouter_json_repair_model_preference or "").strip()
-        if preferred and preferred != current_model:
+        if preferred and preferred != current_model and preferred in self._openrouter_candidates:
             pool.append(preferred)
 
         pool.extend(
