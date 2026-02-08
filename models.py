@@ -6,7 +6,7 @@ import random
 import statistics
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional
 
 from supabase import Client, create_client
@@ -241,6 +241,28 @@ class LegoHunterRepository:
             .eq("set_id", set_id)
             .in_("platform", ["vinted", "subito"])
             .order("price", desc=False)
+            .limit(1)
+            .execute(),
+        )
+        rows = result.data or []
+        return rows[0] if rows else None
+
+    def get_best_recent_secondary_price(
+        self,
+        set_id: str,
+        max_age_hours: float = 72.0,
+    ) -> Optional[Dict[str, Any]]:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1.0, float(max_age_hours)))
+        cutoff_iso = cutoff.isoformat()
+        result = self._with_retry(
+            "get_best_recent_secondary_price",
+            lambda: self.client.table("market_time_series")
+            .select("*")
+            .eq("set_id", set_id)
+            .in_("platform", ["vinted", "subito"])
+            .gte("recorded_at", cutoff_iso)
+            .order("price", desc=False)
+            .order("recorded_at", desc=True)
             .limit(1)
             .execute(),
         )

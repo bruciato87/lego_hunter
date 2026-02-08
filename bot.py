@@ -6,7 +6,7 @@ import html
 import logging
 import os
 from datetime import date, datetime
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Optional
 from urllib.parse import quote_plus
 
 from telegram import Bot, BotCommand, Update
@@ -15,9 +15,9 @@ from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from fiscal import FiscalGuardian
-from models import LegoHunterRepository
+from models import LegoHunterRepository, MarketTimeSeriesRecord
 from oracle import DiscoveryOracle
-from scrapers import PLAYWRIGHT_AVAILABLE
+from scrapers import PLAYWRIGHT_AVAILABLE, SecondaryMarketValidator
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -90,6 +90,69 @@ async def _telegram_call_with_retry(
                 LOGGER.exception("Non-fatal Telegram operation failed: %s", operation_name)
                 return None
             raise
+
+
+async def validate_secondary_deals_with_scrapers(
+    *,
+    repository: LegoHunterRepository,
+    opportunities: Iterable[dict[str, Any]],
+    per_set_limit: int = 3,
+) -> list[dict[str, Any]]:
+    candidates = list(opportunities)
+    if not candidates:
+        return []
+
+    validator = SecondaryMarketValidator()
+    results = await validator.compare_secondary_prices(candidates, per_set_limit=per_set_limit)
+    merged: list[dict[str, Any]] = []
+
+    for opportunity in candidates:
+        key = str(opportunity.get("set_id") or opportunity.get("set_name"))
+        listings = results.get(key, [])
+        primary_price = float(opportunity.get("current_price") or 0.0)
+
+        best_secondary = None
+        if listings:
+            best_secondary = min(listings, key=lambda row: row.price)
+            try:
+                await asyncio.to_thread(
+                    repository.insert_market_snapshot,
+                    MarketTimeSeriesRecord(
+                        set_id=best_secondary.set_id,
+                        set_name=best_secondary.set_name,
+                        platform=best_secondary.platform,
+                        listing_type=best_secondary.condition,
+                        price=best_secondary.price,
+                        shipping_cost=0.0,
+                        listing_url=best_secondary.listing_url,
+                        raw_payload={"source_note": best_secondary.source_note},
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Failed to save secondary snapshot %s: %s", key, exc)
+
+        discount_pct = 0.0
+        if best_secondary and primary_price > 0:
+            discount_pct = ((primary_price - best_secondary.price) / primary_price) * 100
+
+        merged.append(
+            {
+                **opportunity,
+                "secondary_best_price": best_secondary.price if best_secondary else None,
+                "secondary_platform": best_secondary.platform if best_secondary else None,
+                "secondary_url": best_secondary.listing_url if best_secondary else None,
+                "discount_vs_primary_pct": round(discount_pct, 2),
+            }
+        )
+
+    merged.sort(
+        key=lambda row: (
+            row.get("discount_vs_primary_pct") or 0.0,
+            row.get("ai_investment_score") or 0,
+        ),
+        reverse=True,
+    )
+    return merged
 
 
 class LegoHunterTelegramBot:
@@ -259,23 +322,39 @@ class LegoHunterTelegramBot:
         if not self._is_authorized(update):
             return
 
+        opportunities = await asyncio.to_thread(self.repository.get_top_opportunities, 8, 50)
+        if not opportunities:
+            await update.message.reply_text("Nessuna opportunita' in radar. Lancia /scova e riprova.")
+            return
+
         if not PLAYWRIGHT_AVAILABLE:
-            await update.message.reply_text(
-                "Il comando /offerte richiede Playwright e non e' disponibile nel runtime webhook leggero. "
-                "Resta attivo nei cicli schedulati cloud."
-            )
+            cached_deals = await self._get_cached_secondary_deals(opportunities[:8], max_age_hours=72.0)
+            if not cached_deals:
+                await update.message.reply_text(
+                    "Nessuna offerta recente in cache cloud (ultime 72h). "
+                    "Riprova dopo il prossimo ciclo schedulato."
+                )
+                return
+            lines = ["Offerte LEGO (cache cloud, ultime 72h):"]
+            lines.extend(self._format_secondary_deals(cached_deals[:5]))
+            await update.message.reply_text("\n\n".join(lines), disable_web_page_preview=True)
             return
 
         await update.message.reply_text("Verifica offerte secondarie (Vinted/Subito) in corso...")
-        oracle = self._get_oracle()
 
         try:
-            opportunities = await asyncio.to_thread(self.repository.get_top_opportunities, 6, 50)
-            if not opportunities:
-                opportunities = await oracle.discover_opportunities(persist=True, top_limit=6)
-            deals = await oracle.validate_secondary_deals(opportunities[:6])
+            deals = await validate_secondary_deals_with_scrapers(
+                repository=self.repository,
+                opportunities=opportunities[:6],
+            )
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("Deal validation failed")
+            cached_deals = await self._get_cached_secondary_deals(opportunities[:8], max_age_hours=72.0)
+            if cached_deals:
+                lines = ["Offerte LEGO (cache cloud, fallback):"]
+                lines.extend(self._format_secondary_deals(cached_deals[:5]))
+                await update.message.reply_text("\n\n".join(lines), disable_web_page_preview=True)
+                return
             await update.message.reply_text(f"Errore verifica offerte: {exc}")
             return
 
@@ -285,13 +364,67 @@ class LegoHunterTelegramBot:
             return
 
         lines = ["Offerte LEGO interessanti:"]
-        for row in good_deals[:5]:
-            lines.append(
+        lines.extend(self._format_secondary_deals(good_deals[:5]))
+        await update.message.reply_text("\n\n".join(lines), disable_web_page_preview=True)
+
+    async def _get_cached_secondary_deals(
+        self,
+        opportunities: list[dict[str, Any]],
+        *,
+        max_age_hours: float,
+    ) -> list[dict[str, Any]]:
+        deals: list[dict[str, Any]] = []
+        for opportunity in opportunities:
+            set_id = str(opportunity.get("set_id") or "").strip()
+            if not set_id:
+                continue
+            secondary = await asyncio.to_thread(
+                self.repository.get_best_recent_secondary_price,
+                set_id,
+                max_age_hours,
+            )
+            if not secondary:
+                continue
+
+            primary_price = float(opportunity.get("current_price") or 0.0)
+            secondary_price = float(secondary.get("price") or 0.0)
+            discount_pct = 0.0
+            if primary_price > 0 and secondary_price > 0:
+                discount_pct = ((primary_price - secondary_price) / primary_price) * 100
+
+            deals.append(
+                {
+                    **opportunity,
+                    "secondary_best_price": secondary_price,
+                    "secondary_platform": secondary.get("platform"),
+                    "secondary_url": secondary.get("listing_url"),
+                    "discount_vs_primary_pct": round(discount_pct, 2),
+                }
+            )
+
+        deals.sort(
+            key=lambda row: (
+                row.get("discount_vs_primary_pct") or 0.0,
+                row.get("ai_investment_score") or 0,
+            ),
+            reverse=True,
+        )
+        return deals
+
+    @staticmethod
+    def _format_secondary_deals(rows: list[dict[str, Any]]) -> list[str]:
+        lines: list[str] = []
+        for row in rows:
+            message = (
                 f"- {row.get('set_name')} ({row.get('set_id')})\n"
-                f"Secondario: {self._fmt_eur(row.get('secondary_best_price'))} su {row.get('secondary_platform')}\n"
+                f"Secondario: {LegoHunterTelegramBot._fmt_eur(row.get('secondary_best_price'))} su {row.get('secondary_platform')}\n"
                 f"Sconto vs prezzo primario: {row.get('discount_vs_primary_pct')}%"
             )
-        await update.message.reply_text("\n\n".join(lines), disable_web_page_preview=True)
+            url = str(row.get("secondary_url") or "").strip()
+            if url:
+                message += f"\nLink: {url}"
+            lines.append(message)
+        return lines
 
     async def cmd_collezione(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update):
@@ -708,6 +841,27 @@ async def run_scheduled_cycle(
             diagnostics.get("fallback_source_used"),
             diagnostics.get("anti_bot_alert"),
             diagnostics.get("ai_runtime"),
+        )
+        secondary_candidates = list(report.get("selected") or [])[:6]
+        if not secondary_candidates:
+            secondary_candidates = repository.get_top_opportunities(6, 50)
+        secondary_refreshed = 0
+        if PLAYWRIGHT_AVAILABLE and secondary_candidates:
+            try:
+                secondary_rows = await validate_secondary_deals_with_scrapers(
+                    repository=repository,
+                    opportunities=secondary_candidates,
+                )
+                secondary_refreshed = sum(
+                    1 for row in secondary_rows if row.get("secondary_best_price") is not None
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Secondary cache refresh failed: %s", exc)
+        LOGGER.info(
+            "Secondary cache refresh | playwright=%s candidates=%s refreshed=%s",
+            PLAYWRIGHT_AVAILABLE,
+            len(secondary_candidates),
+            secondary_refreshed,
         )
         lines = [
             "<b>🧱 LEGO HUNTER</b> <i>Update automatico (ogni 6 ore)</i>",

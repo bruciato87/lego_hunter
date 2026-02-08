@@ -40,6 +40,7 @@ class FakeRepo:
                 "set_name": "LEGO Star Wars",
                 "ai_investment_score": 88,
                 "market_demand_score": 79,
+                "current_price": 129.99,
             }
         ]
 
@@ -66,6 +67,13 @@ class FakeRepo:
 
     def get_best_secondary_price(self, set_id):  # noqa: ANN001
         return {"platform": "vinted", "price": 130.0}
+
+    def get_best_recent_secondary_price(self, set_id, max_age_hours=72.0):  # noqa: ANN001
+        return {
+            "platform": "vinted",
+            "price": 110.0,
+            "listing_url": "https://example.com/listing/75367",
+        }
 
     def get_latest_price(self, set_id, platform=None):  # noqa: ANN001
         return {"platform": platform or "vinted", "price": 140.0}
@@ -184,6 +192,24 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await manager.cmd_scova(update, DummyContext())
 
         oracle_factory.assert_called_once()
+
+    async def test_offerte_uses_cloud_cache_in_light_runtime_without_oracle(self) -> None:
+        oracle_factory = Mock(return_value=FakeOracle())
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=None,
+            oracle_factory=oracle_factory,
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate()
+
+        with patch("bot.PLAYWRIGHT_AVAILABLE", False):
+            await manager.cmd_offerte(update, DummyContext())
+
+        oracle_factory.assert_not_called()
+        self.assertTrue(update.message.replies)
+        self.assertIn("cache cloud", update.message.replies[-1].lower())
+        self.assertIn("LEGO Star Wars", update.message.replies[-1])
 
     async def test_light_commands_do_not_initialize_oracle(self) -> None:
         oracle_factory = Mock(return_value=FakeOracle())
@@ -418,7 +444,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot_mock.send_message = AsyncMock(return_value={"ok": True})
         bot_mock.shutdown = AsyncMock(return_value=None)
 
-        with patch("bot.Bot", return_value=bot_mock), patch("bot.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+        with (
+            patch("bot.Bot", return_value=bot_mock),
+            patch("bot.PLAYWRIGHT_AVAILABLE", False),
+            patch("bot.asyncio.sleep", new=AsyncMock()) as sleep_mock,
+        ):
             await run_scheduled_cycle(
                 token="token",
                 chat_id="123",
@@ -438,7 +468,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot_mock.send_message = AsyncMock(side_effect=TimedOut("timed out"))
         bot_mock.shutdown = AsyncMock(return_value=None)
 
-        with patch("bot.Bot", return_value=bot_mock), patch("bot.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+        with (
+            patch("bot.Bot", return_value=bot_mock),
+            patch("bot.PLAYWRIGHT_AVAILABLE", False),
+            patch("bot.asyncio.sleep", new=AsyncMock()) as sleep_mock,
+        ):
             await run_scheduled_cycle(
                 token="token",
                 chat_id="123",
