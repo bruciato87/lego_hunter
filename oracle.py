@@ -98,6 +98,12 @@ DEFAULT_HISTORICAL_QUALITY_MAX_MEDIAN_AGE_YEARS = 4
 DEFAULT_HISTORICAL_QUALITY_MAX_TOP_THEME_SHARE = 0.26
 DEFAULT_HISTORICAL_QUALITY_MAX_GENERAL_TAG_SHARE = 0.70
 DEFAULT_HISTORICAL_QUALITY_MIN_THEME_COUNT = 12
+DEFAULT_HISTORICAL_DEGRADED_GATE_RELAX_ENABLED = True
+DEFAULT_HISTORICAL_DEGRADED_MIN_SAMPLES = 8
+DEFAULT_HISTORICAL_DEGRADED_MIN_WIN_RATE_PCT = 10.0
+DEFAULT_HISTORICAL_DEGRADED_WIN_RATE_MARGIN_PCT = 3.0
+DEFAULT_HISTORICAL_DEGRADED_MIN_SUPPORT_CONFIDENCE = 40
+DEFAULT_HISTORICAL_DEGRADED_MIN_PRIOR_SCORE = 40
 DEFAULT_AI_MODEL_BAN_SEC = 1800.0
 DEFAULT_AI_MODEL_BAN_FAILURES = 2
 DEFAULT_AI_MODEL_FAILURE_PENALTY = 22
@@ -750,6 +756,40 @@ class DiscoveryOracle:
             minimum=3,
             maximum=100,
         )
+        self.historical_degraded_gate_relax_enabled = self._safe_env_bool(
+            "HISTORICAL_DEGRADED_GATE_RELAX_ENABLED",
+            default=DEFAULT_HISTORICAL_DEGRADED_GATE_RELAX_ENABLED,
+        )
+        self.historical_degraded_min_samples = self._safe_env_int(
+            "HISTORICAL_DEGRADED_MIN_SAMPLES",
+            default=DEFAULT_HISTORICAL_DEGRADED_MIN_SAMPLES,
+            minimum=5,
+            maximum=40,
+        )
+        self.historical_degraded_min_win_rate_pct = self._safe_env_float(
+            "HISTORICAL_DEGRADED_MIN_WIN_RATE_PCT",
+            default=DEFAULT_HISTORICAL_DEGRADED_MIN_WIN_RATE_PCT,
+            minimum=1.0,
+            maximum=80.0,
+        )
+        self.historical_degraded_win_rate_margin_pct = self._safe_env_float(
+            "HISTORICAL_DEGRADED_WIN_RATE_MARGIN_PCT",
+            default=DEFAULT_HISTORICAL_DEGRADED_WIN_RATE_MARGIN_PCT,
+            minimum=0.0,
+            maximum=20.0,
+        )
+        self.historical_degraded_min_support_confidence = self._safe_env_int(
+            "HISTORICAL_DEGRADED_MIN_SUPPORT_CONFIDENCE",
+            default=DEFAULT_HISTORICAL_DEGRADED_MIN_SUPPORT_CONFIDENCE,
+            minimum=1,
+            maximum=100,
+        )
+        self.historical_degraded_min_prior_score = self._safe_env_int(
+            "HISTORICAL_DEGRADED_MIN_PRIOR_SCORE",
+            default=DEFAULT_HISTORICAL_DEGRADED_MIN_PRIOR_SCORE,
+            minimum=1,
+            maximum=100,
+        )
         self.openrouter_opportunistic_enabled = self._safe_env_bool(
             "OPENROUTER_OPPORTUNISTIC_ENABLED",
             default=DEFAULT_OPENROUTER_OPPORTUNISTIC_ENABLED,
@@ -1022,6 +1062,15 @@ class DiscoveryOracle:
             float(self._historical_quality_profile.get("top_theme_share") or 0.0),
             float(self._historical_quality_profile.get("general_tag_share") or 0.0),
             self._historical_quality_profile.get("issues") or [],
+        )
+        LOGGER.info(
+            "Historical degraded relax | enabled=%s min_samples=%s min_win_rate_pct=%.1f win_margin_pct=%.1f min_support=%s min_prior=%s",
+            self.historical_degraded_gate_relax_enabled,
+            self.historical_degraded_min_samples,
+            self.historical_degraded_min_win_rate_pct,
+            self.historical_degraded_win_rate_margin_pct,
+            self.historical_degraded_min_support_confidence,
+            self.historical_degraded_min_prior_score,
         )
         if self.historical_quality_guard_enabled and self._historical_quality_profile.get("degraded"):
             LOGGER.warning(
@@ -5269,17 +5318,38 @@ class DiscoveryOracle:
             min_prior_score = int(adaptive.get("min_prior_score") or min_prior_score)
             adaptive_active = True
 
+        quality_profile = self._historical_quality_profile or {}
+        quality_tier = str(quality_profile.get("tier") or "").strip().lower()
         quality_degraded = bool(
             self.historical_quality_guard_enabled
             and self.historical_quality_soft_gate_enabled
-            and self._historical_quality_profile.get("degraded")
+            and quality_profile.get("degraded")
         )
         if quality_degraded:
-            global_win_rate_pct = float(self._historical_quality_profile.get("global_win_rate_pct") or 0.0)
-            min_samples = min(min_samples, max(8, int(round(float(min_samples) * 0.5))))
-            min_win_rate_pct = min(min_win_rate_pct, max(16.0, global_win_rate_pct + 8.0))
-            min_support_confidence = min(min_support_confidence, 45)
-            min_prior_score = min(min_prior_score, 50)
+            global_win_rate_pct = float(quality_profile.get("global_win_rate_pct") or 0.0)
+            min_samples = min(
+                min_samples,
+                max(
+                    int(self.historical_degraded_min_samples),
+                    int(round(float(min_samples) * 0.5)),
+                ),
+            )
+
+            if quality_tier == "empty" or not self.historical_degraded_gate_relax_enabled:
+                # Empty seed has almost no usable signal quality: keep conservative softening.
+                min_win_rate_pct = min(min_win_rate_pct, max(16.0, global_win_rate_pct + 8.0))
+                min_support_confidence = min(min_support_confidence, max(45, int(self.historical_degraded_min_support_confidence)))
+                min_prior_score = min(min_prior_score, max(50, int(self.historical_degraded_min_prior_score)))
+            else:
+                min_win_rate_pct = min(
+                    min_win_rate_pct,
+                    max(
+                        float(self.historical_degraded_min_win_rate_pct),
+                        global_win_rate_pct + float(self.historical_degraded_win_rate_margin_pct),
+                    ),
+                )
+                min_support_confidence = min(min_support_confidence, int(self.historical_degraded_min_support_confidence))
+                min_prior_score = min(min_prior_score, int(self.historical_degraded_min_prior_score))
 
         return (
             max(5, min_samples),

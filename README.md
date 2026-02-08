@@ -83,6 +83,12 @@ python bot.py --mode scheduled
 - `HISTORICAL_QUALITY_MIN_THEME_COUNT` (opzionale, default `12`)
 - `HISTORICAL_QUALITY_MAX_TOP_THEME_SHARE` (opzionale, default `0.26`)
 - `HISTORICAL_QUALITY_MAX_GENERAL_TAG_SHARE` (opzionale, default `0.70`)
+- `HISTORICAL_DEGRADED_GATE_RELAX_ENABLED` (opzionale, default `true`)
+- `HISTORICAL_DEGRADED_MIN_SAMPLES` (opzionale, default `8`)
+- `HISTORICAL_DEGRADED_MIN_WIN_RATE_PCT` (opzionale, default `10.0`)
+- `HISTORICAL_DEGRADED_WIN_RATE_MARGIN_PCT` (opzionale, default `3.0`)
+- `HISTORICAL_DEGRADED_MIN_SUPPORT_CONFIDENCE` (opzionale, default `40`)
+- `HISTORICAL_DEGRADED_MIN_PRIOR_SCORE` (opzionale, default `40`)
 - `WEBHOOK_BASE_URL` (opzionale per script setup webhook, es. `https://lego-hunter.vercel.app`)
 
 ## Deploy Vercel (comandi Telegram live)

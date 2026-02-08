@@ -2922,6 +2922,54 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         row_low_sample["historical_sample_size"] = 7
         self.assertFalse(oracle._is_high_confidence_pick(row_low_sample))
 
+    def test_historical_quality_degraded_relaxes_gate_thresholds(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.adaptive_historical_thresholds_enabled = False
+        oracle.historical_quality_guard_enabled = True
+        oracle.historical_quality_soft_gate_enabled = True
+        oracle.historical_degraded_gate_relax_enabled = True
+        oracle.historical_high_conf_min_samples = 24
+        oracle.historical_high_conf_min_win_rate_pct = 56.0
+        oracle.historical_high_conf_min_support_confidence = 50
+        oracle.historical_high_conf_min_prior_score = 60
+        oracle._historical_quality_profile = {
+            "degraded": True,
+            "tier": "degraded",
+            "global_win_rate_pct": 11.5,
+        }
+
+        samples, win_rate, support, prior, adaptive = oracle._effective_historical_high_confidence_thresholds()
+        self.assertFalse(adaptive)
+        self.assertEqual(samples, 12)
+        self.assertAlmostEqual(win_rate, 14.5, places=2)
+        self.assertEqual(support, 40)
+        self.assertEqual(prior, 40)
+
+    def test_historical_quality_empty_seed_keeps_conservative_softening(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.adaptive_historical_thresholds_enabled = False
+        oracle.historical_quality_guard_enabled = True
+        oracle.historical_quality_soft_gate_enabled = True
+        oracle.historical_degraded_gate_relax_enabled = True
+        oracle.historical_high_conf_min_samples = 24
+        oracle.historical_high_conf_min_win_rate_pct = 56.0
+        oracle.historical_high_conf_min_support_confidence = 50
+        oracle.historical_high_conf_min_prior_score = 60
+        oracle._historical_quality_profile = {
+            "degraded": True,
+            "tier": "empty",
+            "global_win_rate_pct": 0.0,
+        }
+
+        samples, win_rate, support, prior, adaptive = oracle._effective_historical_high_confidence_thresholds()
+        self.assertFalse(adaptive)
+        self.assertEqual(samples, 12)
+        self.assertEqual(win_rate, 16.0)
+        self.assertEqual(support, 45)
+        self.assertEqual(prior, 50)
+
     def test_format_exception_for_log_timeout_has_message(self) -> None:
         err_type, err_message = DiscoveryOracle._format_exception_for_log(asyncio.TimeoutError())
         self.assertEqual(err_type, "TimeoutError")
