@@ -215,7 +215,8 @@ class LegoHunterTelegramBot:
             "/vendi - Segnali vendita con ROI netto > 30% (Vinted/Subito/eBay.it, bloccati se DAC7 a rischio).\n\n"
             "Come leggere i segnali:\n"
             "Score = composito (AI + Quant + Demand).\n"
-            "HIGH_CONFIDENCE = score sopra soglia + probabilita' upside 12m + confidenza dati alta + AI non in fallback.\n\n"
+            "HIGH_CONFIDENCE_STRICT = criteri completi standard (score+probabilita'+confidenza+dati storici).\n"
+            "HIGH_CONFIDENCE_BOOTSTRAP = criteri completi ma in bootstrap (storico ancora corto, soglie bootstrap attive).\n\n"
             "Alias compatibilita':\n"
             "/hunt -> /scova\n"
             "/portfolio -> /collezione\n"
@@ -681,8 +682,9 @@ class LegoHunterTelegramBot:
             lines.append("")
             lines.append("<b>Top Picks</b>")
             for idx, row in enumerate(selected, start=1):
-                strength = str(row.get("signal_strength") or "HIGH_CONFIDENCE")
-                badge = "🟢" if strength == "HIGH_CONFIDENCE" else "🟡"
+                strength = str(row.get("signal_strength") or "HIGH_CONFIDENCE_STRICT")
+                is_high_confidence = strength.startswith("HIGH_CONFIDENCE")
+                badge = "🟢" if is_high_confidence else "🟡"
                 set_name = html.escape(str(row.get("set_name") or "n/d"))
                 set_id = html.escape(str(row.get("set_id") or "n/d"))
                 source = html.escape(str(row.get("source") or "unknown"))
@@ -751,7 +753,7 @@ class LegoHunterTelegramBot:
                     lines.append(f"Pattern: {html.escape(pattern_summary)}")
                 lines.append(f"Fonte: {source} | Segnale: {strength}")
                 lines.append(LegoHunterTelegramBot._format_pick_link(row))
-                if strength == "HIGH_CONFIDENCE" and bootstrap_enabled:
+                if strength in {"HIGH_CONFIDENCE", "HIGH_CONFIDENCE_BOOTSTRAP"} and bootstrap_enabled:
                     data_points = int(row.get("forecast_data_points") or metadata.get("forecast_data_points") or 0)
                     if bootstrap_min_history_points > 0 and 0 < data_points < bootstrap_min_history_points:
                         lines.append(

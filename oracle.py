@@ -2835,8 +2835,20 @@ class DiscoveryOracle:
             for row in ranked
             if int(row.get("composite_score") or row.get("ai_investment_score") or 0) >= self.min_composite_score
         ]
-        above_threshold_high_conf = [row for row in above_threshold if self._is_high_confidence_pick(row)]
-        above_threshold_low_conf = [row for row in above_threshold if not self._is_high_confidence_pick(row)]
+        above_threshold_with_strength = [
+            (row, self._high_confidence_signal_strength(row))
+            for row in above_threshold
+        ]
+        above_threshold_high_conf = [
+            (row, strength)
+            for row, strength in above_threshold_with_strength
+            if str(strength).startswith("HIGH_CONFIDENCE")
+        ]
+        above_threshold_low_conf = [
+            row
+            for row, strength in above_threshold_with_strength
+            if str(strength) == "LOW_CONFIDENCE"
+        ]
 
         selected: list[Dict[str, Any]]
         fallback_used = False
@@ -2845,9 +2857,9 @@ class DiscoveryOracle:
             selected = [
                 {
                     **row,
-                    "signal_strength": "HIGH_CONFIDENCE",
+                    "signal_strength": str(strength),
                 }
-                for row in above_threshold_high_conf[:top_limit]
+                for row, strength in above_threshold_high_conf[:top_limit]
             ]
         elif above_threshold_low_conf:
             fallback_used = True
@@ -6987,19 +6999,27 @@ class DiscoveryOracle:
         return not reasons, reasons
 
     def _is_high_confidence_pick(self, row: Dict[str, Any]) -> bool:
+        return self._high_confidence_signal_strength(row).startswith("HIGH_CONFIDENCE")
+
+    def _high_confidence_signal_strength(self, row: Dict[str, Any]) -> str:
         if row.get("ai_fallback_used"):
-            return False
+            return "LOW_CONFIDENCE"
         probability_pct = float(row.get("forecast_probability_upside_12m") or 0.0)
         confidence_score = int(row.get("confidence_score") or 0)
         composite_score = int(row.get("composite_score") or row.get("ai_investment_score") or 0)
-        probability_threshold, confidence_threshold, _bootstrap_active, _points = self._effective_high_confidence_thresholds(row)
+        probability_threshold, confidence_threshold, bootstrap_active, _points = self._effective_high_confidence_thresholds(row)
         historical_ok, _historical_reasons = self._historical_high_confidence_status(row)
-        return (
+        passed = (
             composite_score >= self.min_composite_score
             and probability_pct >= (probability_threshold * 100.0)
             and confidence_score >= confidence_threshold
             and historical_ok
         )
+        if not passed:
+            return "LOW_CONFIDENCE"
+        if bootstrap_active:
+            return "HIGH_CONFIDENCE_BOOTSTRAP"
+        return "HIGH_CONFIDENCE_STRICT"
 
     def _build_low_confidence_note(self, row: Dict[str, Any]) -> str:
         existing = str(row.get("risk_note") or "").strip()

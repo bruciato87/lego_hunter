@@ -693,7 +693,7 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0]["set_id"], "10332")
-        self.assertEqual(selected[0]["signal_strength"], "HIGH_CONFIDENCE")
+        self.assertEqual(selected[0]["signal_strength"], "HIGH_CONFIDENCE_STRICT")
         self.assertEqual(diagnostics["above_threshold_count"], 2)
         self.assertEqual(diagnostics["above_threshold_high_confidence_count"], 1)
         self.assertEqual(diagnostics["above_threshold_low_confidence_count"], 1)
@@ -2435,7 +2435,9 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         }
 
         self.assertTrue(oracle._is_high_confidence_pick(short_history_row))
+        self.assertEqual(oracle._high_confidence_signal_strength(short_history_row), "HIGH_CONFIDENCE_BOOTSTRAP")
         self.assertFalse(oracle._is_high_confidence_pick(long_history_row))
+        self.assertEqual(oracle._high_confidence_signal_strength(long_history_row), "LOW_CONFIDENCE")
 
     def test_low_confidence_note_mentions_bootstrap_when_active(self) -> None:
         repo = FakeRepo()
@@ -2510,6 +2512,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         }
 
         self.assertTrue(oracle._is_high_confidence_pick(row))
+        self.assertEqual(oracle._high_confidence_signal_strength(row), "HIGH_CONFIDENCE_STRICT")
         oracle.adaptive_historical_thresholds_enabled = False
         self.assertFalse(oracle._is_high_confidence_pick(row))
 
