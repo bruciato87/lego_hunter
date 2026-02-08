@@ -10,6 +10,8 @@ Bot Telegram autonomo per discovery e monitoraggio opportunita LEGO con data moa
 - Selezione automatica provider/modello: inventory completo modelli text-capable free-tier + quota-check + scelta del migliore disponibile
 - Garanzia runtime: se Gemini e OpenRouter non hanno quota/API disponibili, passa a `heuristic-ai-v2` (fallback sempre operativo)
 - Ranking predittivo ibrido: `Composite Score` = AI + domanda + forecast quantitativo su serie storiche
+- Prior storico geo-scoped: usa solo evidenze mercato Italia/Europa (configurabile) con weighting per recency
+- Integrazione fonte storica secondaria: BrickLink Price Guide (sold) -> seed CSV regionale per rafforzare il prior
 - Forecast quantitativo: probabilita upside 12 mesi, ROI atteso, intervallo di confidenza, tempo stimato al target ROI
 - Definizione `HIGH_CONFIDENCE`: score sopra soglia + probabilita minima + confidenza dati minima + AI non in fallback
 - Backtesting walk-forward su Data Moat: precision@k, coverage, calibrazione probabilistica (Brier score)
@@ -67,9 +69,16 @@ python bot.py --mode scheduled
 - `BACKTEST_MIN_SELECTED` (opzionale, default `15`)
 - `HISTORICAL_REFERENCE_ENABLED` (opzionale, default `true`)
 - `HISTORICAL_REFERENCE_CASES_PATH` (opzionale, default `data/historical_seed/historical_reference_cases.csv`)
+- `HISTORICAL_BRICKLINK_ENABLED` (opzionale, default `true`)
+- `HISTORICAL_BRICKLINK_CASES_PATH` (opzionale, default `data/historical_seed/bricklink_reference_cases.csv`)
 - `HISTORICAL_REFERENCE_MIN_SAMPLES` (opzionale, default `24`)
 - `HISTORICAL_PRIOR_WEIGHT` (opzionale, default `0.10`, range `0.0-0.35`)
 - `HISTORICAL_PRICE_BAND_TOLERANCE` (opzionale, default `0.45`)
+- `HISTORICAL_ALLOWED_COUNTRIES` (opzionale, default `IT`, CSV ISO-2)
+- `HISTORICAL_ALLOWED_REGIONS` (opzionale, default `EU`, CSV)
+- `HISTORICAL_INCLUDE_UNKNOWN_MARKET` (opzionale, default `true`)
+- `HISTORICAL_RECENCY_HALFLIFE_DAYS` (opzionale, default `900`)
+- `HISTORICAL_RECENCY_MIN_WEIGHT` (opzionale, default `0.20`)
 - `HISTORICAL_QUALITY_GUARD_ENABLED` (opzionale, default `true`)
 - `HISTORICAL_QUALITY_SOFT_GATE_ENABLED` (opzionale, default `true`)
 - `HISTORICAL_QUALITY_MAX_MEDIAN_AGE_YEARS` (opzionale, default `4`)
@@ -107,8 +116,16 @@ Eseguire lo script SQL:
 ## Seed storico (Data Moat bootstrap)
 - Il ranking usa un prior storico da `data/historical_seed/historical_reference_cases.csv`.
 - Il prior non sostituisce i dati live: viene usato come fattore additivo controllato (`HISTORICAL_PRIOR_WEIGHT`) per migliorare la stabilita' dei punteggi nei primi mesi.
+- E' possibile aggiungere una seconda sorgente locale con BrickLink (`data/historical_seed/bricklink_reference_cases.csv`) e passare piu path in `HISTORICAL_REFERENCE_CASES_PATH` separati da virgola.
+- Il prior applica pesi di recency (piu peso ai casi recenti) e filtri geografici (`HISTORICAL_ALLOWED_COUNTRIES`, `HISTORICAL_ALLOWED_REGIONS`).
 - Script di rigenerazione seed: `scripts/build_historical_reference_cases.py`.
+- Script sync BrickLink seed: `scripts/sync_bricklink_price_guide.py`.
 - Lo script legge il dataset raw ZIP in `data/historical_seed/raw/` (non versionato) e produce il CSV finale versionato.
+- Per BrickLink servono 4 secret/env:
+  - `BRICKLINK_CONSUMER_KEY`
+  - `BRICKLINK_CONSUMER_SECRET`
+  - `BRICKLINK_TOKEN_VALUE`
+  - `BRICKLINK_TOKEN_SECRET`
 - Audit qualità seed:
   - `python scripts/audit_historical_reference_cases.py`
   - `python scripts/audit_historical_reference_cases.py --json`

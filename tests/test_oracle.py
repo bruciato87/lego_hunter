@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import os
+import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -228,6 +231,142 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(int(prior.get("sample_size") or 0), 12)
         self.assertGreaterEqual(int(prior.get("prior_score") or 0), 60)
         self.assertEqual(prior.get("match_mode"), "direct")
+
+    def test_historical_market_scope_filter_it_eu(self) -> None:
+        headers = [
+            "set_id",
+            "set_name",
+            "theme",
+            "msrp_usd",
+            "roi_12m_pct",
+            "win_12m",
+            "source_dataset",
+            "pattern_tags",
+            "end_date",
+            "market_country",
+            "market_region",
+        ]
+        rows = [
+            {
+                "set_id": "10001",
+                "set_name": "Italian Case",
+                "theme": "City",
+                "msrp_usd": "20",
+                "roi_12m_pct": "34.5",
+                "win_12m": "1",
+                "source_dataset": "seed_it",
+                "pattern_tags": "[]",
+                "end_date": "2025-12-01",
+                "market_country": "IT",
+                "market_region": "EU",
+            },
+            {
+                "set_id": "10002",
+                "set_name": "US Case",
+                "theme": "City",
+                "msrp_usd": "20",
+                "roi_12m_pct": "41.0",
+                "win_12m": "1",
+                "source_dataset": "seed_us",
+                "pattern_tags": "[]",
+                "end_date": "2025-12-01",
+                "market_country": "US",
+                "market_region": "NA",
+            },
+            {
+                "set_id": "10003",
+                "set_name": "Unknown Scope",
+                "theme": "City",
+                "msrp_usd": "20",
+                "roi_12m_pct": "12.0",
+                "win_12m": "0",
+                "source_dataset": "seed_unknown",
+                "pattern_tags": "[]",
+                "end_date": "2025-12-01",
+                "market_country": "",
+                "market_region": "",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            csv_path = os.path.join(temp_dir, "historical_scope.csv")
+            with open(csv_path, "w", encoding="utf-8", newline="") as fp:
+                writer = csv.DictWriter(fp, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(rows)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "HISTORICAL_REFERENCE_CASES_PATH": csv_path,
+                    "HISTORICAL_ALLOWED_COUNTRIES": "IT",
+                    "HISTORICAL_ALLOWED_REGIONS": "EU",
+                    "HISTORICAL_INCLUDE_UNKNOWN_MARKET": "false",
+                    "HISTORICAL_BRICKLINK_ENABLED": "false",
+                },
+                clear=False,
+            ):
+                oracle = DiscoveryOracle(FakeRepo(), gemini_api_key=None, openrouter_api_key=None)
+
+        loaded_ids = {str(row.get("set_id")) for row in oracle._historical_reference_cases}
+        self.assertEqual(loaded_ids, {"10001"})
+        self.assertEqual(int(oracle._historical_market_filter_stats.get("rows_loaded") or 0), 1)
+        self.assertEqual(int(oracle._historical_market_filter_stats.get("rows_skipped_market_scope") or 0), 2)
+
+    def test_historical_prior_recency_weight_prefers_recent_cases(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_reference_min_samples = 20
+        oracle.historical_recency_halflife_days = 900
+        oracle.historical_recency_min_weight = 0.20
+        oracle._historical_reference_cases = []
+
+        for idx in range(15):
+            row = {
+                "set_id": str(95000 + idx),
+                "theme": "Marvel",
+                "theme_norm": "marvel",
+                "set_name": f"Old {idx}",
+                "msrp_usd": 60.0,
+                "roi_12m_pct": -30.0,
+                "win_12m": 0,
+                "source_dataset": "legacy_old",
+                "pattern_tags": "[]",
+                "end_date": "2018-01-01",
+                "observation_months": 24,
+            }
+            row["resolved_weight"] = oracle._historical_case_weight(row)
+            oracle._historical_reference_cases.append(row)
+
+        for idx in range(10):
+            row = {
+                "set_id": str(96000 + idx),
+                "theme": "Marvel",
+                "theme_norm": "marvel",
+                "set_name": f"Recent {idx}",
+                "msrp_usd": 60.0,
+                "roi_12m_pct": 70.0,
+                "win_12m": 1,
+                "source_dataset": "bricklink_priceguide_sold_it",
+                "pattern_tags": "[]",
+                "end_date": datetime.now(timezone.utc).date().isoformat(),
+                "observation_months": 6,
+            }
+            row["resolved_weight"] = oracle._historical_case_weight(row)
+            oracle._historical_reference_cases.append(row)
+
+        candidate = {
+            "set_id": "76281",
+            "set_name": "X-Jet di X-Men",
+            "theme": "Marvel",
+            "source": "lego_proxy_reader",
+            "current_price": 59.99,
+        }
+        prior = oracle._historical_prior_for_candidate(candidate)
+        self.assertIsNotNone(prior)
+        assert prior is not None
+        self.assertGreater(float(prior.get("avg_roi_12m_pct") or 0.0), 0.0)
+        self.assertLess(float(prior.get("effective_sample_size") or 0.0), float(prior.get("sample_size") or 0.0))
 
     def test_historical_prior_alias_mapping_marvel_to_super_heroes(self) -> None:
         repo = FakeRepo()

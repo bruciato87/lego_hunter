@@ -117,10 +117,16 @@ DEFAULT_AI_TOP_PICK_RESCUE_TIMEOUT_SEC = 9.0
 DEFAULT_AI_FINAL_PICK_GUARANTEE_COUNT = 3
 DEFAULT_AI_FINAL_PICK_GUARANTEE_ROUNDS = 2
 DEFAULT_HISTORICAL_REFERENCE_CASES_PATH = "data/historical_seed/historical_reference_cases.csv"
+DEFAULT_HISTORICAL_BRICKLINK_CASES_PATH = "data/historical_seed/bricklink_reference_cases.csv"
 DEFAULT_HISTORICAL_REFERENCE_ENABLED = True
 DEFAULT_HISTORICAL_REFERENCE_MIN_SAMPLES = 24
 DEFAULT_HISTORICAL_PRIOR_WEIGHT = 0.10
 DEFAULT_HISTORICAL_PRICE_BAND_TOLERANCE = 0.45
+DEFAULT_HISTORICAL_ALLOWED_COUNTRIES = "IT"
+DEFAULT_HISTORICAL_ALLOWED_REGIONS = "EU"
+DEFAULT_HISTORICAL_INCLUDE_UNKNOWN_MARKET = True
+DEFAULT_HISTORICAL_RECENCY_HALFLIFE_DAYS = 900
+DEFAULT_HISTORICAL_RECENCY_MIN_WEIGHT = 0.20
 DEFAULT_HISTORY_WINDOW_DAYS = 180
 DEFAULT_BACKTEST_LOOKBACK_DAYS = 365
 DEFAULT_BACKTEST_HORIZON_DAYS = 180
@@ -218,6 +224,11 @@ SPACE_STEM_KEYWORDS = (
 )
 ART_DISPLAY_THEMES = {"Art", "Ideas", "Icons", "Botanicals", "Architecture"}
 LEGO_PRIMARY_SOURCES = {"lego_retiring", "lego_proxy_reader", "lego_http_fallback"}
+EUROPE_MARKET_COUNTRY_CODES = {
+    "IT", "DE", "FR", "ES", "PT", "NL", "BE", "LU", "AT", "IE", "PL", "CZ", "SK", "HU", "SI", "HR", "RO",
+    "BG", "GR", "CY", "MT", "DK", "SE", "FI", "EE", "LV", "LT",
+    "NO", "IS", "CH", "GB", "UK",
+}
 HISTORICAL_THEME_ALIASES = {
     "marvel": ("super heroes", "batman"),
     "super heroes": ("marvel", "batman"),
@@ -559,9 +570,51 @@ class DiscoveryOracle:
             "HISTORICAL_REFERENCE_ENABLED",
             default=DEFAULT_HISTORICAL_REFERENCE_ENABLED,
         )
-        self.historical_reference_path = (
-            os.getenv("HISTORICAL_REFERENCE_CASES_PATH") or DEFAULT_HISTORICAL_REFERENCE_CASES_PATH
+        reference_paths_raw = (
+            os.getenv("HISTORICAL_REFERENCE_CASES_PATH")
+            or DEFAULT_HISTORICAL_REFERENCE_CASES_PATH
         ).strip()
+        self.historical_reference_paths = self._split_env_csv(reference_paths_raw)
+        if not self.historical_reference_paths:
+            self.historical_reference_paths = [DEFAULT_HISTORICAL_REFERENCE_CASES_PATH]
+        self.historical_bricklink_enabled = self._safe_env_bool(
+            "HISTORICAL_BRICKLINK_ENABLED",
+            default=True,
+        )
+        self.historical_bricklink_cases_path = (
+            os.getenv("HISTORICAL_BRICKLINK_CASES_PATH") or DEFAULT_HISTORICAL_BRICKLINK_CASES_PATH
+        ).strip()
+        if (
+            self.historical_bricklink_enabled
+            and self.historical_bricklink_cases_path
+            and self.historical_bricklink_cases_path not in self.historical_reference_paths
+            and Path(self.historical_bricklink_cases_path).exists()
+        ):
+            self.historical_reference_paths.append(self.historical_bricklink_cases_path)
+        self.historical_allowed_countries = self._split_env_csv(
+            os.getenv("HISTORICAL_ALLOWED_COUNTRIES") or DEFAULT_HISTORICAL_ALLOWED_COUNTRIES,
+            upper=True,
+        )
+        self.historical_allowed_regions = self._split_env_csv(
+            os.getenv("HISTORICAL_ALLOWED_REGIONS") or DEFAULT_HISTORICAL_ALLOWED_REGIONS,
+            upper=True,
+        )
+        self.historical_include_unknown_market = self._safe_env_bool(
+            "HISTORICAL_INCLUDE_UNKNOWN_MARKET",
+            default=DEFAULT_HISTORICAL_INCLUDE_UNKNOWN_MARKET,
+        )
+        self.historical_recency_halflife_days = self._safe_env_int(
+            "HISTORICAL_RECENCY_HALFLIFE_DAYS",
+            default=DEFAULT_HISTORICAL_RECENCY_HALFLIFE_DAYS,
+            minimum=30,
+            maximum=3650,
+        )
+        self.historical_recency_min_weight = self._safe_env_float(
+            "HISTORICAL_RECENCY_MIN_WEIGHT",
+            default=DEFAULT_HISTORICAL_RECENCY_MIN_WEIGHT,
+            minimum=0.01,
+            maximum=1.0,
+        )
         self.historical_reference_min_samples = self._safe_env_int(
             "HISTORICAL_REFERENCE_MIN_SAMPLES",
             default=DEFAULT_HISTORICAL_REFERENCE_MIN_SAMPLES,
@@ -790,6 +843,7 @@ class DiscoveryOracle:
         self._historical_reference_cases: list[Dict[str, Any]] = []
         self._historical_quality_profile: Dict[str, Any] = {}
         self._adaptive_historical_thresholds: Dict[str, Any] = {}
+        self._historical_market_filter_stats: Dict[str, Any] = {}
         self.ai_runtime = {
             "engine": "local_ai",
             "provider": "local",
@@ -945,10 +999,15 @@ class DiscoveryOracle:
             self.threshold_profile,
         )
         LOGGER.info(
-            "Historical prior tuning | enabled=%s cases=%s path=%s min_samples=%s weight=%.2f price_tolerance=%.2f high_conf_required=%s high_conf_min_samples=%s high_conf_min_win_rate_pct=%.1f high_conf_min_support_confidence=%s high_conf_min_prior_score=%s adaptive_active=%s adaptive_effective={samples:%s,win_rate:%.1f,support:%s,prior:%s}",
+            "Historical prior tuning | enabled=%s cases=%s paths=%s market_countries=%s market_regions=%s include_unknown=%s recency_halflife_days=%s recency_min_weight=%.2f min_samples=%s weight=%.2f price_tolerance=%.2f high_conf_required=%s high_conf_min_samples=%s high_conf_min_win_rate_pct=%.1f high_conf_min_support_confidence=%s high_conf_min_prior_score=%s adaptive_active=%s adaptive_effective={samples:%s,win_rate:%.1f,support:%s,prior:%s}",
             self.historical_reference_enabled,
             len(self._historical_reference_cases),
-            self.historical_reference_path,
+            ",".join(self.historical_reference_paths),
+            ",".join(self.historical_allowed_countries) or "*",
+            ",".join(self.historical_allowed_regions) or "*",
+            self.historical_include_unknown_market,
+            self.historical_recency_halflife_days,
+            self.historical_recency_min_weight,
             self.historical_reference_min_samples,
             self.historical_prior_weight,
             self.historical_price_band_tolerance,
@@ -1255,6 +1314,18 @@ class DiscoveryOracle:
             return False
         LOGGER.warning("Invalid bool env %s=%r. Using default=%s.", name, raw, default)
         return default
+
+    @staticmethod
+    def _split_env_csv(raw_value: Optional[str], *, upper: bool = False) -> list[str]:
+        if raw_value is None:
+            return []
+        values = []
+        for chunk in str(raw_value).split(","):
+            value = chunk.strip()
+            if not value:
+                continue
+            values.append(value.upper() if upper else value)
+        return values
 
     @staticmethod
     def _provider_health_key(provider: str) -> str:
@@ -2926,6 +2997,10 @@ class DiscoveryOracle:
             "historical_quality": dict(self._historical_quality_profile or {}),
             "historical_quality_guard_enabled": self.historical_quality_guard_enabled,
             "historical_quality_soft_gate_enabled": self.historical_quality_soft_gate_enabled,
+            "historical_allowed_countries": list(self.historical_allowed_countries),
+            "historical_allowed_regions": list(self.historical_allowed_regions),
+            "historical_include_unknown_market": self.historical_include_unknown_market,
+            "historical_market_filter": dict(self._historical_market_filter_stats or {}),
             "threshold_profile": dict(self.threshold_profile),
             "source_strategy": source_diagnostics.get("source_strategy"),
             "source_order": source_diagnostics.get("source_order", []),
@@ -3396,6 +3471,11 @@ class DiscoveryOracle:
                     "ai_shortlisted": bool(row.get("ai_shortlisted")),
                     "historical_prior_score": historical_score,
                     "historical_sample_size": int(historical_prior.get("sample_size") or 0) if historical_prior else 0,
+                    "historical_effective_sample_size": (
+                        round(float(historical_prior.get("effective_sample_size") or 0.0), 2)
+                        if historical_prior
+                        else 0.0
+                    ),
                     "historical_avg_roi_12m_pct": (
                         round(float(historical_prior.get("avg_roi_12m_pct") or 0.0), 2)
                         if historical_prior
@@ -3440,6 +3520,9 @@ class DiscoveryOracle:
             payload["ai_shortlisted"] = bool(row.get("ai_shortlisted"))
             payload["historical_prior_score"] = historical_score
             payload["historical_sample_size"] = int(historical_prior.get("sample_size") or 0) if historical_prior else 0
+            payload["historical_effective_sample_size"] = (
+                round(float(historical_prior.get("effective_sample_size") or 0.0), 2) if historical_prior else 0.0
+            )
             payload["historical_avg_roi_12m_pct"] = (
                 round(float(historical_prior.get("avg_roi_12m_pct") or 0.0), 2) if historical_prior else None
             )
@@ -4763,47 +4846,189 @@ class DiscoveryOracle:
 
         return profile
 
+    @staticmethod
+    def _normalize_market_country_code(value: Any) -> str:
+        text = str(value or "").strip().upper()
+        if len(text) == 2 and text.isalpha():
+            return text
+        return ""
+
+    @classmethod
+    def _normalize_market_region(cls, value: Any, *, market_country: str = "") -> str:
+        raw = str(value or "").strip().upper()
+        normalized = raw
+        if raw in {"EUROPE", "EUROPA", "EU", "EEA", "EMEA"}:
+            normalized = "EU"
+        elif raw in {"WORLD", "GLOBAL", "INTL", "INTERNATIONAL"}:
+            normalized = "GLOBAL"
+        if not normalized and market_country in EUROPE_MARKET_COUNTRY_CODES:
+            normalized = "EU"
+        return normalized
+
+    def _historical_market_allowed(self, market_country: str, market_region: str) -> bool:
+        country = self._normalize_market_country_code(market_country)
+        region = self._normalize_market_region(market_region, market_country=country)
+        if country and self.historical_allowed_countries and country in set(self.historical_allowed_countries):
+            return True
+        if region and self.historical_allowed_regions and region in set(self.historical_allowed_regions):
+            return True
+        if country or region:
+            if self.historical_allowed_countries or self.historical_allowed_regions:
+                return False
+            return True
+        return bool(self.historical_include_unknown_market)
+
+    def _historical_case_weight(
+        self,
+        row: Dict[str, Any],
+        *,
+        now_utc: Optional[datetime] = None,
+    ) -> float:
+        now_dt = now_utc or datetime.now(timezone.utc)
+        weight = 1.0
+
+        base_weight_raw = row.get("case_weight")
+        try:
+            base_weight = float(base_weight_raw) if base_weight_raw not in (None, "") else 1.0
+        except (TypeError, ValueError):
+            base_weight = 1.0
+        weight *= max(0.1, min(3.0, base_weight))
+
+        explicit_recency_raw = row.get("recency_weight")
+        try:
+            explicit_recency = float(explicit_recency_raw) if explicit_recency_raw not in (None, "") else 1.0
+        except (TypeError, ValueError):
+            explicit_recency = 1.0
+        weight *= max(0.1, min(2.0, explicit_recency))
+
+        end_date_text = str(row.get("end_date") or "").strip()
+        age_multiplier = float(self.historical_recency_min_weight)
+        if end_date_text:
+            try:
+                end_dt = datetime.fromisoformat(end_date_text.replace("Z", "+00:00"))
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=timezone.utc)
+                age_days = max(0.0, (now_dt - end_dt).total_seconds() / 86400.0)
+                half_life_days = max(30.0, float(self.historical_recency_halflife_days))
+                decay = 2.0 ** (-age_days / half_life_days)
+                age_multiplier = max(float(self.historical_recency_min_weight), min(1.0, decay))
+            except ValueError:
+                age_multiplier = float(self.historical_recency_min_weight)
+        weight *= age_multiplier
+
+        observation_months_raw = row.get("observation_months")
+        try:
+            observation_months = int(observation_months_raw) if observation_months_raw not in (None, "") else 0
+        except (TypeError, ValueError):
+            observation_months = 0
+        if 0 < observation_months < 12:
+            horizon_factor = max(0.55, min(1.0, float(observation_months) / 12.0))
+            weight *= horizon_factor
+
+        return max(0.05, min(3.0, float(weight)))
+
+    @staticmethod
+    def _weighted_mean(values: list[float], weights: list[float]) -> float:
+        if not values:
+            return 0.0
+        if len(values) != len(weights):
+            return float(statistics.fmean(values))
+        positive_weights = [max(0.0, float(weight)) for weight in weights]
+        total_weight = float(sum(positive_weights))
+        if total_weight <= 0:
+            return float(statistics.fmean(values))
+        return float(sum(value * weight for value, weight in zip(values, positive_weights)) / total_weight)
+
+    @classmethod
+    def _weighted_stddev(cls, values: list[float], weights: list[float]) -> float:
+        if len(values) <= 1:
+            return 0.0
+        mean = cls._weighted_mean(values, weights)
+        positive_weights = [max(0.0, float(weight)) for weight in weights]
+        total_weight = float(sum(positive_weights))
+        if total_weight <= 0:
+            return float(statistics.pstdev(values))
+        variance = sum(weight * ((value - mean) ** 2) for value, weight in zip(values, positive_weights)) / total_weight
+        return float(math.sqrt(max(0.0, variance)))
+
     def _load_historical_reference_cases(self) -> list[Dict[str, Any]]:
         if not self.historical_reference_enabled:
+            self._historical_market_filter_stats = {"enabled": False}
             return []
-        path = Path(self.historical_reference_path)
-        if not path.exists():
-            LOGGER.warning("Historical reference cases file not found: %s", path)
+
+        paths = [Path(item) for item in self.historical_reference_paths if str(item).strip()]
+        if not paths:
+            self._historical_market_filter_stats = {"enabled": True, "paths": [], "rows_loaded": 0}
             return []
 
         cases: list[Dict[str, Any]] = []
-        try:
-            with path.open("r", encoding="utf-8", newline="") as fp:
-                reader = csv.DictReader(fp)
-                for row in reader:
-                    set_id = str(row.get("set_id") or "").strip()
-                    if not set_id:
-                        continue
-                    theme = str(row.get("theme") or "").strip() or "Unknown"
-                    roi_12m_raw = row.get("roi_12m_pct")
-                    try:
-                        roi_12m = float(roi_12m_raw) if roi_12m_raw not in (None, "") else None
-                    except (TypeError, ValueError):
-                        roi_12m = None
-                    if roi_12m is None:
-                        continue
+        stats = {
+            "enabled": True,
+            "paths": [str(path) for path in paths],
+            "rows_total": 0,
+            "rows_loaded": 0,
+            "rows_skipped_missing_id": 0,
+            "rows_skipped_missing_roi": 0,
+            "rows_skipped_market_scope": 0,
+            "missing_paths": [],
+        }
 
-                    msrp_raw = row.get("msrp_usd")
-                    try:
-                        msrp = float(msrp_raw) if msrp_raw not in (None, "") else None
-                    except (TypeError, ValueError):
-                        msrp = None
+        for path in paths:
+            if not path.exists():
+                stats["missing_paths"].append(str(path))
+                continue
 
-                    win_12m_raw = row.get("win_12m")
-                    try:
-                        win_12m = int(win_12m_raw) if win_12m_raw not in (None, "") else None
-                    except (TypeError, ValueError):
-                        win_12m = None
-                    if win_12m is None:
-                        win_12m = int(roi_12m >= float(self.target_roi_pct))
+            try:
+                with path.open("r", encoding="utf-8", newline="") as fp:
+                    reader = csv.DictReader(fp)
+                    for row in reader:
+                        stats["rows_total"] += 1
+                        set_id = str(row.get("set_id") or "").strip()
+                        if not set_id:
+                            stats["rows_skipped_missing_id"] += 1
+                            continue
+                        theme = str(row.get("theme") or "").strip() or "Unknown"
+                        roi_12m_raw = row.get("roi_12m_pct")
+                        try:
+                            roi_12m = float(roi_12m_raw) if roi_12m_raw not in (None, "") else None
+                        except (TypeError, ValueError):
+                            roi_12m = None
+                        if roi_12m is None:
+                            stats["rows_skipped_missing_roi"] += 1
+                            continue
 
-                    cases.append(
-                        {
+                        market_country = self._normalize_market_country_code(
+                            row.get("market_country") or row.get("country_code")
+                        )
+                        market_region = self._normalize_market_region(
+                            row.get("market_region") or row.get("market_scope"),
+                            market_country=market_country,
+                        )
+                        if not self._historical_market_allowed(market_country, market_region):
+                            stats["rows_skipped_market_scope"] += 1
+                            continue
+
+                        msrp_raw = row.get("msrp_usd")
+                        try:
+                            msrp = float(msrp_raw) if msrp_raw not in (None, "") else None
+                        except (TypeError, ValueError):
+                            msrp = None
+
+                        win_12m_raw = row.get("win_12m")
+                        try:
+                            win_12m = int(win_12m_raw) if win_12m_raw not in (None, "") else None
+                        except (TypeError, ValueError):
+                            win_12m = None
+                        if win_12m is None:
+                            win_12m = int(roi_12m >= float(self.target_roi_pct))
+
+                        observation_months_raw = row.get("observation_months")
+                        try:
+                            observation_months = int(observation_months_raw) if observation_months_raw not in (None, "") else 0
+                        except (TypeError, ValueError):
+                            observation_months = 0
+
+                        case: Dict[str, Any] = {
                             "set_id": set_id,
                             "theme": theme,
                             "theme_norm": self._normalize_theme_key(theme),
@@ -4815,11 +5040,52 @@ class DiscoveryOracle:
                             "pattern_tags": str(row.get("pattern_tags") or "").strip(),
                             "pattern_tags_list": self._parse_pattern_tags(row.get("pattern_tags")),
                             "end_date": str(row.get("end_date") or "").strip(),
+                            "observation_months": observation_months,
+                            "market_country": market_country,
+                            "market_region": market_region,
                         }
-                    )
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Historical reference cases load failed: %s", exc)
-            return []
+
+                        recency_weight_raw = row.get("recency_weight")
+                        try:
+                            recency_weight = (
+                                float(recency_weight_raw)
+                                if recency_weight_raw not in (None, "")
+                                else None
+                            )
+                        except (TypeError, ValueError):
+                            recency_weight = None
+                        if recency_weight is not None:
+                            case["recency_weight"] = recency_weight
+
+                        case_weight_raw = row.get("case_weight")
+                        try:
+                            case_weight = (
+                                float(case_weight_raw)
+                                if case_weight_raw not in (None, "")
+                                else None
+                            )
+                        except (TypeError, ValueError):
+                            case_weight = None
+                        if case_weight is not None:
+                            case["case_weight"] = case_weight
+
+                        case["resolved_weight"] = self._historical_case_weight(case)
+                        cases.append(case)
+                        stats["rows_loaded"] += 1
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Historical reference cases load failed | path=%s error=%s", path, exc)
+
+        if stats.get("missing_paths"):
+            LOGGER.warning("Historical reference paths not found: %s", stats.get("missing_paths"))
+        if not cases:
+            LOGGER.warning(
+                "Historical reference loaded 0 rows after filters | countries=%s regions=%s include_unknown=%s",
+                ",".join(self.historical_allowed_countries) or "*",
+                ",".join(self.historical_allowed_regions) or "*",
+                self.historical_include_unknown_market,
+            )
+
+        self._historical_market_filter_stats = stats
         return cases
 
     @staticmethod
@@ -4843,28 +5109,38 @@ class DiscoveryOracle:
         return (ordered[lower] * (1.0 - weight)) + (ordered[upper] * weight)
 
     def _cohort_historical_strength(self, cases: list[Dict[str, Any]]) -> Optional[Dict[str, float]]:
-        rois = [float(row["roi_12m_pct"]) for row in cases if row.get("roi_12m_pct") is not None]
-        if len(rois) < 3:
+        scored_rows = [
+            row
+            for row in cases
+            if row.get("roi_12m_pct") is not None
+        ]
+        if len(scored_rows) < 3:
             return None
 
-        wins = [
-            int(row.get("win_12m"))
-            for row in cases
-            if row.get("win_12m") in (0, 1)
-        ]
+        rois = [float(row["roi_12m_pct"]) for row in scored_rows]
+        weights = [float(row.get("resolved_weight") or self._historical_case_weight(row)) for row in scored_rows]
+        weighted_wins = []
+        for row, roi in zip(scored_rows, rois):
+            if row.get("win_12m") in (0, 1):
+                weighted_wins.append(int(row.get("win_12m")))
+            else:
+                weighted_wins.append(1 if roi >= float(self.target_roi_pct) else 0)
+
         sample_size = len(rois)
-        avg_roi = float(statistics.fmean(rois))
-        win_rate = float(statistics.fmean(wins)) if wins else float(
-            statistics.fmean([1 if roi >= float(self.target_roi_pct) else 0 for roi in rois])
-        )
-        roi_stdev = float(statistics.pstdev(rois)) if len(rois) > 1 else 0.0
+        effective_sample_size = float(sum(max(0.0, weight) for weight in weights))
+        avg_roi = self._weighted_mean(rois, weights)
+        win_rate = self._weighted_mean([float(value) for value in weighted_wins], weights)
+        roi_stdev = self._weighted_stddev(rois, weights)
         roi_component = self._clamp_score(50.0 + (avg_roi * 0.85))
         win_component = self._clamp_score(win_rate * 100.0)
-        sample_bonus = min(10.0, math.log2(sample_size + 1.0) * 2.0)
+        sample_bonus = min(10.0, math.log2(effective_sample_size + 1.0) * 2.0)
         prior_score = self._clamp_score((0.55 * win_component) + (0.45 * roi_component) + sample_bonus - 5.0)
-        support_confidence = self._clamp_score(35.0 + (math.log2(sample_size + 1.0) * 12.0) - min(25.0, roi_stdev * 0.25))
+        support_confidence = self._clamp_score(
+            35.0 + (math.log2(effective_sample_size + 1.0) * 12.0) - min(25.0, roi_stdev * 0.25)
+        )
         return {
-            "sample_size": float(sample_size),
+            "sample_size": float(effective_sample_size),
+            "raw_sample_size": float(sample_size),
             "win_rate_pct": float(win_rate * 100.0),
             "support_confidence": float(support_confidence),
             "prior_score": float(prior_score),
@@ -5046,28 +5322,42 @@ class DiscoveryOracle:
             if len(price_band_cases) >= int(self.historical_reference_min_samples):
                 selected = price_band_cases
 
-        rois = [float(row["roi_12m_pct"]) for row in selected if row.get("roi_12m_pct") is not None]
+        scored_rows = [
+            row
+            for row in selected
+            if row.get("roi_12m_pct") is not None
+        ]
+        rois = [float(row["roi_12m_pct"]) for row in scored_rows]
         if len(rois) < min_required_for_prior:
             return None
 
-        wins = [
-            int(row.get("win_12m"))
-            for row in selected
-            if row.get("win_12m") in (0, 1)
-        ]
+        weights = [float(row.get("resolved_weight") or self._historical_case_weight(row)) for row in scored_rows]
+        weighted_wins = []
+        for row, roi in zip(scored_rows, rois):
+            if row.get("win_12m") in (0, 1):
+                weighted_wins.append(int(row.get("win_12m")))
+            else:
+                weighted_wins.append(1 if roi >= float(self.target_roi_pct) else 0)
+
         sample_size = len(rois)
-        avg_roi = float(statistics.fmean(rois))
+        effective_sample_size = float(sum(max(0.0, weight) for weight in weights))
+        avg_roi = self._weighted_mean(rois, weights)
         median_roi = float(statistics.median(rois))
-        win_rate = float(statistics.fmean(wins)) if wins else float(
-            statistics.fmean([1 if roi >= float(self.target_roi_pct) else 0 for roi in rois])
-        )
-        roi_stdev = float(statistics.pstdev(rois)) if len(rois) > 1 else 0.0
+        win_rate = self._weighted_mean([float(value) for value in weighted_wins], weights)
+        roi_stdev = self._weighted_stddev(rois, weights)
 
         roi_component = self._clamp_score(50.0 + (avg_roi * 0.85))
         win_component = self._clamp_score(win_rate * 100.0)
-        sample_bonus = min(10.0, math.log2(sample_size + 1.0) * 2.0)
+        sample_bonus = min(10.0, math.log2(effective_sample_size + 1.0) * 2.0)
         prior_score = self._clamp_score((0.55 * win_component) + (0.45 * roi_component) + sample_bonus - 5.0)
-        support_confidence = self._clamp_score(35.0 + (math.log2(sample_size + 1.0) * 12.0) - min(25.0, roi_stdev * 0.25))
+        support_confidence = self._clamp_score(
+            35.0 + (math.log2(effective_sample_size + 1.0) * 12.0) - min(25.0, roi_stdev * 0.25)
+        )
+        source_counter = Counter(
+            str(row.get("source_dataset") or "historical_reference_cases")
+            for row in scored_rows
+        )
+        dominant_source = source_counter.most_common(1)[0][0] if source_counter else "historical_reference_cases"
 
         return {
             "theme": theme,
@@ -5075,13 +5365,14 @@ class DiscoveryOracle:
             "matched_theme_keys": matched_theme_keys,
             "theme_case_count": len(theme_cases),
             "sample_size": sample_size,
+            "effective_sample_size": round(effective_sample_size, 2),
             "avg_roi_12m_pct": round(avg_roi, 4),
             "median_roi_12m_pct": round(median_roi, 4),
             "win_rate_12m": round(win_rate, 4),
             "roi_stddev_12m_pct": round(roi_stdev, 4),
             "prior_score": int(round(prior_score)),
             "support_confidence": int(round(support_confidence)),
-            "source": "historical_reference_cases",
+            "source": dominant_source,
         }
 
     def _load_history_by_set(self, set_ids: list[str]) -> Dict[str, list[Dict[str, Any]]]:

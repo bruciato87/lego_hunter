@@ -728,6 +728,9 @@ class LegoHunterTelegramBot:
                 historical_support_confidence = row.get("historical_support_confidence")
                 if historical_support_confidence is None:
                     historical_support_confidence = metadata.get("historical_support_confidence")
+                historical_effective_sample = row.get("historical_effective_sample_size")
+                if historical_effective_sample is None:
+                    historical_effective_sample = metadata.get("historical_effective_sample_size")
 
                 if historical_sample_size > 0:
                     try:
@@ -742,12 +745,21 @@ class LegoHunterTelegramBot:
                         historical_support_value = int(historical_support_confidence or 0)
                     except (TypeError, ValueError):
                         historical_support_value = 0
+                    try:
+                        historical_effective_value = float(historical_effective_sample or 0.0)
+                    except (TypeError, ValueError):
+                        historical_effective_value = 0.0
+                    effective_label = (
+                        f" | Eff {historical_effective_value:.1f}"
+                        if historical_effective_value > 0
+                        else ""
+                    )
                     lines.append(
                         "Storico: "
                         f"{historical_sample_size} campioni | "
                         f"Win-rate 12m {historical_win_rate_value:.1f}% | "
                         f"Prior {historical_prior_value}/100 | "
-                        f"Supporto {historical_support_value}/100"
+                        f"Supporto {historical_support_value}/100{effective_label}"
                     )
                 if pattern_summary:
                     lines.append(f"Pattern: {html.escape(pattern_summary)}")
@@ -828,6 +840,27 @@ class LegoHunterTelegramBot:
                 f"📚 Gate storico ({adaptive_badge}): campioni>={eff_hist_samples} | "
                 f"Win-rate>={eff_hist_win_rate:.0f}% | Supporto>={eff_hist_support} | Prior>={eff_hist_prior}"
             )
+        hist_countries = diagnostics.get("historical_allowed_countries")
+        hist_regions = diagnostics.get("historical_allowed_regions")
+        hist_unknown = bool(diagnostics.get("historical_include_unknown_market"))
+        hist_filter = diagnostics.get("historical_market_filter")
+        if isinstance(hist_countries, list) or isinstance(hist_regions, list):
+            countries_label = ",".join(str(item) for item in (hist_countries or [])) or "*"
+            regions_label = ",".join(str(item) for item in (hist_regions or [])) or "*"
+            if isinstance(hist_filter, dict):
+                loaded = int(hist_filter.get("rows_loaded") or 0)
+                total = int(hist_filter.get("rows_total") or 0)
+                skipped_scope = int(hist_filter.get("rows_skipped_market_scope") or 0)
+                lines.append(
+                    "🌍 Scope storico: "
+                    f"country={countries_label} region={regions_label} unknown={'si' if hist_unknown else 'no'} | "
+                    f"load {loaded}/{total} (scartati scope {skipped_scope})"
+                )
+            else:
+                lines.append(
+                    "🌍 Scope storico: "
+                    f"country={countries_label} region={regions_label} unknown={'si' if hist_unknown else 'no'}"
+                )
         historical_quality = diagnostics.get("historical_quality")
         if isinstance(historical_quality, dict) and historical_quality:
             quality_tier = str(historical_quality.get("tier") or "n/d").upper()
