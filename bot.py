@@ -826,6 +826,31 @@ class LegoHunterTelegramBot:
                 f"📚 Gate storico ({adaptive_badge}): campioni>={eff_hist_samples} | "
                 f"Win-rate>={eff_hist_win_rate:.0f}% | Supporto>={eff_hist_support} | Prior>={eff_hist_prior}"
             )
+        historical_quality = diagnostics.get("historical_quality")
+        if isinstance(historical_quality, dict) and historical_quality:
+            quality_tier = str(historical_quality.get("tier") or "n/d").upper()
+            degraded = bool(historical_quality.get("degraded"))
+            median_age = historical_quality.get("median_age_years")
+            theme_count = historical_quality.get("theme_count")
+            median_age_label = str(median_age) if median_age is not None else "n/d"
+            theme_count_label = str(theme_count) if theme_count is not None else "n/d"
+            max_age = (
+                historical_quality.get("guards", {}).get("max_median_age_years")
+                if isinstance(historical_quality.get("guards"), dict)
+                else None
+            )
+            max_age_label = str(max_age) if max_age is not None else "n/d"
+            if degraded:
+                lines.append(
+                    "🧱 Seed storico: "
+                    f"{quality_tier} (mediana eta' {median_age_label}y/{max_age_label}y, temi {theme_count_label}) "
+                    "-> quality-aware gate attivo."
+                )
+            else:
+                lines.append(
+                    "🧱 Seed storico: "
+                    f"{quality_tier} (mediana eta' {median_age_label}y, temi {theme_count_label})."
+                )
         if bootstrap_enabled:
             bootstrap_rows_count = int(diagnostics.get("bootstrap_rows_count") or 0)
             bootstrap_status = "attivo" if bootstrap_rows_count > 0 else "abilitato (non attivo nel ciclo)"

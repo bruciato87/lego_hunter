@@ -2463,6 +2463,8 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
     def test_adaptive_historical_thresholds_relax_gate_using_reference_distribution(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_quality_guard_enabled = False
+        oracle.historical_quality_soft_gate_enabled = False
         oracle.historical_high_conf_required = True
         oracle.historical_high_conf_min_samples = 24
         oracle.historical_high_conf_min_win_rate_pct = 56.0
@@ -2514,6 +2516,8 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
     def test_high_confidence_requires_historical_evidence(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_quality_guard_enabled = False
+        oracle.historical_quality_soft_gate_enabled = False
         oracle.adaptive_historical_thresholds_enabled = False
         oracle.historical_high_conf_required = True
         oracle.historical_high_conf_min_samples = 24
@@ -2544,6 +2548,8 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
     def test_high_confidence_passes_when_historical_evidence_is_strong(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_quality_guard_enabled = False
+        oracle.historical_quality_soft_gate_enabled = False
         oracle.adaptive_historical_thresholds_enabled = False
         oracle.historical_high_conf_required = True
         oracle.historical_high_conf_min_samples = 24
@@ -2572,6 +2578,8 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
     def test_contextual_historical_gate_relaxes_threshold_for_strong_pattern(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_quality_guard_enabled = False
+        oracle.historical_quality_soft_gate_enabled = False
         oracle.adaptive_historical_thresholds_enabled = False
         oracle.historical_high_conf_required = True
         oracle.historical_high_conf_min_samples = 24
@@ -2612,6 +2620,8 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
     def test_contextual_historical_gate_does_not_relax_weak_pattern(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_quality_guard_enabled = False
+        oracle.historical_quality_soft_gate_enabled = False
         oracle.adaptive_historical_thresholds_enabled = False
         oracle.historical_high_conf_required = True
         oracle.historical_high_conf_min_samples = 24
@@ -2646,6 +2656,63 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertFalse(oracle._is_high_confidence_pick(row))
         note = oracle._build_low_confidence_note(row)
         self.assertIn("Win-rate storico 12m sotto soglia", note)
+
+    def test_historical_quality_report_flags_stale_and_generic_seed(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+
+        synthetic = []
+        for idx in range(30):
+            synthetic.append(
+                {
+                    "set_id": str(99000 + idx),
+                    "theme_norm": "star wars" if idx % 2 == 0 else "city",
+                    "roi_12m_pct": 5.0,
+                    "win_12m": 0,
+                    "end_date": "2018-04-01",
+                    "pattern_tags": '["general_collectible"]',
+                    "pattern_tags_list": ["general_collectible"],
+                }
+            )
+
+        profile = oracle._evaluate_historical_reference_quality(synthetic)
+        self.assertTrue(bool(profile.get("degraded")))
+        issues = " ".join(profile.get("issues") or [])
+        self.assertIn("seed_datato", issues)
+        self.assertIn("pattern_generico", issues)
+
+    def test_historical_quality_soft_gate_allows_zero_sample_when_seed_is_degraded(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.adaptive_historical_thresholds_enabled = False
+        oracle.historical_high_conf_required = True
+        oracle.historical_quality_guard_enabled = True
+        oracle.historical_quality_soft_gate_enabled = True
+        oracle._historical_quality_profile = {
+            "degraded": True,
+            "global_win_rate_pct": 11.5,
+        }
+        oracle.min_upside_probability = 0.60
+        oracle.min_confidence_score = 68
+        oracle.min_composite_score = 60
+
+        row = {
+            "set_id": "11199",
+            "ai_fallback_used": False,
+            "composite_score": 74,
+            "forecast_probability_upside_12m": 66.0,
+            "confidence_score": 72,
+            "forecast_data_points": 120,
+            "historical_sample_size": 0,
+            "historical_win_rate_12m_pct": 0.0,
+            "historical_support_confidence": 0,
+            "historical_prior_score": 0,
+        }
+        self.assertTrue(oracle._is_high_confidence_pick(row))
+
+        row_low_sample = dict(row)
+        row_low_sample["historical_sample_size"] = 7
+        self.assertFalse(oracle._is_high_confidence_pick(row_low_sample))
 
     def test_format_exception_for_log_timeout_has_message(self) -> None:
         err_type, err_message = DiscoveryOracle._format_exception_for_log(asyncio.TimeoutError())

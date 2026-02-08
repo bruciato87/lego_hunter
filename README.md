@@ -70,6 +70,12 @@ python bot.py --mode scheduled
 - `HISTORICAL_REFERENCE_MIN_SAMPLES` (opzionale, default `24`)
 - `HISTORICAL_PRIOR_WEIGHT` (opzionale, default `0.10`, range `0.0-0.35`)
 - `HISTORICAL_PRICE_BAND_TOLERANCE` (opzionale, default `0.45`)
+- `HISTORICAL_QUALITY_GUARD_ENABLED` (opzionale, default `true`)
+- `HISTORICAL_QUALITY_SOFT_GATE_ENABLED` (opzionale, default `true`)
+- `HISTORICAL_QUALITY_MAX_MEDIAN_AGE_YEARS` (opzionale, default `4`)
+- `HISTORICAL_QUALITY_MIN_THEME_COUNT` (opzionale, default `12`)
+- `HISTORICAL_QUALITY_MAX_TOP_THEME_SHARE` (opzionale, default `0.26`)
+- `HISTORICAL_QUALITY_MAX_GENERAL_TAG_SHARE` (opzionale, default `0.70`)
 - `WEBHOOK_BASE_URL` (opzionale per script setup webhook, es. `https://lego-hunter.vercel.app`)
 
 ## Deploy Vercel (comandi Telegram live)
@@ -103,3 +109,7 @@ Eseguire lo script SQL:
 - Il prior non sostituisce i dati live: viene usato come fattore additivo controllato (`HISTORICAL_PRIOR_WEIGHT`) per migliorare la stabilita' dei punteggi nei primi mesi.
 - Script di rigenerazione seed: `scripts/build_historical_reference_cases.py`.
 - Lo script legge il dataset raw ZIP in `data/historical_seed/raw/` (non versionato) e produce il CSV finale versionato.
+- Audit qualità seed:
+  - `python scripts/audit_historical_reference_cases.py`
+  - `python scripts/audit_historical_reference_cases.py --json`
+  - `python scripts/audit_historical_reference_cases.py --fail-on-degraded`

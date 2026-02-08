@@ -92,6 +92,12 @@ DEFAULT_HISTORICAL_CONTEXT_STRONG_PATTERN_MIN_SCORE = 75
 DEFAULT_HISTORICAL_CONTEXT_MAX_WIN_RATE_RELAX_PCT = 10.0
 DEFAULT_HISTORICAL_CONTEXT_MAX_SUPPORT_RELAX = 6
 DEFAULT_HISTORICAL_CONTEXT_MAX_PRIOR_RELAX = 10
+DEFAULT_HISTORICAL_QUALITY_GUARD_ENABLED = True
+DEFAULT_HISTORICAL_QUALITY_SOFT_GATE_ENABLED = True
+DEFAULT_HISTORICAL_QUALITY_MAX_MEDIAN_AGE_YEARS = 4
+DEFAULT_HISTORICAL_QUALITY_MAX_TOP_THEME_SHARE = 0.26
+DEFAULT_HISTORICAL_QUALITY_MAX_GENERAL_TAG_SHARE = 0.70
+DEFAULT_HISTORICAL_QUALITY_MIN_THEME_COUNT = 12
 DEFAULT_AI_MODEL_BAN_SEC = 1800.0
 DEFAULT_AI_MODEL_BAN_FAILURES = 2
 DEFAULT_AI_MODEL_FAILURE_PENALTY = 22
@@ -674,6 +680,38 @@ class DiscoveryOracle:
             minimum=0,
             maximum=30,
         )
+        self.historical_quality_guard_enabled = self._safe_env_bool(
+            "HISTORICAL_QUALITY_GUARD_ENABLED",
+            default=DEFAULT_HISTORICAL_QUALITY_GUARD_ENABLED,
+        )
+        self.historical_quality_soft_gate_enabled = self._safe_env_bool(
+            "HISTORICAL_QUALITY_SOFT_GATE_ENABLED",
+            default=DEFAULT_HISTORICAL_QUALITY_SOFT_GATE_ENABLED,
+        )
+        self.historical_quality_max_median_age_years = self._safe_env_int(
+            "HISTORICAL_QUALITY_MAX_MEDIAN_AGE_YEARS",
+            default=DEFAULT_HISTORICAL_QUALITY_MAX_MEDIAN_AGE_YEARS,
+            minimum=1,
+            maximum=20,
+        )
+        self.historical_quality_max_top_theme_share = self._safe_env_float(
+            "HISTORICAL_QUALITY_MAX_TOP_THEME_SHARE",
+            default=DEFAULT_HISTORICAL_QUALITY_MAX_TOP_THEME_SHARE,
+            minimum=0.10,
+            maximum=0.95,
+        )
+        self.historical_quality_max_general_tag_share = self._safe_env_float(
+            "HISTORICAL_QUALITY_MAX_GENERAL_TAG_SHARE",
+            default=DEFAULT_HISTORICAL_QUALITY_MAX_GENERAL_TAG_SHARE,
+            minimum=0.10,
+            maximum=1.0,
+        )
+        self.historical_quality_min_theme_count = self._safe_env_int(
+            "HISTORICAL_QUALITY_MIN_THEME_COUNT",
+            default=DEFAULT_HISTORICAL_QUALITY_MIN_THEME_COUNT,
+            minimum=3,
+            maximum=100,
+        )
         self.openrouter_opportunistic_enabled = self._safe_env_bool(
             "OPENROUTER_OPPORTUNISTIC_ENABLED",
             default=DEFAULT_OPENROUTER_OPPORTUNISTIC_ENABLED,
@@ -750,6 +788,7 @@ class DiscoveryOracle:
         self._ai_failover_lock: Optional[asyncio.Lock] = None
         self._last_ranking_diagnostics: Dict[str, Any] = {}
         self._historical_reference_cases: list[Dict[str, Any]] = []
+        self._historical_quality_profile: Dict[str, Any] = {}
         self._adaptive_historical_thresholds: Dict[str, Any] = {}
         self.ai_runtime = {
             "engine": "local_ai",
@@ -811,6 +850,9 @@ class DiscoveryOracle:
                 }
 
         self._historical_reference_cases = self._load_historical_reference_cases()
+        self._historical_quality_profile = self._evaluate_historical_reference_quality(
+            self._historical_reference_cases
+        )
         self._adaptive_historical_thresholds = self._compute_adaptive_historical_thresholds()
 
         if self.auto_tune_thresholds:
@@ -924,6 +966,24 @@ class DiscoveryOracle:
             ),
             int(self._adaptive_historical_thresholds.get("min_prior_score") or self.historical_high_conf_min_prior_score),
         )
+        LOGGER.info(
+            "Historical quality | guard_enabled=%s soft_gate=%s tier=%s degraded=%s median_age_years=%s latest_year=%s themes=%s top_theme_share=%.2f general_tag_share=%.2f issues=%s",
+            self.historical_quality_guard_enabled,
+            self.historical_quality_soft_gate_enabled,
+            self._historical_quality_profile.get("tier"),
+            self._historical_quality_profile.get("degraded"),
+            self._historical_quality_profile.get("median_age_years"),
+            self._historical_quality_profile.get("latest_end_year"),
+            self._historical_quality_profile.get("theme_count"),
+            float(self._historical_quality_profile.get("top_theme_share") or 0.0),
+            float(self._historical_quality_profile.get("general_tag_share") or 0.0),
+            self._historical_quality_profile.get("issues") or [],
+        )
+        if self.historical_quality_guard_enabled and self._historical_quality_profile.get("degraded"):
+            LOGGER.warning(
+                "Historical seed degraded: thresholds will use quality-aware softening. details=%s",
+                self._historical_quality_profile.get("issues") or [],
+            )
         LOGGER.info("Discovery source mode configured: %s", self.discovery_source_mode)
 
     def _initialize_gemini_runtime(self) -> None:
@@ -2851,6 +2911,9 @@ class DiscoveryOracle:
             "adaptive_historical_thresholds_active": adaptive_hist_active,
             "adaptive_historical_thresholds": dict(self._adaptive_historical_thresholds or {}),
             "historical_gate_blocked_count": historical_gate_blocked_count,
+            "historical_quality": dict(self._historical_quality_profile or {}),
+            "historical_quality_guard_enabled": self.historical_quality_guard_enabled,
+            "historical_quality_soft_gate_enabled": self.historical_quality_soft_gate_enabled,
             "threshold_profile": dict(self.threshold_profile),
             "source_strategy": source_diagnostics.get("source_strategy"),
             "source_order": source_diagnostics.get("source_order", []),
@@ -4559,6 +4622,135 @@ class DiscoveryOracle:
 
         return keys
 
+    @staticmethod
+    def _parse_pattern_tags(raw_value: Any) -> list[str]:
+        raw_text = str(raw_value or "").strip()
+        if not raw_text:
+            return []
+        try:
+            loaded = json.loads(raw_text)
+            if isinstance(loaded, list):
+                normalized = [
+                    str(item).strip().lower()
+                    for item in loaded
+                    if str(item or "").strip()
+                ]
+                if normalized:
+                    return normalized
+        except Exception:  # noqa: BLE001
+            pass
+        tokens = [part.strip().lower() for part in re.split(r"[|,;]", raw_text)]
+        return [token for token in tokens if token]
+
+    def _evaluate_historical_reference_quality(self, cases: list[Dict[str, Any]]) -> Dict[str, Any]:
+        profile: Dict[str, Any] = {
+            "tier": "none",
+            "degraded": False,
+            "cases": len(cases),
+            "theme_count": 0,
+            "top_theme_share": 0.0,
+            "general_tag_share": 0.0,
+            "global_win_rate_pct": 0.0,
+            "global_avg_roi_12m_pct": 0.0,
+            "median_end_year": None,
+            "latest_end_year": None,
+            "median_age_years": None,
+            "issues": [],
+            "guards": {
+                "max_median_age_years": int(self.historical_quality_max_median_age_years),
+                "min_theme_count": int(self.historical_quality_min_theme_count),
+                "max_top_theme_share": float(self.historical_quality_max_top_theme_share),
+                "max_general_tag_share": float(self.historical_quality_max_general_tag_share),
+            },
+        }
+        if not cases:
+            profile["tier"] = "empty"
+            profile["degraded"] = True
+            profile["issues"] = ["seed_vuoto"]
+            return profile
+
+        theme_counter: Counter[str] = Counter()
+        tag_counter: Counter[str] = Counter()
+        years: list[int] = []
+        for row in cases:
+            theme_key = str(row.get("theme_norm") or "").strip()
+            if theme_key:
+                theme_counter[theme_key] += 1
+
+            tags = row.get("pattern_tags_list")
+            if not isinstance(tags, list):
+                tags = self._parse_pattern_tags(row.get("pattern_tags"))
+            if tags:
+                tag_counter.update(str(tag).strip().lower() for tag in tags if str(tag).strip())
+
+            end_text = str(row.get("end_date") or "").strip()
+            if len(end_text) >= 4 and end_text[:4].isdigit():
+                years.append(int(end_text[:4]))
+
+        rois = [float(row.get("roi_12m_pct")) for row in cases if row.get("roi_12m_pct") is not None]
+        wins = [int(row.get("win_12m")) for row in cases if row.get("win_12m") in (0, 1)]
+        if rois:
+            profile["global_avg_roi_12m_pct"] = round(float(statistics.fmean(rois)), 4)
+        if wins:
+            profile["global_win_rate_pct"] = round(float(statistics.fmean(wins) * 100.0), 4)
+
+        total_cases = max(1, len(cases))
+        theme_count = len(theme_counter)
+        top_theme_count = theme_counter.most_common(1)[0][1] if theme_counter else 0
+        top_theme_share = float(top_theme_count) / float(total_cases)
+        general_tag_count = int(tag_counter.get("general_collectible", 0))
+        general_tag_share = float(general_tag_count) / float(total_cases)
+
+        profile["theme_count"] = int(theme_count)
+        profile["top_theme_share"] = round(top_theme_share, 4)
+        profile["general_tag_share"] = round(general_tag_share, 4)
+        profile["top_theme"] = theme_counter.most_common(1)[0][0] if theme_counter else None
+
+        if years:
+            median_end_year = int(round(statistics.median(years)))
+            latest_end_year = int(max(years))
+            profile["median_end_year"] = median_end_year
+            profile["latest_end_year"] = latest_end_year
+            profile["median_age_years"] = int(max(0, date.today().year - median_end_year))
+        else:
+            profile["issues"].append("assenza_end_date")
+
+        issues: list[str] = list(profile.get("issues") or [])
+        if profile.get("median_age_years") is not None and int(profile["median_age_years"]) > int(
+            self.historical_quality_max_median_age_years
+        ):
+            issues.append(
+                f"seed_datato_mediana_{profile['median_age_years']}y>{int(self.historical_quality_max_median_age_years)}y"
+            )
+        if theme_count < int(self.historical_quality_min_theme_count):
+            issues.append(
+                f"copertura_temi_bassa_{theme_count}<{int(self.historical_quality_min_theme_count)}"
+            )
+        if top_theme_share > float(self.historical_quality_max_top_theme_share):
+            issues.append(
+                f"concentrazione_tema_alta_{top_theme_share:.2f}>{float(self.historical_quality_max_top_theme_share):.2f}"
+            )
+        if general_tag_share > float(self.historical_quality_max_general_tag_share):
+            issues.append(
+                f"pattern_generico_alto_{general_tag_share:.2f}>{float(self.historical_quality_max_general_tag_share):.2f}"
+            )
+
+        profile["issues"] = issues
+        if not issues:
+            profile["tier"] = "healthy"
+            profile["degraded"] = False
+        elif any(issue.startswith("seed_datato_") for issue in issues):
+            profile["tier"] = "degraded"
+            profile["degraded"] = True
+        elif len(issues) >= 2:
+            profile["tier"] = "warning"
+            profile["degraded"] = True
+        else:
+            profile["tier"] = "warning"
+            profile["degraded"] = False
+
+        return profile
+
     def _load_historical_reference_cases(self) -> list[Dict[str, Any]]:
         if not self.historical_reference_enabled:
             return []
@@ -4609,6 +4801,8 @@ class DiscoveryOracle:
                             "win_12m": int(win_12m),
                             "source_dataset": str(row.get("source_dataset") or "").strip(),
                             "pattern_tags": str(row.get("pattern_tags") or "").strip(),
+                            "pattern_tags_list": self._parse_pattern_tags(row.get("pattern_tags")),
+                            "end_date": str(row.get("end_date") or "").strip(),
                         }
                     )
         except Exception as exc:  # noqa: BLE001
@@ -4773,6 +4967,18 @@ class DiscoveryOracle:
             min_support_confidence = int(adaptive.get("min_support_confidence") or min_support_confidence)
             min_prior_score = int(adaptive.get("min_prior_score") or min_prior_score)
             adaptive_active = True
+
+        quality_degraded = bool(
+            self.historical_quality_guard_enabled
+            and self.historical_quality_soft_gate_enabled
+            and self._historical_quality_profile.get("degraded")
+        )
+        if quality_degraded:
+            global_win_rate_pct = float(self._historical_quality_profile.get("global_win_rate_pct") or 0.0)
+            min_samples = min(min_samples, max(8, int(round(float(min_samples) * 0.5))))
+            min_win_rate_pct = min(min_win_rate_pct, max(16.0, global_win_rate_pct + 8.0))
+            min_support_confidence = min(min_support_confidence, 45)
+            min_prior_score = min(min_prior_score, 50)
 
         return (
             max(5, min_samples),
@@ -6729,10 +6935,19 @@ class DiscoveryOracle:
         except (TypeError, ValueError):
             sample_size = 0
 
+        quality_soft_gate_active = bool(
+            self.historical_quality_guard_enabled
+            and self.historical_quality_soft_gate_enabled
+            and self._historical_quality_profile.get("degraded")
+        )
         if sample_size < int(min_samples):
+            if quality_soft_gate_active and sample_size == 0:
+                return True, []
             reasons.append(
                 f"Evidenza storica insufficiente ({sample_size} < {min_samples} campioni)"
             )
+            if quality_soft_gate_active:
+                reasons.insert(0, "Gate storico quality-aware attivo")
             return False, reasons
 
         win_rate_pct_raw = self._row_metric_value(row, "historical_win_rate_12m_pct")
