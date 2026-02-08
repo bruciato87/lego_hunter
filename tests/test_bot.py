@@ -261,6 +261,46 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(update.message.replies)
         self.assertIn("sospesi", update.message.replies[-1].lower())
 
+    async def test_vendi_prefers_ebay_it_when_best_quote(self) -> None:
+        class EbayFirstRepo(FakeRepo):
+            def get_latest_price(self, set_id, platform=None):  # noqa: ANN001
+                if platform == "ebay":
+                    return {"platform": "ebay", "price": 180.0}
+                if platform == "vinted":
+                    return {"platform": "vinted", "price": 140.0}
+                if platform == "subito":
+                    return {"platform": "subito", "price": 135.0}
+                return None
+
+        manager = LegoHunterTelegramBot(
+            repository=EbayFirstRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate()
+
+        await manager.cmd_vendi(update, DummyContext())
+
+        self.assertTrue(update.message.replies)
+        text = update.message.replies[-1]
+        self.assertIn("Segnali uscita", text)
+        self.assertIn("ebay.it", text.lower())
+
+    async def test_scova_runs_silent_sell_scan_and_shows_only_when_profitable(self) -> None:
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate()
+
+        await manager.cmd_scova(update, DummyContext())
+
+        self.assertTrue(update.message.replies)
+        text = update.message.replies[-1]
+        self.assertIn("Occasioni vendita rilevate", text)
+        self.assertIn("LEGO Star Wars", text)
+
     def test_format_discovery_report_shows_source_pipeline(self) -> None:
         report = {
             "selected": [],

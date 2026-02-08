@@ -212,7 +212,7 @@ class LegoHunterTelegramBot:
             "/cerca <id|nome|tema> - Cerca set nel radar (es. /cerca 75367).\n"
             "/offerte - Verifica se sul secondario trovi prezzi migliori del primario.\n"
             "/collezione - Riepilogo portfolio: capitale investito, valore stimato, ROI latente.\n"
-            "/vendi - Segnali vendita con ROI netto > 30% (bloccati automaticamente se DAC7 a rischio).\n\n"
+            "/vendi - Segnali vendita con ROI netto > 30% (Vinted/Subito/eBay.it, bloccati se DAC7 a rischio).\n\n"
             "Come leggere i segnali:\n"
             "Score = composito (AI + Quant + Demand).\n"
             "HIGH_CONFIDENCE = score sopra soglia + probabilita' upside 12m + confidenza dati alta + AI non in fallback.\n\n"
@@ -253,11 +253,21 @@ class LegoHunterTelegramBot:
             ]
             if diagnostics.get("anti_bot_alert"):
                 lines.append(f"🚨 {html.escape(str(diagnostics.get('anti_bot_message') or 'Possibile anti-bot.'))}")
+            sell_signals = await self._compute_sell_signals(respect_fiscal_gate=True)
+            if sell_signals:
+                lines.append("")
+                lines.append("💸 <b>Occasioni vendita rilevate</b>")
+                lines.extend(self._format_sell_signal_lines(sell_signals[:3]))
             await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
             return
 
         lines = ["🧱 <b>Discovery LEGO</b>"]
         lines.extend(self._format_discovery_report(report, top_limit=3))
+        sell_signals = await self._compute_sell_signals(respect_fiscal_gate=True)
+        if sell_signals:
+            lines.append("")
+            lines.append("💸 <b>Occasioni vendita rilevate</b>")
+            lines.extend(self._format_sell_signal_lines(sell_signals[:3]))
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def cmd_radar(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -482,15 +492,36 @@ class LegoHunterTelegramBot:
             return
 
         try:
-            holdings = await asyncio.to_thread(self.repository.get_portfolio, "holding")
+            signals = await self._compute_sell_signals()
         except Exception as exc:  # noqa: BLE001
-            await update.message.reply_text(f"Errore portfolio: {exc}")
+            await update.message.reply_text(f"Errore calcolo segnali vendita: {exc}")
             return
 
+        if not signals:
+            await update.message.reply_text("Nessun set supera ROI netto > 30% al momento.")
+            return
+
+        lines = ["Segnali uscita (ROI netto > 30%):"]
+        lines.extend(self._format_sell_signal_lines(signals[:10]))
+
+        await update.message.reply_text("\n".join(lines))
+
+    async def _compute_sell_signals(self, *, respect_fiscal_gate: bool = False) -> list[dict[str, Any]]:
+        if respect_fiscal_gate:
+            safety = await asyncio.to_thread(self.fiscal_guardian.check_safety_status)
+            if not safety.get("allow_sell_signals", False):
+                return []
+
+        holdings = await asyncio.to_thread(self.repository.get_portfolio, "holding")
         signals: list[dict[str, Any]] = []
         estimated_shipping_out = 7.0
+        sale_platforms = ("vinted", "subito", "ebay")
 
         for row in holdings:
+            set_id = str(row.get("set_id") or "").strip()
+            if not set_id:
+                continue
+
             qty = int(row.get("quantity") or 1)
             buy_price = float(row.get("purchase_price") or 0.0)
             ship_in = float(row.get("shipping_in_cost") or 0.0)
@@ -498,42 +529,56 @@ class LegoHunterTelegramBot:
             if total_cost <= 0:
                 continue
 
-            latest = await asyncio.to_thread(self.repository.get_latest_price, row.get("set_id"), "vinted")
-            if not latest:
-                latest = await asyncio.to_thread(self.repository.get_best_secondary_price, row.get("set_id"))
-            if not latest:
-                continue
-
-            sale_unit = float(latest.get("price") or 0.0)
-            if sale_unit <= 0:
-                continue
-
-            net_sale_total = (sale_unit - estimated_shipping_out) * qty
-            roi_net = ((net_sale_total - total_cost) / total_cost) * 100
-            if roi_net > 30:
-                signals.append(
+            platform_quotes: list[dict[str, Any]] = []
+            for platform in sale_platforms:
+                latest = await asyncio.to_thread(self.repository.get_latest_price, set_id, platform)
+                if not latest:
+                    continue
+                sale_unit = float(latest.get("price") or 0.0)
+                if sale_unit <= 0:
+                    continue
+                platform_quotes.append(
                     {
-                        "set_name": row.get("set_name"),
-                        "set_id": row.get("set_id"),
-                        "platform": latest.get("platform"),
+                        "platform": platform,
                         "sale_unit": sale_unit,
-                        "roi_net": roi_net,
                     }
                 )
 
-        if not signals:
-            await update.message.reply_text("Nessun set supera ROI netto > 30% al momento.")
-            return
+            if not platform_quotes:
+                continue
 
-        signals.sort(key=lambda row: row["roi_net"], reverse=True)
-        lines = ["Segnali uscita (ROI netto > 30%):"]
-        for row in signals[:10]:
-            lines.append(
-                f"- {row['set_name']} ({row['set_id']}) | {row['platform']} {self._fmt_eur(row['sale_unit'])} | "
-                f"ROI netto {row['roi_net']:.1f}%"
+            best_quote = max(platform_quotes, key=lambda item: item["sale_unit"])
+            sale_unit = float(best_quote["sale_unit"])
+            net_sale_total = (sale_unit - estimated_shipping_out) * qty
+            roi_net = ((net_sale_total - total_cost) / total_cost) * 100
+            if roi_net <= 30.0:
+                continue
+
+            signals.append(
+                {
+                    "set_name": row.get("set_name"),
+                    "set_id": set_id,
+                    "platform": best_quote.get("platform") or "n/d",
+                    "sale_unit": sale_unit,
+                    "roi_net": roi_net,
+                }
             )
 
-        await update.message.reply_text("\n".join(lines))
+        signals.sort(key=lambda row: row["roi_net"], reverse=True)
+        return signals
+
+    def _format_sell_signal_lines(self, rows: list[dict[str, Any]]) -> list[str]:
+        lines: list[str] = []
+        for row in rows:
+            platform = str(row.get("platform") or "n/d").lower()
+            if platform == "ebay":
+                platform = "ebay.it"
+            lines.append(
+                f"- {row.get('set_name')} ({row.get('set_id')}) | "
+                f"{platform} {self._fmt_eur(row.get('sale_unit'))} | "
+                f"ROI netto {float(row.get('roi_net') or 0.0):.1f}%"
+            )
+        return lines
 
     def _is_authorized(self, update: Update) -> bool:
         if self.allowed_chat_id is None:

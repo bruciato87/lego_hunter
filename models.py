@@ -239,7 +239,7 @@ class LegoHunterRepository:
             lambda: self.client.table("market_time_series")
             .select("*")
             .eq("set_id", set_id)
-            .in_("platform", ["vinted", "subito"])
+            .in_("platform", ["vinted", "subito", "ebay"])
             .order("price", desc=False)
             .limit(1)
             .execute(),
@@ -259,7 +259,7 @@ class LegoHunterRepository:
             lambda: self.client.table("market_time_series")
             .select("*")
             .eq("set_id", set_id)
-            .in_("platform", ["vinted", "subito"])
+            .in_("platform", ["vinted", "subito", "ebay"])
             .gte("recorded_at", cutoff_iso)
             .order("price", desc=False)
             .order("recorded_at", desc=True)

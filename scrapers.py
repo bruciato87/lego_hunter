@@ -473,6 +473,83 @@ class SubitoScraper(BaseStealthScraper):
         return await self._with_retry(f"subito_search:{query}", _run)
 
 
+class EbayItScraper(BaseStealthScraper):
+    async def search_new_sealed(self, query: str, limit: int = 10) -> list[MarketListing]:
+        encoded_query = quote_plus(f"{query} lego nuovo sigillato")
+        url = (
+            "https://www.ebay.it/sch/i.html"
+            f"?_nkw={encoded_query}&LH_ItemCondition=1000&LH_BIN=1&rt=nc"
+        )
+
+        async def _run() -> list[MarketListing]:
+            page = await self._new_page()
+            try:
+                await page.goto(url, wait_until="domcontentloaded")
+                await self._human_jitter()
+
+                cards: list[Dict[str, str]] = await page.evaluate(
+                    """
+                    () => {
+                      const items = Array.from(document.querySelectorAll('li.s-item'));
+                      const out = [];
+                      const seen = new Set();
+
+                      for (const item of items) {
+                        const link = item.querySelector('a.s-item__link');
+                        const href = link ? (link.href || '') : '';
+                        if (!href || seen.has(href)) continue;
+                        seen.add(href);
+
+                        const titleEl = item.querySelector('.s-item__title');
+                        const priceEl = item.querySelector('.s-item__price');
+                        const title = titleEl ? (titleEl.textContent || '').trim() : '';
+                        const price = priceEl ? (priceEl.textContent || '').trim() : '';
+                        const blob = (item.innerText || '').trim();
+                        if (!title || title.length < 4) continue;
+                        out.push({ href, title, price, blob });
+                      }
+                      return out;
+                    }
+                    """
+                )
+
+                listings: list[MarketListing] = []
+                for item in cards:
+                    title = item.get("title") or ""
+                    blob = item.get("blob") or ""
+                    if "shop on ebay" in title.lower():
+                        continue
+
+                    condition = self._normalize_condition(title, blob)
+                    if condition != "new":
+                        continue
+
+                    set_id = self._extract_set_id(query, title, blob)
+                    price = self._extract_price(item.get("price"), blob)
+                    href = item.get("href") or ""
+                    if not set_id or price is None or not href:
+                        continue
+
+                    listings.append(
+                        MarketListing(
+                            platform="ebay",
+                            set_id=set_id,
+                            set_name=title,
+                            price=price,
+                            listing_url=href,
+                            condition=condition,
+                            source_note="secondary_market",
+                        )
+                    )
+
+                listings.sort(key=lambda row: row.price)
+                return listings[:limit]
+            finally:
+                await page.close()
+
+        return await self._with_retry(f"ebay_it_search:{query}", _run)
+
+
 class SecondaryMarketValidator:
     async def compare_secondary_prices(
         self,
@@ -482,7 +559,7 @@ class SecondaryMarketValidator:
     ) -> Dict[str, list[MarketListing]]:
         results: Dict[str, list[MarketListing]] = {}
 
-        async with VintedScraper() as vinted, SubitoScraper() as subito:
+        async with VintedScraper() as vinted, SubitoScraper() as subito, EbayItScraper() as ebay_it:
             for candidate in opportunities:
                 set_id = str(candidate.get("set_id") or "").strip()
                 set_name = str(candidate.get("set_name") or "").strip()
@@ -491,9 +568,10 @@ class SecondaryMarketValidator:
 
                 query = f"{set_id} {set_name}".strip()
 
-                vinted_listings, subito_listings = await asyncio.gather(
+                vinted_listings, subito_listings, ebay_listings = await asyncio.gather(
                     vinted.search_new_sealed(query, limit=per_set_limit),
                     subito.search_new_sealed(query, limit=per_set_limit),
+                    ebay_it.search_new_sealed(query, limit=per_set_limit),
                     return_exceptions=True,
                 )
 
@@ -508,6 +586,11 @@ class SecondaryMarketValidator:
                 else:
                     listings.extend(subito_listings)
 
+                if isinstance(ebay_listings, Exception):
+                    LOGGER.warning("eBay.it validation failed for %s: %s", query, ebay_listings)
+                else:
+                    listings.extend(ebay_listings)
+
                 if listings:
                     listings.sort(key=lambda row: row.price)
                     results[set_id or set_name] = listings[:per_set_limit]
@@ -517,6 +600,7 @@ class SecondaryMarketValidator:
 
 __all__ = [
     "AmazonBestsellerScraper",
+    "EbayItScraper",
     "LegoRetiringScraper",
     "MarketListing",
     "SecondaryMarketValidator",
