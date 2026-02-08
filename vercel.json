@@ -2,7 +2,6 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "api/telegram_webhook.py": {
-      "runtime": "python3.11",
       "maxDuration": 60
     }
   },
