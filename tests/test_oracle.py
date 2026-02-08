@@ -227,6 +227,44 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         assert prior is not None
         self.assertGreaterEqual(int(prior.get("sample_size") or 0), 12)
         self.assertGreaterEqual(int(prior.get("prior_score") or 0), 60)
+        self.assertEqual(prior.get("match_mode"), "direct")
+
+    def test_historical_prior_alias_mapping_marvel_to_super_heroes(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_reference_min_samples = 12
+        oracle._historical_reference_cases = []
+        for idx in range(30):
+            oracle._historical_reference_cases.append(
+                {
+                    "set_id": str(81000 + idx),
+                    "theme": "Super Heroes",
+                    "theme_norm": "super heroes",
+                    "set_name": f"SH Case {idx}",
+                    "msrp_usd": 45.0 + (idx % 8),
+                    "roi_12m_pct": 34.0 + (idx % 5),
+                    "win_12m": 1,
+                    "source_dataset": "seed",
+                    "pattern_tags": "[]",
+                }
+            )
+
+        candidate = {
+            "set_id": "76281",
+            "set_name": "X-Jet di X-Men",
+            "theme": "Marvel",
+            "source": "lego_proxy_reader",
+            "current_price": 59.99,
+        }
+        prior = oracle._historical_prior_for_candidate(candidate)
+        self.assertIsNotNone(prior)
+        assert prior is not None
+        self.assertEqual(prior.get("match_mode"), "alias")
+        self.assertIn("super heroes", prior.get("matched_theme_keys") or [])
+        self.assertGreaterEqual(int(prior.get("sample_size") or 0), 12)
+
+    def test_normalize_theme_key_handles_symbols_and_spacing(self) -> None:
+        self.assertEqual(DiscoveryOracle._normalize_theme_key("  Marvel / Super-Heroes  "), "marvel super heroes")
 
     def test_effective_pattern_score_penalizes_fallback_retiring_only(self) -> None:
         repo = FakeRepo()
@@ -618,6 +656,7 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
             }
         ]
         oracle = DummyOracle(repo, candidates)
+        oracle.min_composite_score = 1
 
         report = await oracle.discover_with_diagnostics(persist=False, top_limit=10, fallback_limit=3)
         selected = report["selected"]

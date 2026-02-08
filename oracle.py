@@ -37,6 +37,7 @@ LOGGER = logging.getLogger(__name__)
 JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
+NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]+")
 MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
 MODEL_VERSION_RE = re.compile(r"gemini-(\d+(?:\.\d+)?)", re.IGNORECASE)
 
@@ -197,6 +198,16 @@ SPACE_STEM_KEYWORDS = (
 )
 ART_DISPLAY_THEMES = {"Art", "Ideas", "Icons", "Botanicals", "Architecture"}
 LEGO_PRIMARY_SOURCES = {"lego_retiring", "lego_proxy_reader", "lego_http_fallback"}
+HISTORICAL_THEME_ALIASES = {
+    "marvel": ("super heroes", "batman"),
+    "super heroes": ("marvel", "batman"),
+    "dc": ("super heroes", "batman"),
+    "icons": ("advanced models", "architecture", "ideas"),
+    "botanicals": ("advanced models", "ideas"),
+    "animal crossing": ("miscellaneous", "city", "friends"),
+    "ideas": ("advanced models", "architecture"),
+    "creator expert": ("advanced models", "creator"),
+}
 
 
 @dataclass
@@ -3875,6 +3886,38 @@ class DiscoveryOracle:
                 message = repr(exc).strip() or "<no_error_message>"
         return err_type, message
 
+    @staticmethod
+    def _normalize_theme_key(raw_theme: Any) -> str:
+        text = str(raw_theme or "").strip().lower()
+        if not text:
+            return ""
+        text = text.replace("&", " and ").replace("/", " ")
+        text = NON_ALNUM_RE.sub(" ", text)
+        text = SPACE_RE.sub(" ", text).strip()
+        return text
+
+    @classmethod
+    def _historical_theme_keys_for_candidate(cls, raw_theme: Any) -> list[str]:
+        primary = cls._normalize_theme_key(raw_theme)
+        if not primary:
+            return []
+
+        keys: list[str] = [primary]
+        aliases = HISTORICAL_THEME_ALIASES.get(primary, ())
+        for alias in aliases:
+            normalized = cls._normalize_theme_key(alias)
+            if normalized and normalized not in keys:
+                keys.append(normalized)
+
+        # Reverse lookup: if primary appears as alias, include that anchor key as fallback.
+        for anchor_key, alias_list in HISTORICAL_THEME_ALIASES.items():
+            normalized_anchor = cls._normalize_theme_key(anchor_key)
+            normalized_aliases = {cls._normalize_theme_key(item) for item in alias_list}
+            if primary in normalized_aliases and normalized_anchor and normalized_anchor not in keys:
+                keys.append(normalized_anchor)
+
+        return keys
+
     def _load_historical_reference_cases(self) -> list[Dict[str, Any]]:
         if not self.historical_reference_enabled:
             return []
@@ -3918,7 +3961,7 @@ class DiscoveryOracle:
                         {
                             "set_id": set_id,
                             "theme": theme,
-                            "theme_norm": theme.lower().strip(),
+                            "theme_norm": self._normalize_theme_key(theme),
                             "set_name": str(row.get("set_name") or "").strip(),
                             "msrp_usd": msrp,
                             "roi_12m_pct": roi_12m,
@@ -3940,13 +3983,26 @@ class DiscoveryOracle:
         if not self._historical_reference_cases:
             return None
 
-        theme = str(candidate.get("theme") or "").strip().lower()
+        theme = self._normalize_theme_key(candidate.get("theme"))
         if not theme:
             return None
 
-        theme_cases = [row for row in self._historical_reference_cases if row.get("theme_norm") == theme]
+        direct_cases = [row for row in self._historical_reference_cases if row.get("theme_norm") == theme]
+        match_mode = "direct"
+        matched_theme_keys = [theme]
+        theme_cases = direct_cases
         if len(theme_cases) < 6:
-            return None
+            candidate_keys = self._historical_theme_keys_for_candidate(theme)
+            matched_theme_keys = candidate_keys or [theme]
+            theme_cases = [
+                row
+                for row in self._historical_reference_cases
+                if str(row.get("theme_norm") or "") in set(matched_theme_keys)
+            ]
+            if len(theme_cases) >= 6 and len(matched_theme_keys) > 1:
+                match_mode = "alias"
+            else:
+                return None
 
         price_raw = candidate.get("current_price")
         try:
@@ -3992,6 +4048,9 @@ class DiscoveryOracle:
 
         return {
             "theme": theme,
+            "match_mode": match_mode,
+            "matched_theme_keys": matched_theme_keys,
+            "theme_case_count": len(theme_cases),
             "sample_size": sample_size,
             "avg_roi_12m_pct": round(avg_roi, 4),
             "median_roi_12m_pct": round(median_roi, 4),
