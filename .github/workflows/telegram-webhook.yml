@@ -16,6 +16,7 @@ on:
 jobs:
   configure-webhook:
     runs-on: ubuntu-latest
+    environment: lego_hunter
     steps:
       - name: Checkout
         uses: actions/checkout@v4
