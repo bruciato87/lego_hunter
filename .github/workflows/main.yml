@@ -62,11 +62,13 @@ jobs:
             --markets IT \
             --include-eu-fallback \
             --include-vinted \
-            --max-sets 120 \
-            --max-vinted-targets 45 \
+            --max-sets 80 \
+            --max-vinted-targets 40 \
             --lookback-days 365 \
             --min-sold-listings 4 \
-            --min-vinted-listings 3
+            --max-markets-per-set 1 \
+            --min-vinted-listings 3 \
+            --max-vinted-markets-per-set 1
 
       - name: Run scheduled discovery cycle
         env:

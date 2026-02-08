@@ -154,6 +154,27 @@ class EbayHistorySyncTests(unittest.TestCase):
         self.assertEqual(calls[0], ("IT", "77051"))
         self.assertTrue(any(query.startswith("77051 In volo") for _, query in calls[1:]))
 
+    def test_build_case_rows_respects_market_cap(self) -> None:
+        class FakeClient:
+            def fetch_sold_prices(self, *, market: str, query: str):  # noqa: ANN001
+                _ = query
+                if market == "IT":
+                    return [80.0, 82.0, 85.0, 88.0]
+                if market == "DE":
+                    return [90.0, 91.0, 92.0, 93.0]
+                return []
+
+        rows = self.mod._build_case_rows(
+            targets=[{"set_id": "76281", "set_name": "X-Jet", "theme": "Marvel", "msrp_hint": 70.0}],
+            markets=["IT", "DE"],
+            client=FakeClient(),
+            min_sold_listings=4,
+            target_roi_pct=20.0,
+            max_markets_per_set=1,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["market_country"], "IT")
+
     def test_build_vinted_case_rows_produces_rows(self) -> None:
         class FakeVintedClient:
             def fetch_listing_prices(self, *, market: str, query: str, require_new: bool = True):  # noqa: ANN001
@@ -186,6 +207,28 @@ class EbayHistorySyncTests(unittest.TestCase):
         self.assertEqual(by_country["DE"]["source_dataset"], "vinted_active_de_30d")
         self.assertEqual(by_country["IT"]["market_region"], "EU")
         self.assertEqual(by_country["IT"]["win_12m"], 0)
+
+    def test_build_vinted_case_rows_respects_market_cap(self) -> None:
+        class FakeVintedClient:
+            def fetch_listing_prices(self, *, market: str, query: str, require_new: bool = True):  # noqa: ANN001
+                _ = query
+                _ = require_new
+                if market == "IT":
+                    return [70.0, 72.0, 75.0]
+                if market == "DE":
+                    return [68.0, 73.0, 79.0]
+                return []
+
+        rows = self.mod._build_vinted_case_rows(
+            targets=[{"set_id": "76281", "set_name": "X-Jet", "theme": "Marvel", "msrp_hint": 60.0}],
+            markets=["IT", "DE"],
+            client=FakeVintedClient(),
+            min_listings=3,
+            target_roi_pct=20.0,
+            max_markets_per_set=1,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["market_country"], "IT")
 
 
 if __name__ == "__main__":

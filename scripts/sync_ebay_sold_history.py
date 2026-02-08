@@ -426,6 +426,7 @@ def _build_case_rows(
     client: EbaySoldClient,
     min_sold_listings: int,
     target_roi_pct: float,
+    max_markets_per_set: int = 5,
 ) -> list[Dict[str, Any]]:
     rows: list[Dict[str, Any]] = []
     today = datetime.now(timezone.utc).date()
@@ -441,6 +442,7 @@ def _build_case_rows(
             msrp_hint = None
         queries = _build_query_variants(set_id, set_name)
         target_rows_before = len(rows)
+        market_rows = 0
 
         for market in markets:
             sold_prices: list[float] = []
@@ -501,6 +503,9 @@ def _build_case_rows(
                     "sold_stdev_price": f"{stdev:.4f}",
                 }
             )
+            market_rows += 1
+            if market_rows >= max(1, int(max_markets_per_set)):
+                break
         if len(rows) == target_rows_before:
             LOGGER.debug("No sold data found for set=%s (%s) across markets=%s", set_id, set_name, ",".join(markets))
     return rows
@@ -513,6 +518,7 @@ def _build_vinted_case_rows(
     client: VintedCatalogClient,
     min_listings: int,
     target_roi_pct: float,
+    max_markets_per_set: int = 3,
 ) -> list[Dict[str, Any]]:
     rows: list[Dict[str, Any]] = []
     today = datetime.now(timezone.utc).date()
@@ -529,6 +535,7 @@ def _build_vinted_case_rows(
             msrp_hint = None
         queries = _build_query_variants(set_id, set_name)
         target_rows_before = len(rows)
+        market_rows = 0
 
         for market in markets:
             listing_prices: list[float] = []
@@ -598,6 +605,9 @@ def _build_vinted_case_rows(
                     "sold_stdev_price": f"{stdev:.4f}",
                 }
             )
+            market_rows += 1
+            if market_rows >= max(1, int(max_markets_per_set)):
+                break
         if len(rows) == target_rows_before:
             LOGGER.debug("No Vinted listings found for set=%s (%s) across markets=%s", set_id, set_name, ",".join(markets))
     return rows
@@ -655,7 +665,9 @@ def main() -> int:
     parser.add_argument("--max-vinted-targets", type=int, default=45)
     parser.add_argument("--lookback-days", type=int, default=365)
     parser.add_argument("--min-sold-listings", type=int, default=4)
+    parser.add_argument("--max-markets-per-set", type=int, default=1)
     parser.add_argument("--min-vinted-listings", type=int, default=3)
+    parser.add_argument("--max-vinted-markets-per-set", type=int, default=1)
     parser.add_argument("--target-roi-pct", type=float, default=20.0)
     args = parser.parse_args()
 
@@ -692,6 +704,7 @@ def main() -> int:
         client=ebay_client,
         min_sold_listings=max(1, int(args.min_sold_listings)),
         target_roi_pct=float(args.target_roi_pct),
+        max_markets_per_set=max(1, int(args.max_markets_per_set)),
     )
     rows = list(ebay_rows)
     vinted_rows: list[Dict[str, Any]] = []
@@ -705,6 +718,7 @@ def main() -> int:
             client=vinted_client,
             min_listings=max(1, int(args.min_vinted_listings)),
             target_roi_pct=float(args.target_roi_pct),
+            max_markets_per_set=max(1, int(args.max_vinted_markets_per_set)),
         )
         rows.extend(vinted_rows)
 
