@@ -2198,6 +2198,133 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(results["75367"].score, 84)
         mocked_repair.assert_awaited_once()
 
+    async def test_score_ai_shortlist_batch_parses_non_json_without_repair_call(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle._openrouter_model_id = "vendor/model-pro:free"
+        oracle.ai_runtime = {
+            "engine": "openrouter",
+            "provider": "openrouter",
+            "model": "vendor/model-pro:free",
+            "mode": "api_openrouter_inventory",
+            "inventory_available": 1,
+        }
+
+        entries = [
+            {
+                "set_id": "75367",
+                "candidate": {
+                    "set_id": "75367",
+                    "set_name": "Set 75367",
+                    "theme": "Star Wars",
+                    "source": "lego_proxy_reader",
+                    "current_price": 99.99,
+                    "eol_date_prediction": "2026-12-01",
+                },
+            },
+            {
+                "set_id": "76281",
+                "candidate": {
+                    "set_id": "76281",
+                    "set_name": "Set 76281",
+                    "theme": "Marvel",
+                    "source": "lego_proxy_reader",
+                    "current_price": 79.99,
+                    "eol_date_prediction": "2026-10-01",
+                },
+            },
+        ]
+
+        raw_text = (
+            "1) set_id 75367 -> score 84/100. outlook positivo.\n"
+            "2) set_id 76281 -> score 71/100. domanda media."
+        )
+        with patch.object(oracle, "_openrouter_generate", return_value=raw_text), patch.object(
+            oracle,
+            "_repair_openrouter_non_json_batch_output",
+            new=AsyncMock(return_value={}),
+        ) as mocked_repair:
+            results, error = await oracle._score_ai_shortlist_batch(
+                entries,
+                deadline=time.monotonic() + 10.0,
+                allow_repair_calls=False,
+                allow_failover_call=False,
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(set(results.keys()), {"75367", "76281"})
+        self.assertEqual(results["75367"].score, 84)
+        self.assertEqual(results["76281"].score, 71)
+        mocked_repair.assert_not_awaited()
+
+    async def test_score_ai_shortlist_single_call_mode_uses_one_batch_for_all_pending(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_single_call_scoring_enabled = True
+        oracle.ai_batch_scoring_enabled = True
+        oracle.ai_scoring_hard_budget_sec = 8.0
+        oracle.ai_runtime = {
+            "engine": "openrouter",
+            "provider": "openrouter",
+            "model": "vendor/model-pro:free",
+            "mode": "api_openrouter_inventory",
+            "inventory_available": 1,
+        }
+
+        shortlist = []
+        for set_id in ("75367", "76281", "42182"):
+            shortlist.append(
+                {
+                    "set_id": set_id,
+                    "candidate": {
+                        "set_id": set_id,
+                        "set_name": f"Set {set_id}",
+                        "theme": "City",
+                        "source": "lego_proxy_reader",
+                        "current_price": 49.99,
+                        "eol_date_prediction": "2026-10-01",
+                    },
+                }
+            )
+
+        async def fake_batch(entries, **kwargs):  # noqa: ANN001
+            _ = kwargs
+            out = {}
+            for entry in entries:
+                sid = str(entry["set_id"])
+                out[sid] = AIInsight(
+                    score=80,
+                    summary=f"ok {sid}",
+                    predicted_eol_date="2026-10-01",
+                    fallback_used=False,
+                    confidence="HIGH_CONFIDENCE",
+                )
+            return out, None
+
+        with patch.object(oracle, "_score_ai_shortlist_batch", new=AsyncMock(side_effect=fake_batch)) as mocked_batch, patch.object(
+            oracle,
+            "_get_ai_insight",
+            new=AsyncMock(side_effect=AssertionError("single-call mode should not use per-pick calls")),
+        ):
+            results, stats = await oracle._score_ai_shortlist(shortlist)
+
+        self.assertEqual(len(results), 3)
+        self.assertEqual(int(stats["ai_scored_count"]), 3)
+        self.assertEqual(int(stats["ai_batch_scored_count"]), 3)
+        self.assertEqual(mocked_batch.await_count, 1)
+
+    def test_batch_insights_from_unstructured_text_order_fallback(self) -> None:
+        candidates = [
+            {"set_id": "75367", "set_name": "Set A", "theme": "Star Wars", "source": "lego_proxy_reader"},
+            {"set_id": "76281", "set_name": "Set B", "theme": "Marvel", "source": "lego_proxy_reader"},
+        ]
+        raw_text = "1) Score 88/100, forte domanda.\n2) Score 74/100, upside moderato."
+        insights = DiscoveryOracle._batch_insights_from_unstructured_text(raw_text, candidates)
+        self.assertEqual(set(insights.keys()), {"75367", "76281"})
+        self.assertEqual(insights["75367"].score, 88)
+        self.assertEqual(insights["76281"].score, 74)
+
     def test_compute_fast_fail_timeouts_reduces_timeout_when_budget_is_tight(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
