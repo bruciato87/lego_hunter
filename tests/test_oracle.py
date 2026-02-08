@@ -2610,6 +2610,57 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(insights["75367"].score, 90)
         self.assertEqual(insights["76281"].score, 75)
 
+    def test_ai_guardrail_caps_non_json_outlier_scores(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_score_guardrail_enabled = True
+        oracle.ai_score_soft_cap = 95
+        oracle.ai_score_soft_cap_factor = 0.35
+        oracle.ai_low_confidence_score_cap = 90
+        oracle.ai_non_json_score_cap = 85
+
+        candidate = {
+            "set_id": "71486",
+            "set_name": "Castello di Nocturnia",
+            "eol_date_prediction": "2026-05-27",
+        }
+        insight = AIInsight(
+            score=99,
+            summary="output non strutturato",
+            predicted_eol_date=None,
+            fallback_used=False,
+            confidence="LOW_CONFIDENCE",
+            risk_note="Output AI non JSON: score estratto da testo con parsing robusto.",
+        )
+
+        normalized = oracle._normalize_ai_insight(insight, candidate)
+        self.assertEqual(normalized.score, 85)
+        self.assertEqual(normalized.model_raw_score, 99)
+        self.assertIn("AI guardrail applicato", str(normalized.risk_note))
+
+    def test_ai_guardrail_soft_caps_extreme_json_scores(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_score_guardrail_enabled = True
+        oracle.ai_score_soft_cap = 95
+        oracle.ai_score_soft_cap_factor = 0.35
+
+        candidate = {
+            "set_id": "76281",
+            "set_name": "X-Jet di X-Men",
+            "eol_date_prediction": "2026-05-16",
+        }
+        insight = AIInsight(
+            score=99,
+            summary="output json valido",
+            fallback_used=False,
+            confidence="HIGH_CONFIDENCE",
+        )
+
+        normalized = oracle._normalize_ai_insight(insight, candidate)
+        self.assertEqual(normalized.score, 96)
+        self.assertEqual(normalized.model_raw_score, 99)
+
     def test_bootstrap_thresholds_can_promote_high_confidence_when_history_is_short(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)

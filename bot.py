@@ -666,6 +666,15 @@ class LegoHunterTelegramBot:
             float(diagnostics.get("bootstrap_min_probability_high_confidence") or 0.0) * 100.0
         )
         bootstrap_min_confidence = int(diagnostics.get("bootstrap_min_confidence_score_high_confidence") or 0)
+        selected_strengths = [str(row.get("signal_strength") or "") for row in selected]
+        only_bootstrap_high_confidence = bool(selected_strengths) and all(
+            strength == "HIGH_CONFIDENCE_BOOTSTRAP"
+            for strength in selected_strengths
+        )
+        includes_bootstrap_high_confidence = any(
+            strength == "HIGH_CONFIDENCE_BOOTSTRAP"
+            for strength in selected_strengths
+        )
 
         lines: list[str] = []
         if diagnostics.get("fallback_used"):
@@ -676,7 +685,12 @@ class LegoHunterTelegramBot:
             else:
                 lines.append("⚠️ Nessun set sopra soglia composita nel ciclo: mostro i migliori <b>LOW_CONFIDENCE</b>.")
         else:
-            lines.append("✅ Opportunita' sopra soglia trovate.")
+            if only_bootstrap_high_confidence:
+                lines.append("🧪 Opportunita' sopra soglia trovate (solo <b>HIGH_CONFIDENCE_BOOTSTRAP</b>, confidenza preliminare).")
+            elif includes_bootstrap_high_confidence:
+                lines.append("✅ Opportunita' sopra soglia trovate (mix <b>STRICT</b> + <b>BOOTSTRAP</b>).")
+            else:
+                lines.append("✅ Opportunita' sopra soglia trovate.")
 
         if selected:
             lines.append("")
@@ -684,7 +698,16 @@ class LegoHunterTelegramBot:
             for idx, row in enumerate(selected, start=1):
                 strength = str(row.get("signal_strength") or "HIGH_CONFIDENCE_STRICT")
                 is_high_confidence = strength.startswith("HIGH_CONFIDENCE")
-                badge = "🟢" if is_high_confidence else "🟡"
+                if strength == "HIGH_CONFIDENCE_BOOTSTRAP":
+                    badge = "🔵"
+                else:
+                    badge = "🟢" if is_high_confidence else "🟡"
+                strength_label = {
+                    "HIGH_CONFIDENCE": "HIGH_CONFIDENCE_STRICT",
+                    "HIGH_CONFIDENCE_STRICT": "HIGH_CONFIDENCE_STRICT",
+                    "HIGH_CONFIDENCE_BOOTSTRAP": "HIGH_CONFIDENCE_BOOTSTRAP (preliminare)",
+                    "LOW_CONFIDENCE": "LOW_CONFIDENCE",
+                }.get(strength, strength)
                 set_name = html.escape(str(row.get("set_name") or "n/d"))
                 set_id = html.escape(str(row.get("set_id") or "n/d"))
                 source = html.escape(str(row.get("source") or "unknown"))
@@ -763,7 +786,7 @@ class LegoHunterTelegramBot:
                     )
                 if pattern_summary:
                     lines.append(f"Pattern: {html.escape(pattern_summary)}")
-                lines.append(f"Fonte: {source} | Segnale: {strength}")
+                lines.append(f"Fonte: {source} | Segnale: {html.escape(strength_label)}")
                 lines.append(LegoHunterTelegramBot._format_pick_link(row))
                 if strength in {"HIGH_CONFIDENCE", "HIGH_CONFIDENCE_BOOTSTRAP"} and bootstrap_enabled:
                     data_points = int(row.get("forecast_data_points") or metadata.get("forecast_data_points") or 0)
@@ -813,6 +836,12 @@ class LegoHunterTelegramBot:
             f"Max Score: {int(diagnostics.get('max_composite_score', 0))} | "
             f"Max Prob12m: {float(diagnostics.get('max_probability_upside_12m', 0.0)):.1f}%"
         )
+        ai_guardrails = int(diagnostics.get("ai_guardrail_applied_count") or 0)
+        if ai_guardrails > 0:
+            lines.append(
+                f"🛡️ AI guardrail: {ai_guardrails} score normalizzati | "
+                f"Max AI raw {int(diagnostics.get('max_ai_model_raw_score') or diagnostics.get('max_ai_score') or 0)}"
+            )
         if diagnostics.get("historical_high_conf_required"):
             eff_hist_samples = int(
                 diagnostics.get("historical_high_conf_effective_min_samples")

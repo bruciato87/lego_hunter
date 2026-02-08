@@ -525,6 +525,51 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<", note_line)
         self.assertNotIn(">", note_line)
 
+    def test_format_discovery_report_marks_bootstrap_as_preliminary_and_shows_guardrail_diagnostics(self) -> None:
+        report = {
+            "selected": [
+                {
+                    "set_id": "76281",
+                    "set_name": "X-Jet di X-Men",
+                    "source": "lego_proxy_reader",
+                    "signal_strength": "HIGH_CONFIDENCE_BOOTSTRAP",
+                    "ai_investment_score": 72,
+                    "ai_raw_score": 78,
+                    "market_demand_score": 95,
+                    "forecast_probability_upside_12m": 66.2,
+                    "confidence_score": 58,
+                    "metadata": {
+                        "forecast_data_points": 40,
+                    },
+                }
+            ],
+            "diagnostics": {
+                "fallback_used": False,
+                "above_threshold_count": 12,
+                "above_threshold_high_confidence_count": 1,
+                "source_raw_counts": {},
+                "dedup_candidates": 41,
+                "threshold": 60,
+                "max_ai_score": 78,
+                "max_ai_model_raw_score": 99,
+                "ai_guardrail_applied_count": 2,
+                "source_strategy": "external_first",
+                "selected_source": "external_proxy",
+                "bootstrap_thresholds_enabled": True,
+                "bootstrap_min_history_points": 45,
+                "bootstrap_min_probability_high_confidence": 0.56,
+                "bootstrap_min_confidence_score_high_confidence": 55,
+                "bootstrap_rows_count": 8,
+                "ai_runtime": {"engine": "openrouter", "model": "x/y:free", "mode": "api"},
+            },
+        }
+
+        lines = LegoHunterTelegramBot._format_discovery_report(report, top_limit=3)
+        joined = "\n".join(lines)
+        self.assertIn("solo <b>HIGH_CONFIDENCE_BOOTSTRAP</b>", joined)
+        self.assertIn("Segnale: HIGH_CONFIDENCE_BOOTSTRAP (preliminare)", joined)
+        self.assertIn("🛡️ AI guardrail: 2 score normalizzati | Max AI raw 99", joined)
+
     async def test_scheduled_cycle_continues_when_command_sync_times_out(self) -> None:
         bot_mock = AsyncMock()
         bot_mock.set_my_commands = AsyncMock(side_effect=TimedOut("timed out"))

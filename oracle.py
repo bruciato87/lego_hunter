@@ -74,10 +74,15 @@ DEFAULT_AI_BATCH_TIMEOUT_SEC = 26.0
 DEFAULT_AI_SINGLE_CALL_SCORING_ENABLED = False
 DEFAULT_AI_SINGLE_CALL_ALLOW_REPAIR_CALLS = False
 DEFAULT_AI_SINGLE_CALL_MAX_CANDIDATES = 12
+DEFAULT_AI_SCORE_GUARDRAIL_ENABLED = True
+DEFAULT_AI_SCORE_SOFT_CAP = 95
+DEFAULT_AI_SCORE_SOFT_CAP_FACTOR = 0.35
+DEFAULT_AI_LOW_CONFIDENCE_SCORE_CAP = 90
+DEFAULT_AI_NON_JSON_SCORE_CAP = 85
 DEFAULT_BOOTSTRAP_THRESHOLDS_ENABLED = False
 DEFAULT_BOOTSTRAP_MIN_HISTORY_POINTS = 45
-DEFAULT_BOOTSTRAP_MIN_UPSIDE_PROBABILITY = 0.52
-DEFAULT_BOOTSTRAP_MIN_CONFIDENCE_SCORE = 50
+DEFAULT_BOOTSTRAP_MIN_UPSIDE_PROBABILITY = 0.56
+DEFAULT_BOOTSTRAP_MIN_CONFIDENCE_SCORE = 55
 DEFAULT_HISTORICAL_HIGH_CONF_REQUIRED = True
 DEFAULT_HISTORICAL_HIGH_CONF_MIN_SAMPLES = 24
 DEFAULT_HISTORICAL_HIGH_CONF_MIN_WIN_RATE_PCT = 56.0
@@ -254,6 +259,7 @@ class AIInsight:
     fallback_used: bool = False
     confidence: str = "HIGH_CONFIDENCE"
     risk_note: Optional[str] = None
+    model_raw_score: Optional[int] = None
 
 
 @dataclass
@@ -542,6 +548,34 @@ class DiscoveryOracle:
             default=DEFAULT_AI_SINGLE_CALL_MAX_CANDIDATES,
             minimum=3,
             maximum=40,
+        )
+        self.ai_score_guardrail_enabled = self._safe_env_bool(
+            "AI_SCORE_GUARDRAIL_ENABLED",
+            default=DEFAULT_AI_SCORE_GUARDRAIL_ENABLED,
+        )
+        self.ai_score_soft_cap = self._safe_env_int(
+            "AI_SCORE_SOFT_CAP",
+            default=DEFAULT_AI_SCORE_SOFT_CAP,
+            minimum=70,
+            maximum=99,
+        )
+        self.ai_score_soft_cap_factor = self._safe_env_float(
+            "AI_SCORE_SOFT_CAP_FACTOR",
+            default=DEFAULT_AI_SCORE_SOFT_CAP_FACTOR,
+            minimum=0.05,
+            maximum=0.95,
+        )
+        self.ai_low_confidence_score_cap = self._safe_env_int(
+            "AI_LOW_CONFIDENCE_SCORE_CAP",
+            default=DEFAULT_AI_LOW_CONFIDENCE_SCORE_CAP,
+            minimum=50,
+            maximum=100,
+        )
+        self.ai_non_json_score_cap = self._safe_env_int(
+            "AI_NON_JSON_SCORE_CAP",
+            default=DEFAULT_AI_NON_JSON_SCORE_CAP,
+            minimum=40,
+            maximum=100,
         )
         self.ai_top_pick_rescue_enabled = self._safe_env_bool(
             "AI_TOP_PICK_RESCUE_ENABLED",
@@ -953,7 +987,7 @@ class DiscoveryOracle:
             self.openrouter_free_tier_only,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s floor_multi_model=%s per_model=%s bonus=%s cache_ttl_sec=%.0f persisted_cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f ai_single_call=%s ai_single_call_allow_repair=%s ai_single_call_max_candidates=%s ai_top_pick_rescue_enabled=%s ai_top_pick_rescue_count=%s ai_top_pick_rescue_timeout_sec=%.1f ai_final_pick_guarantee_count=%s ai_final_pick_guarantee_rounds=%s openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s floor_multi_model=%s per_model=%s bonus=%s cache_ttl_sec=%.0f persisted_cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f ai_single_call=%s ai_single_call_allow_repair=%s ai_single_call_max_candidates=%s ai_guardrail_enabled=%s ai_soft_cap=%s ai_soft_cap_factor=%.2f ai_low_conf_cap=%s ai_non_json_cap=%s ai_top_pick_rescue_enabled=%s ai_top_pick_rescue_count=%s ai_top_pick_rescue_timeout_sec=%.1f ai_final_pick_guarantee_count=%s ai_final_pick_guarantee_rounds=%s openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
             self.ai_dynamic_shortlist_enabled,
@@ -979,6 +1013,11 @@ class DiscoveryOracle:
             self.ai_single_call_scoring_enabled,
             self.ai_single_call_allow_repair_calls,
             self.ai_single_call_max_candidates,
+            self.ai_score_guardrail_enabled,
+            self.ai_score_soft_cap,
+            self.ai_score_soft_cap_factor,
+            self.ai_low_confidence_score_cap,
+            self.ai_non_json_score_cap,
             self.ai_top_pick_rescue_enabled,
             self.ai_top_pick_rescue_count,
             self.ai_top_pick_rescue_timeout_sec,
@@ -3062,6 +3101,28 @@ class DiscoveryOracle:
                 ),
                 default=0,
             ),
+            "max_ai_model_raw_score": max(
+                (
+                    int(
+                        row.get("ai_model_raw_score")
+                        or row.get("metadata", {}).get("ai_model_raw_score")
+                        or row.get("ai_raw_score")
+                        or row.get("metadata", {}).get("ai_raw_score")
+                        or row.get("ai_investment_score")
+                        or 0
+                    )
+                    for row in ranked
+                ),
+                default=0,
+            ),
+            "ai_guardrail_applied_count": sum(
+                1
+                for row in ranked
+                if bool(
+                    row.get("ai_score_guardrail_applied")
+                    or row.get("metadata", {}).get("ai_score_guardrail_applied")
+                )
+            ),
             "max_composite_score": max((int(row.get("composite_score") or 0) for row in ranked), default=0),
             "max_probability_upside_12m": max(
                 (float(row.get("forecast_probability_upside_12m") or 0.0) for row in ranked),
@@ -3097,12 +3158,14 @@ class DiscoveryOracle:
             top_debug = []
 
         LOGGER.info(
-            "Discovery summary | ranked=%s above_threshold=%s high_conf=%s fallback_used=%s max_ai=%s max_composite=%s max_prob=%.1f profile=%s ai=%s ranking=%s top=%s",
+            "Discovery summary | ranked=%s above_threshold=%s high_conf=%s fallback_used=%s max_ai=%s max_ai_raw=%s ai_guardrails=%s max_composite=%s max_prob=%.1f profile=%s ai=%s ranking=%s top=%s",
             diagnostics["ranked_candidates"],
             diagnostics["above_threshold_count"],
             diagnostics["above_threshold_high_confidence_count"],
             diagnostics["fallback_used"],
             diagnostics["max_ai_score"],
+            diagnostics["max_ai_model_raw_score"],
+            diagnostics["ai_guardrail_applied_count"],
             diagnostics["max_composite_score"],
             diagnostics["max_probability_upside_12m"],
             diagnostics["threshold_profile"],
@@ -3483,6 +3546,14 @@ class DiscoveryOracle:
                     "ai_confidence": str(ai.confidence or "HIGH_CONFIDENCE"),
                     "ai_risk_note": ai.risk_note,
                     "ai_raw_score": int(ai.score),
+                    "ai_model_raw_score": (
+                        int(ai.model_raw_score)
+                        if ai.model_raw_score is not None
+                        else int(ai.score)
+                    ),
+                    "ai_score_guardrail_applied": bool(
+                        ai.model_raw_score is not None and int(ai.model_raw_score) != int(ai.score)
+                    ),
                     "forecast_score": int(forecast.forecast_score),
                     "forecast_probability_upside_12m": round(float(forecast.probability_upside_12m) * 100.0, 2),
                     "expected_roi_12m_pct": round(float(forecast.expected_roi_12m_pct), 2),
@@ -3533,6 +3604,14 @@ class DiscoveryOracle:
             payload["market_demand_score"] = demand
             payload["ai_investment_score"] = composite_score
             payload["ai_raw_score"] = ai.score
+            payload["ai_model_raw_score"] = (
+                int(ai.model_raw_score)
+                if ai.model_raw_score is not None
+                else int(ai.score)
+            )
+            payload["ai_score_guardrail_applied"] = bool(
+                ai.model_raw_score is not None and int(ai.model_raw_score) != int(ai.score)
+            )
             payload["forecast_score"] = forecast.forecast_score
             payload["forecast_probability_upside_12m"] = round(float(forecast.probability_upside_12m) * 100.0, 2)
             payload["expected_roi_12m_pct"] = round(float(forecast.expected_roi_12m_pct), 2)
@@ -4331,6 +4410,7 @@ class DiscoveryOracle:
                 insights = self._batch_payload_to_ai_insights(payload, candidates)
             except Exception:
                 insights = self._batch_insights_from_unstructured_text(text, candidates)
+            insights = self._normalize_batch_ai_insights(insights, candidates)
 
             if insights:
                 if current_model:
@@ -4370,6 +4450,7 @@ class DiscoveryOracle:
                     request_timeout=timeout_sec,
                 )
                 insights = await _insights_from_openrouter_text(text)
+                insights = self._normalize_batch_ai_insights(insights, candidates)
                 if insights:
                     self._record_model_success("openrouter", current_model, phase="batch_scoring")
                     LOGGER.info(
@@ -4394,6 +4475,7 @@ class DiscoveryOracle:
                             request_timeout=timeout_sec,
                         )
                         insights = await _insights_from_openrouter_text(text)
+                        insights = self._normalize_batch_ai_insights(insights, candidates)
                         if insights:
                             self._record_model_success("openrouter", rotated_model, phase="batch_scoring_after_failover")
                             LOGGER.info(
@@ -4414,6 +4496,24 @@ class DiscoveryOracle:
                 return {}, str(exc)
 
         return {}, "no_external_ai_available"
+
+    def _normalize_batch_ai_insights(
+        self,
+        insights: Dict[str, AIInsight],
+        candidates: list[Dict[str, Any]],
+    ) -> Dict[str, AIInsight]:
+        if not insights:
+            return {}
+        candidate_by_set_id = {
+            str(row.get("set_id") or "").strip(): row
+            for row in candidates
+            if str(row.get("set_id") or "").strip()
+        }
+        normalized: Dict[str, AIInsight] = {}
+        for set_id, insight in insights.items():
+            candidate = candidate_by_set_id.get(str(set_id), {"set_id": set_id})
+            normalized[str(set_id)] = self._normalize_ai_insight(insight, candidate)
+        return normalized
 
     def _compute_fast_fail_timeouts(
         self,
@@ -5532,6 +5632,87 @@ class DiscoveryOracle:
             fallback_used=bool(insight.fallback_used),
             confidence=str(insight.confidence),
             risk_note=insight.risk_note,
+            model_raw_score=(
+                int(insight.model_raw_score)
+                if insight.model_raw_score is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _is_non_json_ai_note(note: Optional[str]) -> bool:
+        lowered = str(note or "").strip().lower()
+        if not lowered:
+            return False
+        return ("non json" in lowered) or ("parsing robusto" in lowered)
+
+    @staticmethod
+    def _merge_risk_note(existing: Optional[str], addition: str) -> str:
+        base = str(existing or "").strip()
+        if not base:
+            return addition
+        if addition.lower() in base.lower():
+            return base
+        return f"{base.rstrip('.')} | {addition}"
+
+    def _normalize_ai_insight(self, insight: AIInsight, candidate: Dict[str, Any]) -> AIInsight:
+        score = max(1, min(100, int(insight.score)))
+        model_raw_score = (
+            int(insight.model_raw_score)
+            if insight.model_raw_score is not None
+            else score
+        )
+        if bool(insight.fallback_used) or not self.ai_score_guardrail_enabled:
+            return AIInsight(
+                score=score,
+                summary=str(insight.summary),
+                predicted_eol_date=insight.predicted_eol_date or candidate.get("eol_date_prediction"),
+                fallback_used=bool(insight.fallback_used),
+                confidence=str(insight.confidence),
+                risk_note=insight.risk_note,
+                model_raw_score=(
+                    model_raw_score
+                    if insight.model_raw_score is not None
+                    else None
+                ),
+            )
+
+        adjusted = float(score)
+        guardrails: list[str] = []
+
+        if adjusted > float(self.ai_score_soft_cap):
+            adjusted = float(self.ai_score_soft_cap) + (
+                (adjusted - float(self.ai_score_soft_cap)) * float(self.ai_score_soft_cap_factor)
+            )
+            guardrails.append(f"soft-cap {self.ai_score_soft_cap}")
+
+        low_confidence = str(insight.confidence or "").strip().upper() != "HIGH_CONFIDENCE"
+        if low_confidence and adjusted > float(self.ai_low_confidence_score_cap):
+            adjusted = float(self.ai_low_confidence_score_cap)
+            guardrails.append(f"low-conf cap {self.ai_low_confidence_score_cap}")
+
+        non_json_output = self._is_non_json_ai_note(insight.risk_note)
+        if non_json_output and adjusted > float(self.ai_non_json_score_cap):
+            adjusted = float(self.ai_non_json_score_cap)
+            guardrails.append(f"non-json cap {self.ai_non_json_score_cap}")
+
+        final_score = max(1, min(100, int(round(adjusted))))
+        risk_note = insight.risk_note
+        if final_score != score and guardrails:
+            risk_note = self._merge_risk_note(
+                risk_note,
+                "AI guardrail applicato "
+                f"({score}->{final_score}; {', '.join(guardrails)}).",
+            )
+
+        return AIInsight(
+            score=final_score,
+            summary=str(insight.summary),
+            predicted_eol_date=insight.predicted_eol_date or candidate.get("eol_date_prediction"),
+            fallback_used=bool(insight.fallback_used),
+            confidence=str(insight.confidence),
+            risk_note=risk_note,
+            model_raw_score=(model_raw_score if final_score != model_raw_score else None),
         )
 
     def _prime_ai_cache_from_repository(self, candidates: list[Dict[str, Any]]) -> int:
@@ -5576,6 +5757,7 @@ class DiscoveryOracle:
             insight = self._insight_from_persisted_row(row, candidate)
             if insight is None:
                 continue
+            insight = self._normalize_ai_insight(insight, candidate)
             key = self._ai_cache_key(candidate)
             if not key:
                 continue
@@ -5610,6 +5792,11 @@ class DiscoveryOracle:
             or candidate.get("eol_date_prediction")
         )
         confidence = str(metadata.get("ai_confidence") or "HIGH_CONFIDENCE")
+        model_raw_score = metadata.get("ai_model_raw_score")
+        try:
+            parsed_model_raw = int(float(model_raw_score)) if model_raw_score is not None else None
+        except (TypeError, ValueError):
+            parsed_model_raw = None
         return AIInsight(
             score=score,
             summary=summary,
@@ -5617,6 +5804,7 @@ class DiscoveryOracle:
             fallback_used=False,
             confidence=confidence,
             risk_note=None,
+            model_raw_score=(parsed_model_raw if parsed_model_raw != score else None),
         )
 
     def _get_cached_ai_insight(self, candidate: Dict[str, Any]) -> Optional[AIInsight]:
@@ -5633,7 +5821,7 @@ class DiscoveryOracle:
         if expires_at <= now_ts:
             self._ai_insight_cache.pop(key, None)
             return None
-        return self._clone_ai_insight(cached)
+        return self._normalize_ai_insight(self._clone_ai_insight(cached), candidate)
 
     def _set_cached_ai_insight(self, candidate: Dict[str, Any], insight: AIInsight) -> None:
         if self.ai_cache_ttl_sec <= 0 or insight.fallback_used:
@@ -6633,7 +6821,7 @@ class DiscoveryOracle:
                 insight = self._payload_to_ai_insight(payload, candidate)
                 if current_gemini_model:
                     self._record_model_success("gemini", current_gemini_model, phase="scoring")
-                return insight
+                return self._normalize_ai_insight(insight, candidate)
             except Exception as exc:  # noqa: BLE001
                 if current_gemini_model:
                     self._record_model_failure("gemini", current_gemini_model, str(exc), phase="scoring")
@@ -6651,7 +6839,7 @@ class DiscoveryOracle:
                         insight = self._payload_to_ai_insight(payload, candidate)
                         if next_model:
                             self._record_model_success("gemini", next_model, phase="scoring_after_failover")
-                        return insight
+                        return self._normalize_ai_insight(insight, candidate)
                     except Exception as exc_after_switch:  # noqa: BLE001
                         if next_model:
                             self._record_model_failure(
@@ -6686,7 +6874,7 @@ class DiscoveryOracle:
                 prompt=prompt,
             )
             if insight is not None:
-                return insight
+                return self._normalize_ai_insight(insight, candidate)
 
         return self._heuristic_ai_fallback(candidate)
 
