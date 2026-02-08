@@ -312,6 +312,49 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("LOW_CONFIDENCE", joined)
         self.assertIn('href="https://www.lego.com/it-it/search?q=76281"', joined)
 
+    def test_format_discovery_report_bootstrap_high_conf_note_is_html_safe(self) -> None:
+        report = {
+            "selected": [
+                {
+                    "set_id": "42182",
+                    "set_name": "Rover lunare NASA Apollo - LRV",
+                    "source": "lego_proxy_reader",
+                    "signal_strength": "HIGH_CONFIDENCE",
+                    "ai_investment_score": 78,
+                    "market_demand_score": 96,
+                    "forecast_probability_upside_12m": 64.4,
+                    "confidence_score": 56,
+                    "metadata": {
+                        "forecast_data_points": 12,
+                    },
+                }
+            ],
+            "diagnostics": {
+                "fallback_used": False,
+                "above_threshold_count": 16,
+                "above_threshold_high_confidence_count": 3,
+                "source_raw_counts": {},
+                "dedup_candidates": 41,
+                "threshold": 60,
+                "max_ai_score": 82,
+                "source_strategy": "external_first",
+                "selected_source": "external_proxy",
+                "bootstrap_thresholds_enabled": True,
+                "bootstrap_min_history_points": 45,
+                "bootstrap_min_probability_high_confidence": 0.52,
+                "bootstrap_min_confidence_score_high_confidence": 50,
+                "bootstrap_rows_count": 8,
+                "ai_runtime": {"engine": "openrouter", "model": "x/y:free", "mode": "api"},
+            },
+        }
+
+        lines = LegoHunterTelegramBot._format_discovery_report(report, top_limit=3)
+        note_line = next((line for line in lines if line.startswith("Nota: HIGH_CONFIDENCE in bootstrap")), "")
+        self.assertTrue(note_line)
+        self.assertIn("inferiori a 45", note_line)
+        self.assertNotIn("<", note_line)
+        self.assertNotIn(">", note_line)
+
     async def test_scheduled_cycle_continues_when_command_sync_times_out(self) -> None:
         bot_mock = AsyncMock()
         bot_mock.set_my_commands = AsyncMock(side_effect=TimedOut("timed out"))

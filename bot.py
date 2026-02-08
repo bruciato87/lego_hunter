@@ -524,9 +524,9 @@ class LegoHunterTelegramBot:
                     if bootstrap_min_history_points > 0 and 0 < data_points < bootstrap_min_history_points:
                         lines.append(
                             "Nota: HIGH_CONFIDENCE in bootstrap "
-                            f"(data points {data_points} < {bootstrap_min_history_points}; "
-                            f"soglie bootstrap Prob>={bootstrap_min_probability_pct:.0f}% "
-                            f"e Conf>={bootstrap_min_confidence})."
+                            f"(data points {data_points} inferiori a {bootstrap_min_history_points}; "
+                            f"soglie bootstrap Prob minimo {bootstrap_min_probability_pct:.0f}% "
+                            f"e Conf minima {bootstrap_min_confidence})."
                         )
                 if strength == "LOW_CONFIDENCE":
                     risk_note = str(row.get("risk_note") or "Conferma manuale consigliata.")
