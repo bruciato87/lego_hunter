@@ -120,12 +120,12 @@ Eseguire lo script SQL:
 ## Seed storico (Data Moat bootstrap)
 - Il ranking usa un prior storico da `data/historical_seed/historical_reference_cases.csv`.
 - Il prior non sostituisce i dati live: viene usato come fattore additivo controllato (`HISTORICAL_PRIOR_WEIGHT`) per migliorare la stabilita' dei punteggi nei primi mesi.
-- E' possibile aggiungere una seconda sorgente locale con eBay sold (`data/historical_seed/ebay_reference_cases.csv`) e passare piu path in `HISTORICAL_REFERENCE_CASES_PATH` separati da virgola.
+- E' possibile aggiungere una seconda sorgente locale con dati secondario (eBay sold + Vinted active) in `data/historical_seed/ebay_reference_cases.csv` e passare piu path in `HISTORICAL_REFERENCE_CASES_PATH` separati da virgola.
 - Il prior applica pesi di recency (piu peso ai casi recenti) e filtri geografici (`HISTORICAL_ALLOWED_COUNTRIES`, `HISTORICAL_ALLOWED_REGIONS`).
 - Script di rigenerazione seed: `scripts/build_historical_reference_cases.py`.
-- Script sync eBay sold seed: `scripts/sync_ebay_sold_history.py`.
+- Script sync secondario (eBay sold + Vinted active): `scripts/sync_ebay_sold_history.py`.
 - Lo script legge il dataset raw ZIP in `data/historical_seed/raw/` (non versionato) e produce il CSV finale versionato.
-- Lo script eBay non richiede API key a pagamento.
+- Lo script secondario non richiede API key a pagamento.
 - Audit qualità seed:
   - `python scripts/audit_historical_reference_cases.py`
   - `python scripts/audit_historical_reference_cases.py --json`

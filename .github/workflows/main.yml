@@ -51,7 +51,7 @@ jobs:
           pip install -r requirements.playwright.txt
           python -m playwright install --with-deps chromium
 
-      - name: Sync eBay sold historical seed (IT/EU)
+      - name: Sync secondary historical seed (eBay sold + Vinted active)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -61,9 +61,12 @@ jobs:
             --out data/historical_seed/ebay_reference_cases.csv \
             --markets IT \
             --include-eu-fallback \
+            --include-vinted \
             --max-sets 120 \
+            --max-vinted-targets 45 \
             --lookback-days 365 \
-            --min-sold-listings 4
+            --min-sold-listings 4 \
+            --min-vinted-listings 3
 
       - name: Run scheduled discovery cycle
         env:

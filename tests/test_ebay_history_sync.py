@@ -41,12 +41,57 @@ class EbayHistorySyncTests(unittest.TestCase):
         prices = self.mod.extract_sold_prices_from_html(html)
         self.assertEqual(prices, [79.99, 149.9])
 
+    def test_extract_sold_prices_from_html_supports_s_card_dom(self) -> None:
+        html = """
+        <ul class="srp-river-results">
+          <li class="s-card s-card--horizontal s-card--overflow" id="item1">
+            <div class="su-card-container__content">
+              <div class="s-card__title">LEGO Set 76281 - Marvel X-Men X-Jet - Scatola Nuova Sigillata</div>
+              <div>EUR 53,28</div>
+              <div>+EUR 18,44 di spese di spedizione stimate</div>
+            </div>
+          </li>
+          <li class="s-card s-card--horizontal" id="item2">
+            <div class="su-card-container__content">
+              <div class="s-card__title">Shop on eBay</div>
+              <div>EUR 9,99</div>
+            </div>
+          </li>
+        </ul>
+        """
+        prices = self.mod.extract_sold_prices_from_html(html)
+        self.assertEqual(prices, [53.28])
+
+    def test_extract_vinted_listing_prices_from_html(self) -> None:
+        html = """
+        <div class="new-item-box__container">
+          <a href="https://www.vinted.it/items/7868717435-set-lego-x-men-ref-76281?referrer=catalog"
+             title="Set LEGO X-Men - Ref. 76281, brand: LEGO, condizioni: Nuovo con cartellino, taglia: Taglia unica, €65.00, €68.95 include la Protezione acquisti">
+          </a>
+        </div>
+        <div class="new-item-box__container">
+          <a href="https://www.vinted.it/items/7868719999-lego-used-76281?referrer=catalog"
+             title="LEGO 76281 usato, €40.00">
+          </a>
+        </div>
+        """
+        prices_new = self.mod.extract_vinted_listing_prices_from_html(html, require_new=True)
+        prices_all = self.mod.extract_vinted_listing_prices_from_html(html, require_new=False)
+        self.assertEqual(prices_new, [65.0])
+        self.assertEqual(prices_all, [65.0, 40.0])
+
     def test_build_search_url_includes_completed_and_sold_filters(self) -> None:
         url = self.mod._build_search_url("https://www.ebay.it", "76281 x-jet")
         self.assertIn("LH_Complete=1", url)
         self.assertIn("LH_Sold=1", url)
         self.assertIn("LH_ItemCondition=1000", url)
         self.assertIn("ebay.it/sch/i.html", url)
+
+    def test_build_vinted_search_url(self) -> None:
+        url = self.mod._build_vinted_search_url("https://www.vinted.it", "76281 x-jet")
+        self.assertIn("vinted.it/catalog", url)
+        self.assertIn("search_text=", url)
+        self.assertIn("order=newest_first", url)
 
     def test_build_case_rows_produces_it_and_eu_rows(self) -> None:
         class FakeClient:
@@ -108,6 +153,39 @@ class EbayHistorySyncTests(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 2)
         self.assertEqual(calls[0], ("IT", "77051"))
         self.assertTrue(any(query.startswith("77051 In volo") for _, query in calls[1:]))
+
+    def test_build_vinted_case_rows_produces_rows(self) -> None:
+        class FakeVintedClient:
+            def fetch_listing_prices(self, *, market: str, query: str, require_new: bool = True):  # noqa: ANN001
+                _ = query
+                _ = require_new
+                if market == "IT":
+                    return [70.0, 72.0, 75.0]
+                if market == "DE":
+                    return [68.0, 73.0, 79.0]
+                return []
+
+        targets = [
+            {
+                "set_id": "76281",
+                "set_name": "X-Jet di X-Men",
+                "theme": "Marvel",
+                "msrp_hint": 89.99,
+            }
+        ]
+        rows = self.mod._build_vinted_case_rows(
+            targets=targets,
+            markets=["IT", "DE"],
+            client=FakeVintedClient(),
+            min_listings=3,
+            target_roi_pct=20.0,
+        )
+        self.assertEqual(len(rows), 2)
+        by_country = {row["market_country"]: row for row in rows}
+        self.assertEqual(by_country["IT"]["source_dataset"], "vinted_active_it_30d")
+        self.assertEqual(by_country["DE"]["source_dataset"], "vinted_active_de_30d")
+        self.assertEqual(by_country["IT"]["market_region"], "EU")
+        self.assertEqual(by_country["IT"]["win_12m"], 0)
 
 
 if __name__ == "__main__":
