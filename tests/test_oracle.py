@@ -2519,6 +2519,82 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(int(stats["ai_batch_scored_count"]), 3)
         self.assertEqual(mocked_batch.await_count, 1)
 
+    async def test_score_ai_shortlist_single_call_mode_attempts_missing_rescue_once(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_single_call_scoring_enabled = True
+        oracle.ai_single_call_allow_repair_calls = False
+        oracle.ai_single_call_missing_rescue_enabled = True
+        oracle.ai_single_call_missing_rescue_max_candidates = 2
+        oracle.ai_single_call_missing_rescue_timeout_sec = 10.0
+        oracle.ai_scoring_hard_budget_sec = 20.0
+        oracle.ai_runtime = {
+            "engine": "openrouter",
+            "provider": "openrouter",
+            "model": "vendor/model-pro:free",
+            "mode": "api_openrouter_inventory",
+            "inventory_available": 1,
+        }
+
+        shortlist = []
+        for set_id in ("75367", "76281", "42182"):
+            shortlist.append(
+                {
+                    "set_id": set_id,
+                    "candidate": {
+                        "set_id": set_id,
+                        "set_name": f"Set {set_id}",
+                        "theme": "City",
+                        "source": "lego_proxy_reader",
+                        "current_price": 49.99,
+                        "eol_date_prediction": "2026-10-01",
+                    },
+                }
+            )
+
+        batch_call_counter = {"n": 0}
+
+        async def fake_batch(entries, **kwargs):  # noqa: ANN001
+            batch_call_counter["n"] += 1
+            if batch_call_counter["n"] == 1:
+                return {
+                    "75367": AIInsight(
+                        score=80,
+                        summary="ok 75367",
+                        predicted_eol_date="2026-10-01",
+                        fallback_used=False,
+                        confidence="HIGH_CONFIDENCE",
+                    )
+                }, None
+            return {
+                "76281": AIInsight(
+                    score=77,
+                    summary="ok 76281",
+                    predicted_eol_date="2026-10-01",
+                    fallback_used=False,
+                    confidence="HIGH_CONFIDENCE",
+                )
+            }, None
+
+        with patch.object(oracle, "_score_ai_shortlist_batch", new=AsyncMock(side_effect=fake_batch)) as mocked_batch:
+            results, stats = await oracle._score_ai_shortlist(shortlist)
+
+        self.assertEqual(mocked_batch.await_count, 2)
+        first_kwargs = mocked_batch.await_args_list[0].kwargs
+        second_kwargs = mocked_batch.await_args_list[1].kwargs
+        self.assertFalse(bool(first_kwargs.get("allow_repair_calls")))
+        self.assertTrue(bool(second_kwargs.get("allow_repair_calls")))
+        self.assertFalse(bool(second_kwargs.get("allow_failover_call")))
+
+        self.assertFalse(results["75367"].fallback_used)
+        self.assertFalse(results["76281"].fallback_used)
+        self.assertTrue(results["42182"].fallback_used)
+        self.assertEqual(int(stats["ai_scored_count"]), 2)
+        self.assertEqual(int(stats["ai_batch_scored_count"]), 2)
+        self.assertEqual(int(stats["ai_single_call_rescue_attempted"]), 1)
+        self.assertEqual(int(stats["ai_single_call_rescue_scored"]), 1)
+        self.assertEqual(int(stats["ai_budget_exhausted"]), 1)
+
     def test_select_ai_shortlist_single_call_applies_cap(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)

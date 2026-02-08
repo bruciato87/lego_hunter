@@ -98,8 +98,11 @@ jobs:
           AI_BATCH_MIN_CANDIDATES: "2"
           AI_BATCH_MAX_CANDIDATES: "10"
           AI_SINGLE_CALL_SCORING_ENABLED: "true"
-          AI_SINGLE_CALL_ALLOW_REPAIR_CALLS: "false"
+          AI_SINGLE_CALL_ALLOW_REPAIR_CALLS: "true"
           AI_SINGLE_CALL_MAX_CANDIDATES: "12"
+          AI_SINGLE_CALL_MISSING_RESCUE_ENABLED: "true"
+          AI_SINGLE_CALL_MISSING_RESCUE_MAX_CANDIDATES: "3"
+          AI_SINGLE_CALL_MISSING_RESCUE_TIMEOUT_SEC: "10"
           AI_CACHE_TTL_SEC: ${{ github.event.inputs.disable_ai_cache == 'true' && '0' || '10800' }}
           AI_PERSISTED_CACHE_TTL_SEC: ${{ github.event.inputs.disable_ai_cache == 'true' && '0' || '129600' }}
           AI_SCORE_GUARDRAIL_ENABLED: "true"

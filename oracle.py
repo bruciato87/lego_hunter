@@ -74,6 +74,9 @@ DEFAULT_AI_BATCH_TIMEOUT_SEC = 26.0
 DEFAULT_AI_SINGLE_CALL_SCORING_ENABLED = False
 DEFAULT_AI_SINGLE_CALL_ALLOW_REPAIR_CALLS = False
 DEFAULT_AI_SINGLE_CALL_MAX_CANDIDATES = 12
+DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_ENABLED = True
+DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_MAX_CANDIDATES = 3
+DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_TIMEOUT_SEC = 10.0
 DEFAULT_AI_SCORE_GUARDRAIL_ENABLED = True
 DEFAULT_AI_SCORE_SOFT_CAP = 95
 DEFAULT_AI_SCORE_SOFT_CAP_FACTOR = 0.35
@@ -549,6 +552,22 @@ class DiscoveryOracle:
             minimum=3,
             maximum=40,
         )
+        self.ai_single_call_missing_rescue_enabled = self._safe_env_bool(
+            "AI_SINGLE_CALL_MISSING_RESCUE_ENABLED",
+            default=DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_ENABLED,
+        )
+        self.ai_single_call_missing_rescue_max_candidates = self._safe_env_int(
+            "AI_SINGLE_CALL_MISSING_RESCUE_MAX_CANDIDATES",
+            default=DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_MAX_CANDIDATES,
+            minimum=1,
+            maximum=8,
+        )
+        self.ai_single_call_missing_rescue_timeout_sec = self._safe_env_float(
+            "AI_SINGLE_CALL_MISSING_RESCUE_TIMEOUT_SEC",
+            default=DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_TIMEOUT_SEC,
+            minimum=6.0,
+            maximum=25.0,
+        )
         self.ai_score_guardrail_enabled = self._safe_env_bool(
             "AI_SCORE_GUARDRAIL_ENABLED",
             default=DEFAULT_AI_SCORE_GUARDRAIL_ENABLED,
@@ -987,7 +1006,7 @@ class DiscoveryOracle:
             self.openrouter_free_tier_only,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s floor_multi_model=%s per_model=%s bonus=%s cache_ttl_sec=%.0f persisted_cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f ai_single_call=%s ai_single_call_allow_repair=%s ai_single_call_max_candidates=%s ai_guardrail_enabled=%s ai_soft_cap=%s ai_soft_cap_factor=%.2f ai_low_conf_cap=%s ai_non_json_cap=%s ai_top_pick_rescue_enabled=%s ai_top_pick_rescue_count=%s ai_top_pick_rescue_timeout_sec=%.1f ai_final_pick_guarantee_count=%s ai_final_pick_guarantee_rounds=%s openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s floor_multi_model=%s per_model=%s bonus=%s cache_ttl_sec=%.0f persisted_cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f ai_single_call=%s ai_single_call_allow_repair=%s ai_single_call_max_candidates=%s ai_single_call_missing_rescue_enabled=%s ai_single_call_missing_rescue_max=%s ai_single_call_missing_rescue_timeout_sec=%.1f ai_guardrail_enabled=%s ai_soft_cap=%s ai_soft_cap_factor=%.2f ai_low_conf_cap=%s ai_non_json_cap=%s ai_top_pick_rescue_enabled=%s ai_top_pick_rescue_count=%s ai_top_pick_rescue_timeout_sec=%.1f ai_final_pick_guarantee_count=%s ai_final_pick_guarantee_rounds=%s openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
             self.ai_dynamic_shortlist_enabled,
@@ -1013,6 +1032,9 @@ class DiscoveryOracle:
             self.ai_single_call_scoring_enabled,
             self.ai_single_call_allow_repair_calls,
             self.ai_single_call_max_candidates,
+            self.ai_single_call_missing_rescue_enabled,
+            self.ai_single_call_missing_rescue_max_candidates,
+            self.ai_single_call_missing_rescue_timeout_sec,
             self.ai_score_guardrail_enabled,
             self.ai_score_soft_cap,
             self.ai_score_soft_cap_factor,
@@ -4046,6 +4068,8 @@ class DiscoveryOracle:
             "ai_budget_exhausted": 0,
             "ai_timeout_count": 0,
             "ai_batch_scored_count": 0,
+            "ai_single_call_rescue_attempted": 0,
+            "ai_single_call_rescue_scored": 0,
         }
         if not shortlist:
             return {}, stats
@@ -4133,6 +4157,59 @@ class DiscoveryOracle:
             pending_entries = [entry for entry in pending_entries if str(entry["set_id"]) not in results]
 
         if single_call_mode:
+            if pending_entries and self.ai_single_call_missing_rescue_enabled:
+                rescue_entries = pending_entries[
+                    : max(1, int(self.ai_single_call_missing_rescue_max_candidates))
+                ]
+                budget_left_for_rescue = max(0.0, deadline - time.monotonic())
+                rescue_timeout_sec = min(
+                    float(self.ai_single_call_missing_rescue_timeout_sec),
+                    budget_left_for_rescue,
+                )
+                if rescue_timeout_sec >= 6.0 and rescue_entries:
+                    stats["ai_single_call_rescue_attempted"] = 1
+                    rescue_deadline = time.monotonic() + rescue_timeout_sec
+                    rescue_results, rescue_error = await self._score_ai_shortlist_batch(
+                        rescue_entries,
+                        deadline=rescue_deadline,
+                        allow_repair_calls=True,
+                        allow_failover_call=False,
+                    )
+                    if rescue_error:
+                        non_error_reasons = {"no_external_ai_available", "insufficient_budget_for_batch"}
+                        if str(rescue_error) in non_error_reasons:
+                            LOGGER.info(
+                                "AI single-call missing rescue skipped | candidates=%s reason=%s",
+                                len(rescue_entries),
+                                str(rescue_error)[:220],
+                            )
+                        else:
+                            stats["ai_errors"] += 1
+                            LOGGER.warning(
+                                "AI single-call missing rescue failed | candidates=%s error=%s",
+                                len(rescue_entries),
+                                str(rescue_error)[:220],
+                            )
+                    for entry in rescue_entries:
+                        set_id = str(entry["set_id"])
+                        ai = rescue_results.get(set_id)
+                        if ai is None:
+                            continue
+                        results[set_id] = ai
+                        stats["ai_cache_misses"] += 1
+                        if not ai.fallback_used:
+                            stats["ai_scored_count"] += 1
+                            stats["ai_batch_scored_count"] += 1
+                            stats["ai_single_call_rescue_scored"] += 1
+                            self._set_cached_ai_insight(entry["candidate"], ai)
+                    pending_entries = [entry for entry in pending_entries if str(entry["set_id"]) not in results]
+                elif rescue_entries:
+                    LOGGER.info(
+                        "AI single-call missing rescue skipped | reason=insufficient_budget timeout_sec=%.2f pending=%s",
+                        rescue_timeout_sec,
+                        len(pending_entries),
+                    )
+
             for entry in pending_entries:
                 set_id = str(entry["set_id"])
                 fallback = self._heuristic_ai_fallback(entry["candidate"])
@@ -4153,7 +4230,7 @@ class DiscoveryOracle:
 
             elapsed = time.monotonic() - started
             LOGGER.info(
-                "AI shortlist scoring summary | candidates=%s scored=%s batch_scored=%s cache_hits=%s persisted_cache_hits=%s cache_misses=%s errors=%s timeouts=%s budget_exhausted=%s concurrency=%s elapsed=%.2fs budget=%.2fs single_call=%s",
+                "AI shortlist scoring summary | candidates=%s scored=%s batch_scored=%s cache_hits=%s persisted_cache_hits=%s cache_misses=%s errors=%s timeouts=%s budget_exhausted=%s concurrency=%s elapsed=%.2fs budget=%.2fs single_call=%s single_call_rescue_attempted=%s single_call_rescue_scored=%s",
                 len(shortlist),
                 stats["ai_scored_count"],
                 stats["ai_batch_scored_count"],
@@ -4167,6 +4244,8 @@ class DiscoveryOracle:
                 elapsed,
                 self.ai_scoring_hard_budget_sec,
                 single_call_mode,
+                stats["ai_single_call_rescue_attempted"],
+                stats["ai_single_call_rescue_scored"],
             )
             return results, stats
 
@@ -4353,7 +4432,7 @@ class DiscoveryOracle:
 
         elapsed = time.monotonic() - started
         LOGGER.info(
-            "AI shortlist scoring summary | candidates=%s scored=%s batch_scored=%s cache_hits=%s persisted_cache_hits=%s cache_misses=%s errors=%s timeouts=%s budget_exhausted=%s concurrency=%s elapsed=%.2fs budget=%.2fs single_call=%s",
+            "AI shortlist scoring summary | candidates=%s scored=%s batch_scored=%s cache_hits=%s persisted_cache_hits=%s cache_misses=%s errors=%s timeouts=%s budget_exhausted=%s concurrency=%s elapsed=%.2fs budget=%.2fs single_call=%s single_call_rescue_attempted=%s single_call_rescue_scored=%s",
             len(shortlist),
             stats["ai_scored_count"],
             stats["ai_batch_scored_count"],
@@ -4367,6 +4446,8 @@ class DiscoveryOracle:
             elapsed,
             self.ai_scoring_hard_budget_sec,
             single_call_mode,
+            stats["ai_single_call_rescue_attempted"],
+            stats["ai_single_call_rescue_scored"],
         )
         return results, stats
 
