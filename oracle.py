@@ -74,6 +74,11 @@ DEFAULT_BOOTSTRAP_THRESHOLDS_ENABLED = False
 DEFAULT_BOOTSTRAP_MIN_HISTORY_POINTS = 45
 DEFAULT_BOOTSTRAP_MIN_UPSIDE_PROBABILITY = 0.52
 DEFAULT_BOOTSTRAP_MIN_CONFIDENCE_SCORE = 50
+DEFAULT_HISTORICAL_HIGH_CONF_REQUIRED = True
+DEFAULT_HISTORICAL_HIGH_CONF_MIN_SAMPLES = 24
+DEFAULT_HISTORICAL_HIGH_CONF_MIN_WIN_RATE_PCT = 56.0
+DEFAULT_HISTORICAL_HIGH_CONF_MIN_SUPPORT_CONFIDENCE = 50
+DEFAULT_HISTORICAL_HIGH_CONF_MIN_PRIOR_SCORE = 60
 DEFAULT_AI_MODEL_BAN_SEC = 1800.0
 DEFAULT_AI_MODEL_BAN_FAILURES = 2
 DEFAULT_AI_MODEL_FAILURE_PENALTY = 22
@@ -540,6 +545,34 @@ class DiscoveryOracle:
             minimum=1,
             maximum=100,
         )
+        self.historical_high_conf_required = self._safe_env_bool(
+            "HISTORICAL_HIGH_CONF_REQUIRED",
+            default=DEFAULT_HISTORICAL_HIGH_CONF_REQUIRED,
+        )
+        self.historical_high_conf_min_samples = self._safe_env_int(
+            "HISTORICAL_HIGH_CONF_MIN_SAMPLES",
+            default=DEFAULT_HISTORICAL_HIGH_CONF_MIN_SAMPLES,
+            minimum=5,
+            maximum=250,
+        )
+        self.historical_high_conf_min_win_rate_pct = self._safe_env_float(
+            "HISTORICAL_HIGH_CONF_MIN_WIN_RATE_PCT",
+            default=DEFAULT_HISTORICAL_HIGH_CONF_MIN_WIN_RATE_PCT,
+            minimum=1.0,
+            maximum=100.0,
+        )
+        self.historical_high_conf_min_support_confidence = self._safe_env_int(
+            "HISTORICAL_HIGH_CONF_MIN_SUPPORT_CONFIDENCE",
+            default=DEFAULT_HISTORICAL_HIGH_CONF_MIN_SUPPORT_CONFIDENCE,
+            minimum=1,
+            maximum=100,
+        )
+        self.historical_high_conf_min_prior_score = self._safe_env_int(
+            "HISTORICAL_HIGH_CONF_MIN_PRIOR_SCORE",
+            default=DEFAULT_HISTORICAL_HIGH_CONF_MIN_PRIOR_SCORE,
+            minimum=1,
+            maximum=100,
+        )
         self.openrouter_opportunistic_enabled = self._safe_env_bool(
             "OPENROUTER_OPPORTUNISTIC_ENABLED",
             default=DEFAULT_OPENROUTER_OPPORTUNISTIC_ENABLED,
@@ -730,7 +763,7 @@ class DiscoveryOracle:
             self.openrouter_opportunistic_timeout_sec,
         )
         LOGGER.info(
-            "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f bootstrap_enabled=%s bootstrap_min_history=%s bootstrap_min_prob=%.2f bootstrap_min_confidence=%s",
+            "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f bootstrap_enabled=%s bootstrap_min_history=%s bootstrap_min_prob=%.2f bootstrap_min_confidence=%s historical_gate_required=%s historical_min_samples=%s historical_min_win_rate_pct=%.1f historical_min_support_confidence=%s historical_min_prior_score=%s",
             self.min_composite_score,
             self.min_upside_probability,
             self.min_confidence_score,
@@ -740,6 +773,11 @@ class DiscoveryOracle:
             self.bootstrap_min_history_points,
             self.bootstrap_min_upside_probability,
             self.bootstrap_min_confidence_score,
+            self.historical_high_conf_required,
+            self.historical_high_conf_min_samples,
+            self.historical_high_conf_min_win_rate_pct,
+            self.historical_high_conf_min_support_confidence,
+            self.historical_high_conf_min_prior_score,
         )
         LOGGER.info(
             "Backtest tuning | enabled=%s lookback_days=%s horizon_days=%s min_selected=%s profile=%s",
@@ -750,13 +788,18 @@ class DiscoveryOracle:
             self.threshold_profile,
         )
         LOGGER.info(
-            "Historical prior tuning | enabled=%s cases=%s path=%s min_samples=%s weight=%.2f price_tolerance=%.2f",
+            "Historical prior tuning | enabled=%s cases=%s path=%s min_samples=%s weight=%.2f price_tolerance=%.2f high_conf_required=%s high_conf_min_samples=%s high_conf_min_win_rate_pct=%.1f high_conf_min_support_confidence=%s high_conf_min_prior_score=%s",
             self.historical_reference_enabled,
             len(self._historical_reference_cases),
             self.historical_reference_path,
             self.historical_reference_min_samples,
             self.historical_prior_weight,
             self.historical_price_band_tolerance,
+            self.historical_high_conf_required,
+            self.historical_high_conf_min_samples,
+            self.historical_high_conf_min_win_rate_pct,
+            self.historical_high_conf_min_support_confidence,
+            self.historical_high_conf_min_prior_score,
         )
         LOGGER.info("Discovery source mode configured: %s", self.discovery_source_mode)
 
@@ -2649,6 +2692,11 @@ class DiscoveryOracle:
             for row in ranked
             if self._effective_high_confidence_thresholds(row)[2]
         )
+        historical_gate_blocked_count = sum(
+            1
+            for row in above_threshold
+            if not self._historical_high_confidence_status(row)[0]
+        )
 
         diagnostics = {
             "threshold": self.min_composite_score,
@@ -2660,6 +2708,12 @@ class DiscoveryOracle:
             "bootstrap_min_probability_high_confidence": self.bootstrap_min_upside_probability,
             "bootstrap_min_confidence_score_high_confidence": self.bootstrap_min_confidence_score,
             "bootstrap_rows_count": bootstrap_rows_count,
+            "historical_high_conf_required": self.historical_high_conf_required,
+            "historical_high_conf_min_samples": self.historical_high_conf_min_samples,
+            "historical_high_conf_min_win_rate_pct": self.historical_high_conf_min_win_rate_pct,
+            "historical_high_conf_min_support_confidence": self.historical_high_conf_min_support_confidence,
+            "historical_high_conf_min_prior_score": self.historical_high_conf_min_prior_score,
+            "historical_gate_blocked_count": historical_gate_blocked_count,
             "threshold_profile": dict(self.threshold_profile),
             "source_strategy": source_diagnostics.get("source_strategy"),
             "source_order": source_diagnostics.get("source_order", []),
@@ -5566,6 +5620,64 @@ class DiscoveryOracle:
 
         return probability_threshold, confidence_threshold, bootstrap_active, data_points
 
+    @staticmethod
+    def _row_metric_value(row: Dict[str, Any], key: str) -> Any:
+        if row.get(key) is not None:
+            return row.get(key)
+        meta = row.get("metadata")
+        if isinstance(meta, dict):
+            return meta.get(key)
+        return None
+
+    def _historical_high_confidence_status(self, row: Dict[str, Any]) -> tuple[bool, list[str]]:
+        if not self.historical_high_conf_required:
+            return True, []
+
+        reasons: list[str] = []
+        sample_size_raw = self._row_metric_value(row, "historical_sample_size")
+        try:
+            sample_size = max(0, int(float(sample_size_raw or 0)))
+        except (TypeError, ValueError):
+            sample_size = 0
+
+        if sample_size < int(self.historical_high_conf_min_samples):
+            reasons.append(
+                f"Evidenza storica insufficiente ({sample_size} < {self.historical_high_conf_min_samples} campioni)"
+            )
+            return False, reasons
+
+        win_rate_pct_raw = self._row_metric_value(row, "historical_win_rate_12m_pct")
+        try:
+            win_rate_pct = float(win_rate_pct_raw or 0.0)
+        except (TypeError, ValueError):
+            win_rate_pct = 0.0
+        if win_rate_pct < float(self.historical_high_conf_min_win_rate_pct):
+            reasons.append(
+                f"Win-rate storico 12m sotto soglia ({win_rate_pct:.1f}% < {self.historical_high_conf_min_win_rate_pct:.0f}%)"
+            )
+
+        support_conf_raw = self._row_metric_value(row, "historical_support_confidence")
+        try:
+            support_conf = max(0, int(float(support_conf_raw or 0)))
+        except (TypeError, ValueError):
+            support_conf = 0
+        if support_conf < int(self.historical_high_conf_min_support_confidence):
+            reasons.append(
+                f"Confidenza supporto storico sotto soglia ({support_conf} < {self.historical_high_conf_min_support_confidence})"
+            )
+
+        prior_score_raw = self._row_metric_value(row, "historical_prior_score")
+        try:
+            prior_score = max(0, int(float(prior_score_raw or 0)))
+        except (TypeError, ValueError):
+            prior_score = 0
+        if prior_score < int(self.historical_high_conf_min_prior_score):
+            reasons.append(
+                f"Prior storico sotto soglia ({prior_score} < {self.historical_high_conf_min_prior_score})"
+            )
+
+        return not reasons, reasons
+
     def _is_high_confidence_pick(self, row: Dict[str, Any]) -> bool:
         if row.get("ai_fallback_used"):
             return False
@@ -5573,10 +5685,12 @@ class DiscoveryOracle:
         confidence_score = int(row.get("confidence_score") or 0)
         composite_score = int(row.get("composite_score") or row.get("ai_investment_score") or 0)
         probability_threshold, confidence_threshold, _bootstrap_active, _points = self._effective_high_confidence_thresholds(row)
+        historical_ok, _historical_reasons = self._historical_high_confidence_status(row)
         return (
             composite_score >= self.min_composite_score
             and probability_pct >= (probability_threshold * 100.0)
             and confidence_score >= confidence_threshold
+            and historical_ok
         )
 
     def _build_low_confidence_note(self, row: Dict[str, Any]) -> str:
@@ -5606,6 +5720,10 @@ class DiscoveryOracle:
             reasons.append(
                 f"Bootstrap soglie attivo (data points {data_points} < {self.bootstrap_min_history_points})"
             )
+
+        historical_ok, historical_reasons = self._historical_high_confidence_status(row)
+        if not historical_ok:
+            reasons.extend(historical_reasons)
 
         if reasons:
             return "; ".join(reasons) + "."

@@ -63,6 +63,7 @@ class DummyOracle(DiscoveryOracle):
         super().__init__(repository, gemini_api_key=None, min_ai_score=60)
         self._candidates = candidates
         self.ai_calls = 0
+        self.historical_high_conf_required = False
 
     async def _collect_source_candidates(self):
         return self._candidates
@@ -1895,6 +1896,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
     def test_bootstrap_thresholds_can_promote_high_confidence_when_history_is_short(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_high_conf_required = False
         oracle.bootstrap_thresholds_enabled = True
         oracle.bootstrap_min_history_points = 45
         oracle.bootstrap_min_upside_probability = 0.52
@@ -1926,6 +1928,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
     def test_low_confidence_note_mentions_bootstrap_when_active(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_high_conf_required = False
         oracle.bootstrap_thresholds_enabled = True
         oracle.bootstrap_min_history_points = 45
         oracle.bootstrap_min_upside_probability = 0.52
@@ -1944,6 +1947,62 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertIn("Bootstrap soglie attivo", note)
         self.assertIn("50.0% < 52%", note)
         self.assertIn("45 < 50", note)
+
+    def test_high_confidence_requires_historical_evidence(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_high_conf_required = True
+        oracle.historical_high_conf_min_samples = 24
+        oracle.historical_high_conf_min_win_rate_pct = 56.0
+        oracle.historical_high_conf_min_support_confidence = 50
+        oracle.historical_high_conf_min_prior_score = 60
+        oracle.min_upside_probability = 0.60
+        oracle.min_confidence_score = 68
+        oracle.min_composite_score = 60
+
+        row = {
+            "set_id": "76281",
+            "ai_fallback_used": False,
+            "composite_score": 74,
+            "forecast_probability_upside_12m": 64.0,
+            "confidence_score": 72,
+            "forecast_data_points": 120,
+            "historical_sample_size": 12,
+            "historical_win_rate_12m_pct": 75.0,
+            "historical_support_confidence": 62,
+            "historical_prior_score": 77,
+        }
+
+        self.assertFalse(oracle._is_high_confidence_pick(row))
+        note = oracle._build_low_confidence_note(row)
+        self.assertIn("Evidenza storica insufficiente", note)
+
+    def test_high_confidence_passes_when_historical_evidence_is_strong(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_high_conf_required = True
+        oracle.historical_high_conf_min_samples = 24
+        oracle.historical_high_conf_min_win_rate_pct = 56.0
+        oracle.historical_high_conf_min_support_confidence = 50
+        oracle.historical_high_conf_min_prior_score = 60
+        oracle.min_upside_probability = 0.60
+        oracle.min_confidence_score = 68
+        oracle.min_composite_score = 60
+
+        row = {
+            "set_id": "76281",
+            "ai_fallback_used": False,
+            "composite_score": 74,
+            "forecast_probability_upside_12m": 64.0,
+            "confidence_score": 72,
+            "forecast_data_points": 120,
+            "historical_sample_size": 36,
+            "historical_win_rate_12m_pct": 69.0,
+            "historical_support_confidence": 63,
+            "historical_prior_score": 76,
+        }
+
+        self.assertTrue(oracle._is_high_confidence_pick(row))
 
     def test_format_exception_for_log_timeout_has_message(self) -> None:
         err_type, err_message = DiscoveryOracle._format_exception_for_log(asyncio.TimeoutError())
