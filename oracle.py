@@ -3075,6 +3075,23 @@ class DiscoveryOracle:
             effective_hist_min_prior_score,
             adaptive_hist_active,
         ) = self._effective_historical_high_confidence_thresholds()
+        ai_shortlisted_rows = [row for row in ranked if bool(row.get("ai_shortlisted"))]
+        ai_shortlist_count = len(ai_shortlisted_rows)
+        ai_fallback_total_count = sum(1 for row in ranked if bool(row.get("ai_fallback_used")))
+
+        def _is_non_json_row(row: Dict[str, Any]) -> bool:
+            return self._is_non_json_ai_note(
+                str(row.get("risk_note") or row.get("metadata", {}).get("ai_risk_note") or "")
+            )
+
+        ai_non_json_total_count = sum(1 for row in ranked if _is_non_json_row(row))
+        ai_shortlist_fallback_count = sum(1 for row in ai_shortlisted_rows if bool(row.get("ai_fallback_used")))
+        ai_shortlist_non_json_count = sum(1 for row in ai_shortlisted_rows if _is_non_json_row(row))
+        ai_shortlist_strict_pass_count = sum(
+            1
+            for row in ai_shortlisted_rows
+            if (not bool(row.get("ai_fallback_used")) and not _is_non_json_row(row))
+        )
 
         diagnostics = {
             "threshold": self.min_composite_score,
@@ -3121,7 +3138,11 @@ class DiscoveryOracle:
             "above_threshold_high_confidence_strict_count": len(above_threshold_high_conf_strict),
             "above_threshold_high_confidence_bootstrap_count": len(above_threshold_high_conf_bootstrap),
             "above_threshold_low_confidence_count": len(above_threshold_low_conf),
-            "fallback_scored_count": sum(1 for row in ranked if row.get("ai_fallback_used")),
+            "fallback_scored_count": ai_fallback_total_count,
+            "ai_shortlist_effective_count": ai_shortlist_count,
+            "ai_shortlist_fallback_count": ai_shortlist_fallback_count,
+            "ai_shortlist_non_json_count": ai_shortlist_non_json_count,
+            "ai_shortlist_strict_pass_count": ai_shortlist_strict_pass_count,
             "below_threshold_count": len(ranked) - len(above_threshold),
             "max_ai_score": max(
                 (
@@ -3172,22 +3193,32 @@ class DiscoveryOracle:
             "model_health": self._model_health_public(),
             "backtest_runtime": self._backtest_runtime_public(self.backtest_runtime),
             "ranking": dict(self._last_ranking_diagnostics or {}),
-            "ai_non_json_count": sum(
-                1
-                for row in ranked
-                if self._is_non_json_ai_note(
-                    str(row.get("risk_note") or row.get("metadata", {}).get("ai_risk_note") or "")
-                )
-            ),
+            "ai_non_json_count": ai_non_json_total_count,
         }
 
         ranked_count = max(1, len(ranked))
-        diagnostics["fallback_rate"] = round(float(diagnostics["fallback_scored_count"]) / ranked_count, 4)
-        diagnostics["non_json_rate"] = round(float(diagnostics["ai_non_json_count"]) / ranked_count, 4)
-        diagnostics["strict_pass_rate"] = round(
+        shortlist_count_for_rate = max(1, ai_shortlist_count)
+        diagnostics["fallback_rate_total"] = round(float(diagnostics["fallback_scored_count"]) / ranked_count, 4)
+        diagnostics["non_json_rate_total"] = round(float(diagnostics["ai_non_json_count"]) / ranked_count, 4)
+        diagnostics["fallback_rate_shortlist"] = round(
+            float(diagnostics["ai_shortlist_fallback_count"]) / shortlist_count_for_rate,
+            4,
+        )
+        diagnostics["non_json_rate_shortlist"] = round(
+            float(diagnostics["ai_shortlist_non_json_count"]) / shortlist_count_for_rate,
+            4,
+        )
+        diagnostics["strict_pass_rate_shortlist"] = round(
+            float(diagnostics["ai_shortlist_strict_pass_count"]) / shortlist_count_for_rate,
+            4,
+        )
+        diagnostics["high_conf_strict_rate"] = round(
             float(diagnostics["above_threshold_high_confidence_strict_count"]) / max(1, int(diagnostics["above_threshold_count"])),
             4,
         )
+        diagnostics["fallback_rate"] = diagnostics["fallback_rate_shortlist"]
+        diagnostics["non_json_rate"] = diagnostics["non_json_rate_shortlist"]
+        diagnostics["strict_pass_rate"] = diagnostics["strict_pass_rate_shortlist"]
 
         if ranked:
             top_debug = [
@@ -3297,7 +3328,7 @@ class DiscoveryOracle:
             "ai_final_pick_guarantee_rescue_sets": 0,
             "ai_final_pick_guarantee_pending_after_rounds": 0,
         }
-        if self.ai_top_pick_rescue_enabled and ranked and not self.ai_single_call_scoring_enabled:
+        if self.ai_top_pick_rescue_enabled and ranked:
             initial_rescue_stats = await self._rescue_top_pick_ai_scores(
                 prepared=prepared,
                 ranked=ranked,
@@ -3314,7 +3345,8 @@ class DiscoveryOracle:
                     shortlist_count=len(shortlist),
                 )
 
-            guarantee_count = max(1, int(self.ai_final_pick_guarantee_count))
+            # Always guarantee at least a top-3 external AI attempt before accepting fallback.
+            guarantee_count = max(3, int(self.ai_final_pick_guarantee_count))
             guarantee_rounds = max(1, int(self.ai_final_pick_guarantee_rounds))
             for _ in range(guarantee_rounds):
                 top_rows = sorted(
@@ -4009,17 +4041,18 @@ class DiscoveryOracle:
             return [], []
 
         if self.ai_single_call_scoring_enabled:
-            shortlist_cap = min(len(prepared), max(3, int(self.ai_single_call_max_candidates)))
+            shortlist_cap = self._effective_ai_single_call_shortlist_cap(len(prepared))
             shortlist = prepared[:shortlist_cap]
             skipped = prepared[shortlist_cap:]
             for row in shortlist:
                 row["ai_shortlisted"] = True
             if skipped:
                 LOGGER.info(
-                    "AI single-call shortlist cap applied | candidates=%s selected=%s skipped=%s cap=%s",
+                    "AI single-call shortlist cap applied | candidates=%s selected=%s skipped=%s cap_effective=%s cap_configured=%s",
                     len(prepared),
                     len(shortlist),
                     len(skipped),
+                    shortlist_cap,
                     self.ai_single_call_max_candidates,
                 )
             return shortlist, skipped
@@ -4030,6 +4063,42 @@ class DiscoveryOracle:
         for row in shortlist:
             row["ai_shortlisted"] = True
         return shortlist, skipped
+
+    def _effective_ai_single_call_shortlist_cap(self, candidate_count: int) -> int:
+        if candidate_count <= 0:
+            return 0
+
+        base_cap = min(candidate_count, max(3, int(self.ai_single_call_max_candidates)))
+        if not self.ai_dynamic_shortlist_enabled:
+            return base_cap
+
+        engine = str(self.ai_runtime.get("engine") or "")
+        if engine != "openrouter":
+            return base_cap
+
+        inventory_available = int(
+            self.ai_runtime.get("inventory_available")
+            or len(self._openrouter_available_candidates)
+            or 0
+        )
+        if inventory_available <= 0:
+            return base_cap
+
+        adaptive_floor = max(3, int(self.ai_dynamic_shortlist_floor))
+        if inventory_available >= 2:
+            adaptive_floor = max(adaptive_floor, int(self.ai_dynamic_shortlist_multi_model_floor))
+
+        effective = min(candidate_count, max(base_cap, adaptive_floor))
+        if effective > base_cap:
+            LOGGER.info(
+                "AI single-call shortlist floor raised | candidates=%s base=%s effective=%s inventory_available=%s engine=%s",
+                candidate_count,
+                base_cap,
+                effective,
+                inventory_available,
+                engine,
+            )
+        return effective
 
     def _effective_ai_shortlist_limit(self, candidate_count: int) -> int:
         if candidate_count <= 0:

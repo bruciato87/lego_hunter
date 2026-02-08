@@ -836,14 +836,42 @@ class LegoHunterTelegramBot:
             f"Max Score: {int(diagnostics.get('max_composite_score', 0))} | "
             f"Max Prob12m: {float(diagnostics.get('max_probability_upside_12m', 0.0)):.1f}%"
         )
-        strict_pass_rate = float(diagnostics.get("strict_pass_rate") or 0.0)
-        non_json_rate = float(diagnostics.get("non_json_rate") or 0.0)
-        fallback_rate = float(diagnostics.get("fallback_rate") or 0.0)
+        strict_pass_rate = float(
+            diagnostics.get("strict_pass_rate_shortlist")
+            if diagnostics.get("strict_pass_rate_shortlist") is not None
+            else diagnostics.get("strict_pass_rate")
+            or 0.0
+        )
+        non_json_rate = float(
+            diagnostics.get("non_json_rate_shortlist")
+            if diagnostics.get("non_json_rate_shortlist") is not None
+            else diagnostics.get("non_json_rate")
+            or 0.0
+        )
+        fallback_rate = float(
+            diagnostics.get("fallback_rate_shortlist")
+            if diagnostics.get("fallback_rate_shortlist") is not None
+            else diagnostics.get("fallback_rate")
+            or 0.0
+        )
         if strict_pass_rate > 0.0 or non_json_rate > 0.0 or fallback_rate > 0.0:
             lines.append(
-                f"🧪 Qualita AI: strict-pass {strict_pass_rate * 100.0:.0f}% | "
+                f"🧪 Qualita AI (shortlist): strict-pass {strict_pass_rate * 100.0:.0f}% | "
                 f"non-JSON {non_json_rate * 100.0:.0f}% | "
                 f"fallback {fallback_rate * 100.0:.0f}%"
+            )
+        total_non_json_rate = float(diagnostics.get("non_json_rate_total") or 0.0)
+        total_fallback_rate = float(diagnostics.get("fallback_rate_total") or 0.0)
+        if (
+            diagnostics.get("non_json_rate_total") is not None
+            or diagnostics.get("fallback_rate_total") is not None
+        ) and (
+            abs(total_non_json_rate - non_json_rate) > 0.0001
+            or abs(total_fallback_rate - fallback_rate) > 0.0001
+        ):
+            lines.append(
+                f"📊 Copertura ranking totale: non-JSON {total_non_json_rate * 100.0:.0f}% | "
+                f"fallback {total_fallback_rate * 100.0:.0f}%"
             )
         ai_guardrails = int(diagnostics.get("ai_guardrail_applied_count") or 0)
         if ai_guardrails > 0:
