@@ -78,6 +78,11 @@ Configurazione webhook Telegram:
 python scripts/configure_telegram_webhook.py --base-url https://<tuo-progetto>.vercel.app
 ```
 
+Alternativa cloud-only (senza locale):
+- workflow GitHub `telegram-webhook` (`workflow_dispatch`)
+- input `base_url` oppure variabile repo `WEBHOOK_BASE_URL`
+- secrets richiesti: `TELEGRAM_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`
+
 Verifica rapida:
 ```bash
 curl -s https://<tuo-progetto>.vercel.app/healthz

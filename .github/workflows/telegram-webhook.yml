@@ -1,0 +1,48 @@
+name: telegram-webhook
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Public Vercel URL (es. https://lego-hunter.vercel.app)"
+        required: false
+        type: string
+      drop_pending_updates:
+        description: "Drop pending Telegram updates before enabling webhook"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  configure-webhook:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: python -m pip install --upgrade pip requests
+
+      - name: Configure Telegram webhook
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          WEBHOOK_BASE_URL: ${{ inputs.base_url != '' && inputs.base_url || vars.WEBHOOK_BASE_URL }}
+          DROP_PENDING_UPDATES: ${{ inputs.drop_pending_updates }}
+        run: |
+          if [ -z "$WEBHOOK_BASE_URL" ]; then
+            echo "Missing base URL: pass workflow input 'base_url' or set repository variable WEBHOOK_BASE_URL" >&2
+            exit 1
+          fi
+
+          EXTRA_ARGS=""
+          if [ "$DROP_PENDING_UPDATES" = "true" ]; then
+            EXTRA_ARGS="--drop-pending-updates"
+          fi
+
+          python scripts/configure_telegram_webhook.py --base-url "$WEBHOOK_BASE_URL" $EXTRA_ARGS
