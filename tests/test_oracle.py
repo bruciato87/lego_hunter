@@ -312,6 +312,73 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(int(oracle._historical_market_filter_stats.get("rows_loaded") or 0), 1)
         self.assertEqual(int(oracle._historical_market_filter_stats.get("rows_skipped_market_scope") or 0), 2)
 
+    def test_historical_market_scope_infers_eu_for_mendeley_source(self) -> None:
+        headers = [
+            "set_id",
+            "set_name",
+            "theme",
+            "msrp_usd",
+            "roi_12m_pct",
+            "win_12m",
+            "source_dataset",
+            "pattern_tags",
+            "end_date",
+            "market_country",
+            "market_region",
+        ]
+        rows = [
+            {
+                "set_id": "20001",
+                "set_name": "Legacy Mendeley",
+                "theme": "City",
+                "msrp_usd": "20",
+                "roi_12m_pct": "31.0",
+                "win_12m": "1",
+                "source_dataset": "mendeley_whole_2018_2019",
+                "pattern_tags": "[]",
+                "end_date": "2019-04-01",
+                "market_country": "",
+                "market_region": "",
+            },
+            {
+                "set_id": "20002",
+                "set_name": "Unknown non legacy",
+                "theme": "City",
+                "msrp_usd": "20",
+                "roi_12m_pct": "12.0",
+                "win_12m": "0",
+                "source_dataset": "unknown_dataset",
+                "pattern_tags": "[]",
+                "end_date": "2025-12-01",
+                "market_country": "",
+                "market_region": "",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            csv_path = os.path.join(temp_dir, "historical_scope_mendeley.csv")
+            with open(csv_path, "w", encoding="utf-8", newline="") as fp:
+                writer = csv.DictWriter(fp, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(rows)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "HISTORICAL_REFERENCE_CASES_PATH": csv_path,
+                    "HISTORICAL_ALLOWED_COUNTRIES": "IT",
+                    "HISTORICAL_ALLOWED_REGIONS": "EU",
+                    "HISTORICAL_INCLUDE_UNKNOWN_MARKET": "false",
+                },
+                clear=False,
+            ):
+                oracle = DiscoveryOracle(FakeRepo(), gemini_api_key=None, openrouter_api_key=None)
+
+        loaded_ids = {str(row.get("set_id")) for row in oracle._historical_reference_cases}
+        self.assertEqual(loaded_ids, {"20001"})
+        self.assertEqual(int(oracle._historical_market_filter_stats.get("rows_loaded") or 0), 1)
+        self.assertEqual(int(oracle._historical_market_filter_stats.get("rows_inferred_market_scope") or 0), 1)
+
     def test_historical_prior_recency_weight_prefers_recent_cases(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)

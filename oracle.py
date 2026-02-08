@@ -4850,6 +4850,26 @@ class DiscoveryOracle:
             normalized = "EU"
         return normalized
 
+    @classmethod
+    def _infer_market_scope_from_source_dataset(cls, source_dataset: Any) -> tuple[str, str]:
+        token = str(source_dataset or "").strip().lower()
+        if not token:
+            return "", ""
+
+        if token.startswith("ebay_sold_"):
+            match = re.match(r"^ebay_sold_([a-z]{2})", token)
+            if match:
+                country = match.group(1).upper()
+                region = "EU" if country in EUROPE_MARKET_COUNTRY_CODES else ""
+                return country, region
+
+        # Legacy academic seeds do not carry explicit geo columns:
+        # prefer EU-region inference instead of discarding all rows under IT/EU gating.
+        if token.startswith("mendeley_"):
+            return "", "EU"
+
+        return "", ""
+
     def _historical_market_allowed(self, market_country: str, market_region: str) -> bool:
         country = self._normalize_market_country_code(market_country)
         region = self._normalize_market_region(market_region, market_country=country)
@@ -4955,6 +4975,7 @@ class DiscoveryOracle:
             "rows_skipped_missing_id": 0,
             "rows_skipped_missing_roi": 0,
             "rows_skipped_market_scope": 0,
+            "rows_inferred_market_scope": 0,
             "missing_paths": [],
         }
 
@@ -4989,6 +5010,13 @@ class DiscoveryOracle:
                             row.get("market_region") or row.get("market_scope"),
                             market_country=market_country,
                         )
+                        source_dataset = str(row.get("source_dataset") or "").strip()
+                        if not market_country and not market_region:
+                            inferred_country, inferred_region = self._infer_market_scope_from_source_dataset(source_dataset)
+                            if inferred_country or inferred_region:
+                                market_country = market_country or inferred_country
+                                market_region = market_region or inferred_region
+                                stats["rows_inferred_market_scope"] += 1
                         if not self._historical_market_allowed(market_country, market_region):
                             stats["rows_skipped_market_scope"] += 1
                             continue
@@ -5021,7 +5049,7 @@ class DiscoveryOracle:
                             "msrp_usd": msrp,
                             "roi_12m_pct": roi_12m,
                             "win_12m": int(win_12m),
-                            "source_dataset": str(row.get("source_dataset") or "").strip(),
+                            "source_dataset": source_dataset,
                             "pattern_tags": str(row.get("pattern_tags") or "").strip(),
                             "pattern_tags_list": self._parse_pattern_tags(row.get("pattern_tags")),
                             "end_date": str(row.get("end_date") or "").strip(),

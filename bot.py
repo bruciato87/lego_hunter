@@ -851,10 +851,11 @@ class LegoHunterTelegramBot:
                 loaded = int(hist_filter.get("rows_loaded") or 0)
                 total = int(hist_filter.get("rows_total") or 0)
                 skipped_scope = int(hist_filter.get("rows_skipped_market_scope") or 0)
+                inferred_scope = int(hist_filter.get("rows_inferred_market_scope") or 0)
                 lines.append(
                     "🌍 Scope storico: "
                     f"country={countries_label} region={regions_label} unknown={'si' if hist_unknown else 'no'} | "
-                    f"load {loaded}/{total} (scartati scope {skipped_scope})"
+                    f"load {loaded}/{total} (scartati scope {skipped_scope}, inferiti {inferred_scope})"
                 )
             else:
                 lines.append(

@@ -79,6 +79,36 @@ class EbayHistorySyncTests(unittest.TestCase):
         self.assertEqual(by_country["IT"]["market_region"], "EU")
         self.assertTrue(float(by_country["IT"]["roi_12m_pct"]) > 0.0)
 
+    def test_build_case_rows_uses_progressive_query_variants(self) -> None:
+        calls = []
+
+        class FakeClient:
+            def fetch_sold_prices(self, *, market: str, query: str):  # noqa: ANN001
+                calls.append((market, query))
+                if market == "IT" and query.startswith("77051 In volo"):
+                    return [39.0, 42.0, 45.0, 47.0]
+                return []
+
+        targets = [
+            {
+                "set_id": "77051",
+                "set_name": "In volo con la Dodo Airlines",
+                "theme": "Animal Crossing",
+                "msrp_hint": 34.99,
+            }
+        ]
+        rows = self.mod._build_case_rows(
+            targets=targets,
+            markets=["IT"],
+            client=FakeClient(),
+            min_sold_listings=4,
+            target_roi_pct=20.0,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(calls[0], ("IT", "77051"))
+        self.assertTrue(any(query.startswith("77051 In volo") for _, query in calls[1:]))
+
 
 if __name__ == "__main__":
     unittest.main()

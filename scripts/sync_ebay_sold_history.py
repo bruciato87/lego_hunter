@@ -85,6 +85,31 @@ def _parse_csv_list(raw_value: str) -> list[str]:
     return out
 
 
+def _build_query_variants(set_id: str, set_name: str) -> list[str]:
+    variants: list[str] = []
+    base_id = str(set_id or "").strip()
+    if base_id:
+        variants.append(base_id)
+
+    normalized_name = re.sub(r"[^0-9A-Za-z ]+", " ", str(set_name or ""))
+    words = [word for word in normalized_name.split() if len(word) >= 2]
+    if base_id and words:
+        variants.append(f"{base_id} {' '.join(words[:4])}")
+    if base_id and words:
+        variants.append(f"{base_id} {' '.join(words[:2])}")
+
+    # Keep order and remove duplicates.
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in variants:
+        normalized = item.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped or [base_id]
+
+
 def _clean_html_text(value: str) -> str:
     return TAG_RE.sub(" ", value or "").replace("&nbsp;", " ").strip()
 
@@ -261,10 +286,19 @@ def _build_case_rows(
         msrp_hint = _safe_float(target.get("msrp_hint"))
         if msrp_hint is None or msrp_hint <= 0:
             msrp_hint = None
-        query = f"{set_id} {set_name}".strip()
+        queries = _build_query_variants(set_id, set_name)
+        target_rows_before = len(rows)
 
         for market in markets:
-            sold_prices = client.fetch_sold_prices(market=market, query=query)
+            sold_prices: list[float] = []
+            for query in queries:
+                chunk = client.fetch_sold_prices(market=market, query=query)
+                if chunk:
+                    sold_prices.extend(chunk)
+                if len(sold_prices) >= min_sold_listings:
+                    break
+            if sold_prices:
+                sold_prices = sorted({round(price, 2) for price in sold_prices})
             if len(sold_prices) < min_sold_listings:
                 continue
             sold_median = float(median(sold_prices))
@@ -314,6 +348,8 @@ def _build_case_rows(
                     "sold_stdev_price": f"{stdev:.4f}",
                 }
             )
+        if len(rows) == target_rows_before:
+            LOGGER.debug("No sold data found for set=%s (%s) across markets=%s", set_id, set_name, ",".join(markets))
     return rows
 
 
