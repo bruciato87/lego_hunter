@@ -620,7 +620,12 @@ class LegoHunterTelegramBot:
         return lines
 
 
-def build_application(manager: LegoHunterTelegramBot, token: str) -> Application:
+def build_application(
+    manager: LegoHunterTelegramBot,
+    token: str,
+    *,
+    register_commands_on_init: bool = True,
+) -> Application:
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", manager.cmd_start))
@@ -639,10 +644,11 @@ def build_application(manager: LegoHunterTelegramBot, token: str) -> Application
     app.add_handler(CommandHandler("portfolio", manager.cmd_collezione))
     app.add_handler(CommandHandler("sell_signal", manager.cmd_vendi))
 
-    async def _post_init(application: Application) -> None:
-        await manager.register_commands(application)
+    if register_commands_on_init:
+        async def _post_init(application: Application) -> None:
+            await manager.register_commands(application)
 
-    app.post_init = _post_init
+        app.post_init = _post_init
     return app
 
 

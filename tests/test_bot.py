@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 from telegram.error import TimedOut
 
-from bot import LegoHunterTelegramBot, run_scheduled_cycle
+from bot import LegoHunterTelegramBot, build_application, run_scheduled_cycle
 
 
 class DummyMessage:
@@ -127,6 +127,17 @@ class FakeFiscal:
 
 
 class BotTests(unittest.IsolatedAsyncioTestCase):
+    def test_build_application_can_disable_post_init_command_sync(self) -> None:
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+
+        app = build_application(manager, "telegram-token", register_commands_on_init=False)
+
+        self.assertIsNone(app.post_init)
+
     async def test_help_lists_new_lego_commands(self) -> None:
         manager = LegoHunterTelegramBot(
             repository=FakeRepo(),

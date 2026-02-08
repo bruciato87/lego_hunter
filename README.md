@@ -3,7 +3,7 @@
 Bot Telegram autonomo per discovery e monitoraggio opportunita LEGO con data moat su Supabase.
 
 ## Funzioni principali
-- Discovery ogni ora (pipeline cloud-first)
+- Discovery ogni 6 ore (pipeline cloud-first)
 - Sorgente primaria discovery: reader esterno cloud (`external_first`)
 - Fallback automatici: Playwright, poi HTTP parser
 - Ranking AI multi-provider: Gemini primario + OpenRouter fallback + heuristic finale
@@ -41,6 +41,7 @@ python bot.py --mode scheduled
 - `SUPABASE_KEY`
 - `TELEGRAM_TOKEN`
 - `TELEGRAM_CHAT_ID`
+- `TELEGRAM_WEBHOOK_SECRET` (obbligatoria per endpoint webhook su Vercel)
 - `GEMINI_API_KEY`
 - `OPENROUTER_API_KEY` (fallback AI provider)
 - `GEMINI_MODEL` (opzionale: modello preferito; il bot fa comunque auto-detect/failover)
@@ -63,6 +64,24 @@ python bot.py --mode scheduled
 - `HISTORICAL_REFERENCE_MIN_SAMPLES` (opzionale, default `24`)
 - `HISTORICAL_PRIOR_WEIGHT` (opzionale, default `0.10`, range `0.0-0.35`)
 - `HISTORICAL_PRICE_BAND_TOLERANCE` (opzionale, default `0.45`)
+- `WEBHOOK_BASE_URL` (opzionale per script setup webhook, es. `https://lego-hunter.vercel.app`)
+
+## Deploy Vercel (comandi Telegram live)
+- Questo repo usa:
+  - GitHub Actions per il ciclo schedulato ogni 6 ore (`--mode scheduled`)
+  - Vercel webhook per i comandi Telegram in tempo reale
+- Endpoint webhook: `/api/telegram_webhook` (alias `/telegram/webhook`)
+- Health check: `/healthz`
+
+Configurazione webhook Telegram:
+```bash
+python scripts/configure_telegram_webhook.py --base-url https://<tuo-progetto>.vercel.app
+```
+
+Verifica rapida:
+```bash
+curl -s https://<tuo-progetto>.vercel.app/healthz
+```
 
 ## Database
 Eseguire lo script SQL:
