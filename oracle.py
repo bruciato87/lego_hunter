@@ -5626,6 +5626,7 @@ class DiscoveryOracle:
             current_model = str(self._openrouter_model_id or "")
             quality_failover_attempts = 0
             max_quality_failover_attempts = 1 if allow_failover_call else 0
+            quality_repair_attempted = False
             min_quality_samples = max(2, min(int(self.ai_model_quality_min_samples), len(candidates)))
             strict_quality_threshold = float(self.ai_no_signal_min_strict_pass_rate)
             non_json_quality_threshold = float(self.ai_model_quality_max_non_json_rate)
@@ -5648,6 +5649,51 @@ class DiscoveryOracle:
                                 or float(quality.get("non_json_rate", 0.0)) > non_json_quality_threshold
                             )
                         )
+                        if (
+                            low_quality
+                            and allow_repair_calls
+                            and not quality_repair_attempted
+                            and float(quality.get("non_json_rate", 0.0)) > 0.0
+                        ):
+                            quality_repair_attempted = True
+                            repaired = await self._repair_openrouter_non_json_batch_output(
+                                raw_text=text,
+                                candidates=candidates,
+                                timeout_sec=timeout_sec,
+                            )
+                            if repaired:
+                                repaired = self._normalize_batch_ai_insights(repaired, candidates)
+                                repaired_quality = self._ai_insight_quality_breakdown(repaired)
+                                repaired_improved = (
+                                    int(repaired_quality.get("strict", 0)) > int(quality.get("strict", 0))
+                                    or int(repaired_quality.get("non_json", 0)) < int(quality.get("non_json", 0))
+                                )
+                                if repaired_improved:
+                                    insights = repaired
+                                    quality = repaired_quality
+                                    low_quality = (
+                                        int(quality.get("total", 0)) >= min_quality_samples
+                                        and (
+                                            float(quality.get("strict_rate", 0.0)) < strict_quality_threshold
+                                            or float(quality.get("non_json_rate", 0.0)) > non_json_quality_threshold
+                                        )
+                                    )
+                                    LOGGER.info(
+                                        "AI batch quality repaired via JSON repair | model=%s strict_rate=%.2f non_json_rate=%.2f",
+                                        current_model,
+                                        float(quality.get("strict_rate", 0.0)),
+                                        float(quality.get("non_json_rate", 0.0)),
+                                    )
+                                else:
+                                    LOGGER.info(
+                                        "AI batch JSON repair returned but did not improve quality | model=%s strict_before=%s strict_after=%s non_json_before=%s non_json_after=%s",
+                                        current_model,
+                                        int(quality.get("strict", 0)),
+                                        int(repaired_quality.get("strict", 0)),
+                                        int(quality.get("non_json", 0)),
+                                        int(repaired_quality.get("non_json", 0)),
+                                    )
+
                         if low_quality and quality_failover_attempts < max_quality_failover_attempts:
                             reason = (
                                 "batch_quality_low("

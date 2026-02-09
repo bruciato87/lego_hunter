@@ -3507,6 +3507,87 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(results["76281"].score, 71)
         mocked_repair.assert_not_awaited()
 
+    async def test_score_ai_shortlist_batch_parsed_non_json_uses_repair_when_quality_low(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle._openrouter_model_id = "vendor/model-pro:free"
+        oracle.ai_runtime = {
+            "engine": "openrouter",
+            "provider": "openrouter",
+            "model": "vendor/model-pro:free",
+            "mode": "api_openrouter_inventory",
+            "inventory_available": 1,
+        }
+        oracle.ai_no_signal_min_strict_pass_rate = 0.5
+        oracle.ai_model_quality_min_samples = 2
+        oracle.ai_model_quality_max_non_json_rate = 0.25
+
+        entries = [
+            {
+                "set_id": "75367",
+                "candidate": {
+                    "set_id": "75367",
+                    "set_name": "Set 75367",
+                    "theme": "Star Wars",
+                    "source": "lego_proxy_reader",
+                    "current_price": 99.99,
+                    "eol_date_prediction": "2026-12-01",
+                },
+            },
+            {
+                "set_id": "76281",
+                "candidate": {
+                    "set_id": "76281",
+                    "set_name": "Set 76281",
+                    "theme": "Marvel",
+                    "source": "lego_proxy_reader",
+                    "current_price": 79.99,
+                    "eol_date_prediction": "2026-10-01",
+                },
+            },
+        ]
+
+        raw_non_json = (
+            "set_id=75367|score=74|summary=non json a|predicted_eol_date=2026-12-01\n"
+            "set_id=76281|score=71|summary=non json b|predicted_eol_date=2026-10-01"
+        )
+        repaired = {
+            "75367": AIInsight(
+                score=89,
+                summary="strict repaired a",
+                predicted_eol_date="2026-12-01",
+                fallback_used=False,
+                confidence="HIGH_CONFIDENCE",
+            ),
+            "76281": AIInsight(
+                score=84,
+                summary="strict repaired b",
+                predicted_eol_date="2026-10-01",
+                fallback_used=False,
+                confidence="HIGH_CONFIDENCE",
+            ),
+        }
+
+        with patch.object(oracle, "_openrouter_generate", return_value=raw_non_json), patch.object(
+            oracle,
+            "_repair_openrouter_non_json_batch_output",
+            new=AsyncMock(return_value=repaired),
+        ) as mocked_repair:
+            results, error = await oracle._score_ai_shortlist_batch(
+                entries,
+                deadline=time.monotonic() + 10.0,
+                allow_repair_calls=True,
+                allow_failover_call=False,
+            )
+
+        self.assertIsNone(error)
+        mocked_repair.assert_awaited_once()
+        self.assertEqual(results["75367"].score, 89)
+        self.assertEqual(results["76281"].score, 84)
+        self.assertFalse(DiscoveryOracle._is_non_json_ai_note(results["75367"].risk_note))
+        self.assertFalse(DiscoveryOracle._is_non_json_ai_note(results["76281"].risk_note))
+
     async def test_score_ai_shortlist_batch_quality_failover_switches_model(self) -> None:
         repo = FakeRepo()
         with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
