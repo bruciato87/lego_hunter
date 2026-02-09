@@ -9,7 +9,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Optional
 
-from telegram import Update
+from telegram import Bot, Update
 
 from bot import LegoHunterTelegramBot, build_application
 from fiscal import FiscalGuardian
@@ -26,6 +26,31 @@ WEBHOOK_PATHS = {"/api/telegram_webhook", "/telegram/webhook"}
 HEALTH_PATHS = {"/", "/healthz", "/api/telegram_webhook/healthz"}
 
 _MANAGER: Optional[LegoHunterTelegramBot] = None
+
+
+def _is_truthy(raw_value: Optional[str], default: bool = False) -> bool:
+    if raw_value is None:
+        return default
+    return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _webhook_light_mode_enabled() -> bool:
+    return _is_truthy(os.getenv("WEBHOOK_LIGHT_MODE"), default=True)
+
+
+def _blocked_webhook_commands() -> set[str]:
+    raw = str(os.getenv("WEBHOOK_BLOCKED_COMMANDS") or "").strip()
+    if not raw:
+        return {"/scova", "/hunt"}
+    blocked: set[str] = set()
+    for item in raw.split(","):
+        cmd = str(item or "").strip().lower()
+        if not cmd:
+            continue
+        if not cmd.startswith("/"):
+            cmd = f"/{cmd}"
+        blocked.add(cmd)
+    return blocked or {"/scova", "/hunt"}
 
 
 def _normalize_path(path: str) -> str:
@@ -46,6 +71,80 @@ def _is_webhook_path(path: str) -> bool:
 def _is_health_path(path: str) -> bool:
     normalized = _normalize_path(path)
     return normalized in HEALTH_PATHS
+
+
+def _extract_command_from_payload(payload: dict[str, Any]) -> str:
+    for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+        message = payload.get(key)
+        if not isinstance(message, dict):
+            continue
+        raw_text = str(message.get("text") or message.get("caption") or "").strip()
+        if not raw_text.startswith("/"):
+            continue
+        command = raw_text.split(None, 1)[0].strip().lower()
+        # Telegram supports commands like /help@my_bot
+        command = command.split("@", 1)[0]
+        return command
+    return ""
+
+
+def _extract_chat_and_message_id(payload: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
+    for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+        message = payload.get(key)
+        if not isinstance(message, dict):
+            continue
+        chat = message.get("chat")
+        if not isinstance(chat, dict):
+            continue
+        chat_id_raw = chat.get("id")
+        message_id_raw = message.get("message_id")
+        try:
+            chat_id = int(chat_id_raw)
+        except (TypeError, ValueError):
+            continue
+        try:
+            message_id = int(message_id_raw) if message_id_raw is not None else None
+        except (TypeError, ValueError):
+            message_id = None
+        return chat_id, message_id
+    return None, None
+
+
+async def _send_webhook_light_notice(
+    *,
+    token: str,
+    payload: dict[str, Any],
+    command: str,
+) -> None:
+    chat_id, reply_to_message_id = _extract_chat_and_message_id(payload)
+    if chat_id is None:
+        return
+
+    notice = (
+        "Comando non disponibile nel webhook leggero.\n"
+        "Usa /radar, /cerca, /collezione, /vendi, /help.\n"
+        "La discovery completa (/scova) gira nei cicli schedulati cloud."
+    )
+    bot = Bot(token=token)
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=notice,
+            reply_to_message_id=reply_to_message_id,
+            disable_web_page_preview=True,
+            connect_timeout=8,
+            read_timeout=12,
+            write_timeout=12,
+            pool_timeout=8,
+        )
+        LOGGER.info("Webhook lightweight notice sent | command=%s chat_id=%s", command, chat_id)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Failed to send webhook lightweight notice | command=%s error=%s", command, exc)
+    finally:
+        try:
+            await bot.shutdown()
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Bot shutdown warning after lightweight notice", exc_info=True)
 
 
 def _expected_webhook_secret() -> str:
@@ -84,6 +183,12 @@ async def _process_update_payload(payload: dict[str, Any]) -> None:
     token = (os.getenv("TELEGRAM_TOKEN") or "").strip()
     if not token:
         raise RuntimeError("Missing TELEGRAM_TOKEN")
+
+    command = _extract_command_from_payload(payload)
+    if _webhook_light_mode_enabled() and command and command in _blocked_webhook_commands():
+        LOGGER.info("Webhook lightweight command block | command=%s", command)
+        await _send_webhook_light_notice(token=token, payload=payload, command=command)
+        return
 
     manager = _get_manager()
     app = build_application(manager, token, register_commands_on_init=False)
