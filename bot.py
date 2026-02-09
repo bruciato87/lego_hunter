@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import html
+import json
 import logging
 import os
 import re
+import urllib.error
+import urllib.request
 from datetime import date, datetime
 from typing import Any, Awaitable, Callable, Iterable, Optional
 from urllib.parse import quote_plus
@@ -27,6 +30,101 @@ logging.basicConfig(
 LOGGER = logging.getLogger("lego_hunter.bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+SET_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{2,19}$")
+
+
+def _normalize_set_id_token(raw_value: Any) -> str:
+    token = str(raw_value or "").strip()
+    if not token:
+        return ""
+    token = re.split(r"[^\w-]", token, maxsplit=1)[0].strip()
+    if not token:
+        return ""
+    return token if SET_ID_PATTERN.match(token) else ""
+
+
+def _github_dispatch_repository() -> str:
+    repo = str(os.getenv("GITHUB_REPO") or os.getenv("GITHUB_REPOSITORY") or "").strip()
+    return repo
+
+
+def _dispatch_single_set_analysis_workflow(
+    *,
+    set_id: str,
+    chat_id: Optional[str],
+) -> tuple[bool, str]:
+    token = str(
+        os.getenv("GITHUB_ACTIONS_DISPATCH_TOKEN")
+        or os.getenv("GITHUB_TOKEN")
+        or ""
+    ).strip()
+    repository = _github_dispatch_repository()
+    workflow_file = str(os.getenv("GITHUB_WORKFLOW_FILE") or "main.yml").strip() or "main.yml"
+    workflow_ref = str(os.getenv("GITHUB_WORKFLOW_REF") or "main").strip() or "main"
+
+    missing: list[str] = []
+    if not token:
+        missing.append("GITHUB_ACTIONS_DISPATCH_TOKEN (o GITHUB_TOKEN)")
+    if not repository:
+        missing.append("GITHUB_REPO")
+    if missing:
+        return (
+            False,
+            "Configurazione incompleta per dispatch GitHub: "
+            + ", ".join(missing)
+            + ".",
+        )
+
+    inputs: dict[str, str] = {"analysis_set_id": set_id}
+    if chat_id:
+        inputs["analysis_chat_id"] = str(chat_id)
+    payload = {
+        "ref": workflow_ref,
+        "inputs": inputs,
+    }
+    request_url = (
+        f"https://api.github.com/repos/{repository}/actions/workflows/{workflow_file}/dispatches"
+    )
+    request = urllib.request.Request(
+        request_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            status = int(getattr(response, "status", 0) or 0)
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            detail = ""
+        if detail:
+            detail = detail[:240]
+        return (
+            False,
+            f"GitHub API HTTP {exc.code} durante il dispatch"
+            + (f" ({detail})" if detail else "."),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Errore rete durante il dispatch GitHub: {exc}"
+
+    if status not in {200, 201, 202, 204}:
+        return False, f"GitHub dispatch non confermato (status {status})."
+
+    workflow_url = f"https://github.com/{repository}/actions/workflows/{workflow_file}"
+    return (
+        True,
+        "✅ Analisi approfondita avviata su GitHub Actions per set "
+        f"{set_id}.\nSegui qui: {workflow_url}",
+    )
 
 
 async def _telegram_call_with_retry(
@@ -203,6 +301,7 @@ class LegoHunterTelegramBot:
         return [
             BotCommand("start", "Attiva il bot e mostra guida rapida"),
             BotCommand("scova", "Scopre i migliori set da monitorare/acquistare"),
+            BotCommand("analizza", "Analisi approfondita set su GitHub Actions: /analizza 76441"),
             BotCommand("radar", "Mostra le opportunita' piu' forti in radar"),
             BotCommand("cerca", "Cerca un set nel radar: /cerca 75367"),
             BotCommand("offerte", "Confronta prezzo primario vs secondario"),
@@ -228,6 +327,7 @@ class LegoHunterTelegramBot:
             "🧱 LEGO HUNTER - Guida comandi\n\n"
             "Comandi principali:\n"
             "/scova - Discovery completa (LEGO + Amazon + ranking AI) e Top Picks del ciclo.\n"
+            "/analizza <set_id> - Avvia su GitHub un'analisi approfondita singolo set (es. /analizza 76441).\n"
             "/radar - Mostra le opportunita' gia' in Opportunity Radar, ordinate per score.\n"
             "/cerca <id|nome|tema> - Cerca set nel radar (es. /cerca 75367).\n"
             "/offerte - Verifica se sul secondario trovi prezzi migliori del primario.\n"
@@ -242,6 +342,7 @@ class LegoHunterTelegramBot:
             "/portfolio -> /collezione\n"
             "/sell_signal -> /vendi\n\n"
             "Esempi rapidi:\n"
+            "/analizza 76441\n"
             "/cerca millennium falcon\n"
             "/cerca 10332\n"
             "/offerte\n"
@@ -290,6 +391,37 @@ class LegoHunterTelegramBot:
             lines.append("💸 <b>Occasioni vendita rilevate</b>")
             lines.extend(self._format_sell_signal_lines(sell_signals[:3]))
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+    async def cmd_analizza(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+
+        raw_set_id = context.args[0] if context.args else ""
+        set_id = _normalize_set_id_token(raw_set_id)
+        if not set_id:
+            await update.message.reply_text("Uso: /analizza <set_id>  (esempio: /analizza 76441)")
+            return
+
+        chat_id = str(update.effective_chat.id) if update.effective_chat else None
+        await update.message.reply_text(
+            f"Avvio analisi approfondita per set {set_id} su GitHub Actions..."
+        )
+
+        ok, detail = await asyncio.to_thread(
+            _dispatch_single_set_analysis_workflow,
+            set_id=set_id,
+            chat_id=chat_id,
+        )
+        if ok:
+            await update.message.reply_text(detail, disable_web_page_preview=True)
+            return
+
+        await update.message.reply_text(
+            "Impossibile avviare l'analisi su GitHub.\n"
+            f"Dettaglio: {detail}\n"
+            "Config richiesta su Vercel: GITHUB_ACTIONS_DISPATCH_TOKEN, GITHUB_REPO, "
+            "GITHUB_WORKFLOW_FILE (opzionale), GITHUB_WORKFLOW_REF (opzionale)."
+        )
 
     async def cmd_radar(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update):
@@ -1057,6 +1189,8 @@ def build_application(
 
     # New LEGO-focused commands.
     app.add_handler(CommandHandler("scova", manager.cmd_scova))
+    app.add_handler(CommandHandler("analizza", manager.cmd_analizza))
+    app.add_handler(CommandHandler("analisi", manager.cmd_analizza))
     app.add_handler(CommandHandler("radar", manager.cmd_radar))
     app.add_handler(CommandHandler("cerca", manager.cmd_cerca))
     app.add_handler(CommandHandler("offerte", manager.cmd_offerte))
@@ -1084,6 +1218,28 @@ async def run_scheduled_cycle(
     repository: LegoHunterRepository,
     fiscal_guardian: FiscalGuardian,
 ) -> None:
+    requested_single_set_id = _normalize_set_id_token(os.getenv("SINGLE_SET_ANALYSIS_ID"))
+
+    def _pick_row_for_requested_set(report_data: dict[str, Any], requested_set_id: str) -> Optional[dict[str, Any]]:
+        if not requested_set_id:
+            return None
+        buckets = (
+            list(report_data.get("selected") or []),
+            list(report_data.get("above_threshold") or []),
+            list(report_data.get("ranked") or []),
+        )
+        for rows in buckets:
+            for row in rows:
+                if str(row.get("set_id") or "").strip() == requested_set_id:
+                    picked = dict(row)
+                    if not picked.get("signal_strength"):
+                        strength = oracle._high_confidence_signal_strength(picked)
+                        picked["signal_strength"] = strength
+                        if strength == "LOW_CONFIDENCE":
+                            picked["risk_note"] = oracle._build_low_confidence_note(picked)
+                    return picked
+        return None
+
     bot = Bot(token=token)
     LOGGER.info("Scheduled cycle started | chat_id_set=%s", bool(chat_id))
     try:
@@ -1135,11 +1291,38 @@ async def run_scheduled_cycle(
             len(secondary_candidates),
             secondary_refreshed,
         )
-        lines = [
-            "<b>🧱 LEGO HUNTER</b> <i>Update automatico (ogni 6 ore)</i>",
-            "",
-        ]
-        lines.extend(LegoHunterTelegramBot._format_discovery_report(report, top_limit=3))
+        lines = []
+        if requested_single_set_id:
+            lines.extend(
+                [
+                    "<b>🧱 LEGO HUNTER</b> <i>Analisi approfondita singolo set (on-demand)</i>",
+                    f"🎯 Set richiesto: <b>{html.escape(requested_single_set_id)}</b>",
+                    "",
+                ]
+            )
+            target_row = _pick_row_for_requested_set(report, requested_single_set_id)
+            if target_row is not None:
+                focused_report = {
+                    "selected": [target_row],
+                    "diagnostics": report.get("diagnostics") or {},
+                }
+                lines.extend(LegoHunterTelegramBot._format_discovery_report(focused_report, top_limit=1))
+            else:
+                lines.append("⚠️ Set richiesto non trovato tra i candidati del ciclo corrente.")
+                lines.extend(
+                    LegoHunterTelegramBot._format_discovery_report(
+                        {"selected": [], "diagnostics": report.get("diagnostics") or {}},
+                        top_limit=0,
+                    )
+                )
+        else:
+            lines.extend(
+                [
+                    "<b>🧱 LEGO HUNTER</b> <i>Update automatico (ogni 6 ore)</i>",
+                    "",
+                ]
+            )
+            lines.extend(LegoHunterTelegramBot._format_discovery_report(report, top_limit=3))
 
         safety = fiscal_guardian.check_safety_status()
         status = str(safety.get("status") or "UNKNOWN")

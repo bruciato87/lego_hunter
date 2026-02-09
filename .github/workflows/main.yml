@@ -11,6 +11,16 @@ on:
         options:
           - "false"
           - "true"
+      analysis_set_id:
+        description: "Set ID per analisi approfondita on-demand (es. 76441). Vuoto = ciclo standard."
+        required: false
+        default: ""
+        type: string
+      analysis_chat_id:
+        description: "Chat Telegram destinazione per analisi on-demand. Vuoto = TELEGRAM_CHAT_ID secret."
+        required: false
+        default: ""
+        type: string
   schedule:
     - cron: "0 */6 * * *"
 
@@ -84,7 +94,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID: ${{ github.event.inputs.analysis_chat_id != '' && github.event.inputs.analysis_chat_id || secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GEMINI_FREE_TIER_ONLY: "true"
@@ -125,9 +135,11 @@ jobs:
           HISTORICAL_RECENCY_HALFLIFE_DAYS: "900"
           HISTORICAL_RECENCY_MIN_WEIGHT: "0.20"
           HISTORICAL_DEGRADED_MIN_PRIOR_SCORE: "35"
+          SINGLE_SET_ANALYSIS_ID: ${{ github.event.inputs.analysis_set_id || '' }}
           RUN_MODE: scheduled
         run: |
           echo "AI cache debug mode: disable_ai_cache=${{ github.event.inputs.disable_ai_cache || 'false' }}"
+          echo "On-demand set analysis: analysis_set_id='${{ github.event.inputs.analysis_set_id || '' }}'"
           echo "AI_CACHE_TTL_SEC=${AI_CACHE_TTL_SEC}"
           echo "AI_PERSISTED_CACHE_TTL_SEC=${AI_PERSISTED_CACHE_TTL_SEC}"
           python bot.py --mode scheduled

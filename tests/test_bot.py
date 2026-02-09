@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from telegram.error import BadRequest, TimedOut
 
-from bot import LegoHunterTelegramBot, build_application, run_scheduled_cycle
+from bot import (
+    LegoHunterTelegramBot,
+    _dispatch_single_set_analysis_workflow,
+    build_application,
+    run_scheduled_cycle,
+)
 
 
 class DummyMessage:
@@ -135,6 +141,38 @@ class FakeFiscal:
 
 
 class BotTests(unittest.IsolatedAsyncioTestCase):
+    def test_dispatch_single_set_analysis_requires_config(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            ok, detail = _dispatch_single_set_analysis_workflow(set_id="76441", chat_id="123")
+        self.assertFalse(ok)
+        self.assertIn("Configurazione incompleta", detail)
+
+    def test_dispatch_single_set_analysis_success(self) -> None:
+        fake_response = Mock()
+        fake_response.status = 204
+        fake_cm = Mock()
+        fake_cm.__enter__ = Mock(return_value=fake_response)
+        fake_cm.__exit__ = Mock(return_value=None)
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GITHUB_ACTIONS_DISPATCH_TOKEN": "token",
+                    "GITHUB_REPO": "bruciato87/lego_hunter",
+                    "GITHUB_WORKFLOW_FILE": "main.yml",
+                    "GITHUB_WORKFLOW_REF": "main",
+                },
+                clear=False,
+            ),
+            patch("bot.urllib.request.urlopen", return_value=fake_cm) as urlopen_mock,
+        ):
+            ok, detail = _dispatch_single_set_analysis_workflow(set_id="76441", chat_id="123")
+
+        self.assertTrue(ok)
+        self.assertIn("Analisi approfondita avviata", detail)
+        self.assertEqual(urlopen_mock.call_count, 1)
+
     def test_build_application_can_disable_post_init_command_sync(self) -> None:
         manager = LegoHunterTelegramBot(
             repository=FakeRepo(),
@@ -159,6 +197,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(update.message.replies)
         text = update.message.replies[-1]
         self.assertIn("/scova", text)
+        self.assertIn("/analizza <set_id>", text)
         self.assertIn("/offerte", text)
         self.assertIn("/collezione", text)
         self.assertIn("Alias compatibilita'", text)
@@ -192,6 +231,56 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await manager.cmd_scova(update, DummyContext())
 
         oracle_factory.assert_called_once()
+
+    async def test_analizza_requires_set_id_argument(self) -> None:
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate()
+
+        await manager.cmd_analizza(update, DummyContext(args=[]))
+
+        self.assertTrue(update.message.replies)
+        self.assertIn("Uso: /analizza <set_id>", update.message.replies[-1])
+
+    async def test_analizza_dispatches_github_workflow(self) -> None:
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        with patch(
+            "bot._dispatch_single_set_analysis_workflow",
+            return_value=(True, "dispatch ok"),
+        ) as dispatch_mock:
+            await manager.cmd_analizza(update, DummyContext(args=["76441"]))
+
+        dispatch_mock.assert_called_once_with(set_id="76441", chat_id="98765")
+        self.assertGreaterEqual(len(update.message.replies), 2)
+        self.assertIn("Avvio analisi approfondita", update.message.replies[0])
+        self.assertIn("dispatch ok", update.message.replies[-1])
+
+    async def test_analizza_reports_dispatch_configuration_error(self) -> None:
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        with patch(
+            "bot._dispatch_single_set_analysis_workflow",
+            return_value=(False, "missing token"),
+        ):
+            await manager.cmd_analizza(update, DummyContext(args=["76441"]))
+
+        self.assertTrue(update.message.replies)
+        self.assertIn("Impossibile avviare l'analisi su GitHub", update.message.replies[-1])
+        self.assertIn("missing token", update.message.replies[-1])
 
     async def test_offerte_uses_cloud_cache_in_light_runtime_without_oracle(self) -> None:
         oracle_factory = Mock(return_value=FakeOracle())
@@ -678,6 +767,75 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_kwargs.get("parse_mode"), "HTML")
         self.assertNotIn("parse_mode", second_kwargs)
         self.assertIn("LEGO HUNTER", str(second_kwargs.get("text") or ""))
+
+    async def test_scheduled_cycle_can_send_single_set_analysis_report(self) -> None:
+        class SingleSetOracle(FakeOracle):
+            async def discover_with_diagnostics(self, persist=True, top_limit=12, fallback_limit=3):  # noqa: ANN001
+                return {
+                    "selected": [],
+                    "above_threshold": [],
+                    "ranked": [
+                        {
+                            "set_id": "76441",
+                            "set_name": "Castello di Hogwarts",
+                            "source": "lego_proxy_reader",
+                            "ai_investment_score": 82,
+                            "ai_strict_pass": True,
+                            "market_demand_score": 90,
+                            "forecast_score": 61,
+                            "forecast_probability_upside_12m": 64.1,
+                            "confidence_score": 61,
+                            "composite_score": 72,
+                            "current_price": 24.99,
+                            "eol_date_prediction": "2026-05-11",
+                        }
+                    ],
+                    "diagnostics": {
+                        "threshold": 60,
+                        "min_probability_high_confidence": 0.60,
+                        "min_confidence_score_high_confidence": 68,
+                        "source_raw_counts": {},
+                        "dedup_candidates": 1,
+                        "above_threshold_count": 1,
+                        "max_ai_score": 82,
+                        "max_composite_score": 72,
+                        "max_probability_upside_12m": 64.1,
+                        "fallback_used": True,
+                        "source_strategy": "external_first",
+                        "selected_source": "external_proxy",
+                        "ai_runtime": {"engine": "openrouter", "model": "x/y:free", "mode": "api"},
+                    },
+                }
+
+            def _high_confidence_signal_strength(self, row):  # noqa: ANN001
+                return "LOW_CONFIDENCE"
+
+            def _build_low_confidence_note(self, row):  # noqa: ANN001
+                return "nota test"
+
+        bot_mock = AsyncMock()
+        bot_mock.set_my_commands = AsyncMock(return_value=True)
+        bot_mock.send_message = AsyncMock(return_value={"ok": True})
+        bot_mock.shutdown = AsyncMock(return_value=None)
+
+        with (
+            patch("bot.Bot", return_value=bot_mock),
+            patch("bot.PLAYWRIGHT_AVAILABLE", False),
+            patch.dict("os.environ", {"SINGLE_SET_ANALYSIS_ID": "76441"}, clear=False),
+        ):
+            await run_scheduled_cycle(
+                token="token",
+                chat_id="123",
+                oracle=SingleSetOracle(),
+                repository=FakeRepo(),
+                fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+            )
+
+        self.assertEqual(bot_mock.send_message.await_count, 1)
+        text = str(bot_mock.send_message.await_args.kwargs.get("text") or "")
+        self.assertIn("Analisi approfondita singolo set", text)
+        self.assertIn("Set richiesto: <b>76441</b>", text)
+        self.assertIn("Castello di Hogwarts", text)
 
 
 if __name__ == "__main__":
