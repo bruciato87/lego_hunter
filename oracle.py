@@ -81,6 +81,7 @@ DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_TIMEOUT_SEC = 10.0
 DEFAULT_AI_NON_SHORTLIST_CACHE_RESCUE_ENABLED = True
 DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_ENABLED = True
 DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_MAX_CANDIDATES = 6
+DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_MAX_ROUNDS = 3
 DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_MIN_BUDGET_SEC = 14.0
 DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_TIMEOUT_SEC = 12.0
 DEFAULT_AI_SCORE_GUARDRAIL_ENABLED = True
@@ -594,6 +595,12 @@ class DiscoveryOracle:
             minimum=1,
             maximum=20,
         )
+        self.ai_single_call_secondary_batch_max_rounds = self._safe_env_int(
+            "AI_SINGLE_CALL_SECONDARY_BATCH_MAX_ROUNDS",
+            default=DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_MAX_ROUNDS,
+            minimum=1,
+            maximum=10,
+        )
         self.ai_single_call_secondary_batch_min_budget_sec = self._safe_env_float(
             "AI_SINGLE_CALL_SECONDARY_BATCH_MIN_BUDGET_SEC",
             default=DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_MIN_BUDGET_SEC,
@@ -1091,11 +1098,12 @@ class DiscoveryOracle:
             self.openrouter_opportunistic_timeout_sec,
         )
         LOGGER.info(
-            "Single-call expansion tuning | dynamic_max=%s non_shortlist_cache_rescue=%s secondary_batch_enabled=%s secondary_batch_max=%s secondary_batch_min_budget_sec=%.1f secondary_batch_timeout_sec=%.1f",
+            "Single-call expansion tuning | dynamic_max=%s non_shortlist_cache_rescue=%s secondary_batch_enabled=%s secondary_batch_max=%s secondary_batch_rounds=%s secondary_batch_min_budget_sec=%.1f secondary_batch_timeout_sec=%.1f",
             self.ai_single_call_dynamic_max_candidates,
             self.ai_non_shortlist_cache_rescue_enabled,
             self.ai_single_call_secondary_batch_enabled,
             self.ai_single_call_secondary_batch_max_candidates,
+            self.ai_single_call_secondary_batch_max_rounds,
             self.ai_single_call_secondary_batch_min_budget_sec,
             self.ai_single_call_secondary_batch_timeout_sec,
         )
@@ -3335,6 +3343,7 @@ class DiscoveryOracle:
                 "ai_skip_cache_primed": 0,
                 "ai_skip_cache_rescued": 0,
                 "ai_secondary_batch_attempted": 0,
+                "ai_secondary_batch_rounds": 0,
                 "ai_secondary_batch_candidates": 0,
                 "ai_secondary_batch_scored": 0,
                 "ai_secondary_batch_errors": 0,
@@ -3368,6 +3377,7 @@ class DiscoveryOracle:
             "ai_skip_cache_primed": 0,
             "ai_skip_cache_rescued": 0,
             "ai_secondary_batch_attempted": 0,
+            "ai_secondary_batch_rounds": 0,
             "ai_secondary_batch_candidates": 0,
             "ai_secondary_batch_scored": 0,
             "ai_secondary_batch_errors": 0,
@@ -3392,93 +3402,132 @@ class DiscoveryOracle:
                 post_shortlist_stats["ai_skip_cache_rescued"] += 1
 
         if skipped and self.ai_single_call_scoring_enabled and self.ai_single_call_secondary_batch_enabled:
-            unresolved_skipped = [
-                row for row in skipped if str(row.get("set_id") or "").strip() and str(row.get("set_id") or "").strip() not in ai_results
-            ]
-            if unresolved_skipped and self._external_ai_available():
-                elapsed_so_far = max(0.0, time.monotonic() - ai_started)
-                budget_left = max(0.0, float(self.ai_scoring_hard_budget_sec) - elapsed_so_far)
+            if self._external_ai_available():
+                attempted_set_ids: set[str] = set()
                 min_budget = float(self.ai_single_call_secondary_batch_min_budget_sec)
-                if budget_left >= min_budget:
+                max_rounds = max(1, int(self.ai_single_call_secondary_batch_max_rounds))
+                non_error_reasons = {"no_external_ai_available", "insufficient_budget_for_batch"}
+
+                for round_idx in range(1, max_rounds + 1):
+                    selected_rows = self._select_secondary_batch_candidates(
+                        skipped,
+                        ai_results,
+                        attempted_set_ids,
+                        limit=self.ai_single_call_secondary_batch_max_candidates,
+                    )
+                    if not selected_rows:
+                        break
+
+                    elapsed_so_far = max(0.0, time.monotonic() - ai_started)
+                    budget_left = max(0.0, float(self.ai_scoring_hard_budget_sec) - elapsed_so_far)
+                    if budget_left < min_budget:
+                        LOGGER.info(
+                            "AI single-call secondary batch skipped | reason=insufficient_budget budget_left=%.2f min_budget=%.2f unresolved=%s",
+                            budget_left,
+                            min_budget,
+                            len(selected_rows),
+                        )
+                        break
+
                     secondary_entries = [
                         {
                             "set_id": str(row.get("set_id") or "").strip(),
                             "candidate": row.get("candidate") or {},
                         }
-                        for row in unresolved_skipped[: max(1, int(self.ai_single_call_secondary_batch_max_candidates))]
+                        for row in selected_rows
+                        if str(row.get("set_id") or "").strip()
                     ]
-                    secondary_entries = [row for row in secondary_entries if row["set_id"]]
-                    if secondary_entries:
-                        post_shortlist_stats["ai_secondary_batch_attempted"] = 1
-                        post_shortlist_stats["ai_secondary_batch_candidates"] = len(secondary_entries)
+                    if not secondary_entries:
+                        break
+
+                    post_shortlist_stats["ai_secondary_batch_attempted"] += 1
+                    post_shortlist_stats["ai_secondary_batch_rounds"] += 1
+                    post_shortlist_stats["ai_secondary_batch_candidates"] += len(secondary_entries)
+                    attempted_set_ids.update(str(entry["set_id"]) for entry in secondary_entries if entry.get("set_id"))
+
+                    LOGGER.info(
+                        "AI single-call secondary batch round | round=%s/%s candidates=%s budget_left=%.2fs",
+                        round_idx,
+                        max_rounds,
+                        len(secondary_entries),
+                        budget_left,
+                    )
+
+                    for entry in secondary_entries:
+                        source_row = skipped_set_ids.get(str(entry.get("set_id") or "").strip())
+                        if source_row is not None:
+                            source_row["ai_secondary_batch_attempted"] = True
+                            source_row["ai_secondary_batch_round"] = round_idx
+
+                    secondary_timeout = min(
+                        float(self.ai_single_call_secondary_batch_timeout_sec),
+                        max(6.0, budget_left),
+                    )
+                    secondary_deadline = time.monotonic() + secondary_timeout
+                    secondary_results, secondary_error = await self._score_ai_shortlist_batch(
+                        secondary_entries,
+                        deadline=secondary_deadline,
+                        allow_repair_calls=True,
+                        allow_failover_call=True,
+                    )
+                    if secondary_error:
+                        if str(secondary_error) in non_error_reasons:
+                            LOGGER.info(
+                                "AI single-call secondary batch skipped | candidates=%s reason=%s",
+                                len(secondary_entries),
+                                str(secondary_error),
+                            )
+                            break
+
+                        post_shortlist_stats["ai_secondary_batch_errors"] += 1
+                        if "timeout" in str(secondary_error).lower():
+                            post_shortlist_stats["ai_secondary_batch_timeouts"] += 1
+                        LOGGER.warning(
+                            "AI single-call secondary batch failed | round=%s candidates=%s error=%s",
+                            round_idx,
+                            len(secondary_entries),
+                            str(secondary_error)[:220],
+                        )
                         for entry in secondary_entries:
                             source_row = skipped_set_ids.get(str(entry.get("set_id") or "").strip())
                             if source_row is not None:
-                                source_row["ai_secondary_batch_attempted"] = True
-                        secondary_timeout = min(
-                            float(self.ai_single_call_secondary_batch_timeout_sec),
-                            max(6.0, budget_left),
-                        )
-                        secondary_deadline = time.monotonic() + secondary_timeout
-                        secondary_results, secondary_error = await self._score_ai_shortlist_batch(
-                            secondary_entries,
-                            deadline=secondary_deadline,
-                            allow_repair_calls=True,
-                            allow_failover_call=True,
-                        )
-                        if secondary_error:
-                            non_error_reasons = {"no_external_ai_available", "insufficient_budget_for_batch"}
-                            if str(secondary_error) not in non_error_reasons:
-                                post_shortlist_stats["ai_secondary_batch_errors"] += 1
-                                if "timeout" in str(secondary_error).lower():
-                                    post_shortlist_stats["ai_secondary_batch_timeouts"] += 1
-                                LOGGER.warning(
-                                    "AI single-call secondary batch failed | candidates=%s error=%s",
-                                    len(secondary_entries),
-                                    str(secondary_error)[:220],
-                                )
-                                for entry in secondary_entries:
-                                    source_row = skipped_set_ids.get(str(entry.get("set_id") or "").strip())
-                                    if source_row is not None:
-                                        source_row["ai_secondary_batch_failed"] = True
-                                        source_row["ai_secondary_batch_reason"] = str(secondary_error)
-                            else:
-                                LOGGER.info(
-                                    "AI single-call secondary batch skipped | candidates=%s reason=%s",
-                                    len(secondary_entries),
-                                    str(secondary_error),
-                                )
-                        for entry in secondary_entries:
-                            set_id = str(entry.get("set_id") or "").strip()
-                            if not set_id:
-                                continue
-                            insight = secondary_results.get(set_id)
-                            if insight is None:
-                                source_row = skipped_set_ids.get(set_id)
-                                if source_row is not None and not source_row.get("ai_secondary_batch_reason"):
-                                    source_row["ai_secondary_batch_failed"] = True
-                                    source_row["ai_secondary_batch_reason"] = "batch_no_result"
-                                continue
-                            ai_results[set_id] = insight
-                            if not bool(insight.fallback_used):
-                                post_shortlist_stats["ai_secondary_batch_scored"] += 1
-                                self._set_cached_ai_insight(entry["candidate"], insight)
-                                source_row = skipped_set_ids.get(set_id)
-                                if source_row is not None:
-                                    source_row["ai_secondary_batch_scored"] = True
-                                    source_row["ai_secondary_batch_failed"] = False
-                                    source_row["ai_secondary_batch_reason"] = "success"
-                            else:
-                                source_row = skipped_set_ids.get(set_id)
-                                if source_row is not None:
-                                    source_row["ai_secondary_batch_failed"] = True
-                                    source_row["ai_secondary_batch_reason"] = "provider_fallback"
-                else:
+                                source_row["ai_secondary_batch_failed"] = True
+                                source_row["ai_secondary_batch_reason"] = str(secondary_error)
+                        continue
+
+                    round_scored = 0
+                    for entry in secondary_entries:
+                        set_id = str(entry.get("set_id") or "").strip()
+                        if not set_id:
+                            continue
+                        insight = secondary_results.get(set_id)
+                        if insight is None:
+                            source_row = skipped_set_ids.get(set_id)
+                            if source_row is not None and not source_row.get("ai_secondary_batch_reason"):
+                                source_row["ai_secondary_batch_failed"] = True
+                                source_row["ai_secondary_batch_reason"] = "batch_no_result"
+                            continue
+                        ai_results[set_id] = insight
+                        if not bool(insight.fallback_used):
+                            round_scored += 1
+                            post_shortlist_stats["ai_secondary_batch_scored"] += 1
+                            self._set_cached_ai_insight(entry["candidate"], insight)
+                            source_row = skipped_set_ids.get(set_id)
+                            if source_row is not None:
+                                source_row["ai_secondary_batch_scored"] = True
+                                source_row["ai_secondary_batch_failed"] = False
+                                source_row["ai_secondary_batch_reason"] = "success"
+                        else:
+                            source_row = skipped_set_ids.get(set_id)
+                            if source_row is not None:
+                                source_row["ai_secondary_batch_failed"] = True
+                                source_row["ai_secondary_batch_reason"] = "provider_fallback"
+
                     LOGGER.info(
-                        "AI single-call secondary batch skipped | reason=insufficient_budget budget_left=%.2f min_budget=%.2f unresolved=%s",
-                        budget_left,
-                        min_budget,
-                        len(unresolved_skipped),
+                        "AI single-call secondary batch round completed | round=%s scored=%s requested=%s",
+                        round_idx,
+                        round_scored,
+                        len(secondary_entries),
                     )
 
         ranked, opportunities = self._build_ranked_payloads(
@@ -3658,6 +3707,7 @@ class DiscoveryOracle:
             "ai_skip_cache_primed": int(post_shortlist_stats.get("ai_skip_cache_primed", 0)),
             "ai_skip_cache_rescued": int(post_shortlist_stats.get("ai_skip_cache_rescued", 0)),
             "ai_secondary_batch_attempted": int(post_shortlist_stats.get("ai_secondary_batch_attempted", 0)),
+            "ai_secondary_batch_rounds": int(post_shortlist_stats.get("ai_secondary_batch_rounds", 0)),
             "ai_secondary_batch_candidates": int(post_shortlist_stats.get("ai_secondary_batch_candidates", 0)),
             "ai_secondary_batch_scored": int(post_shortlist_stats.get("ai_secondary_batch_scored", 0)),
             "ai_secondary_batch_errors": int(post_shortlist_stats.get("ai_secondary_batch_errors", 0)),
@@ -3679,13 +3729,14 @@ class DiscoveryOracle:
             "total_sec": round(total_duration, 2),
         }
         LOGGER.info(
-            "Ranking completed | candidates=%s shortlisted=%s ai_scored=%s cache_hits=%s persisted_cache_hits=%s skip_cache_rescued=%s secondary_batch_scored=%s rescue_attempts=%s rescue_successes=%s final_pick_guarantee_rounds=%s final_pick_pending=%s historical_prior_applied=%s persisted_opportunities=%s persisted_snapshots=%s durations={prep:%.2fs ai:%.2fs persist:%.2fs total:%.2fs}",
+            "Ranking completed | candidates=%s shortlisted=%s ai_scored=%s cache_hits=%s persisted_cache_hits=%s skip_cache_rescued=%s secondary_batch_rounds=%s secondary_batch_scored=%s rescue_attempts=%s rescue_successes=%s final_pick_guarantee_rounds=%s final_pick_pending=%s historical_prior_applied=%s persisted_opportunities=%s persisted_snapshots=%s durations={prep:%.2fs ai:%.2fs persist:%.2fs total:%.2fs}",
             len(source_candidates),
             len(shortlist),
             self._last_ranking_diagnostics["ai_scored_count"],
             self._last_ranking_diagnostics["ai_cache_hits"],
             self._last_ranking_diagnostics["ai_persisted_cache_hits"],
             self._last_ranking_diagnostics["ai_skip_cache_rescued"],
+            self._last_ranking_diagnostics["ai_secondary_batch_rounds"],
             self._last_ranking_diagnostics["ai_secondary_batch_scored"],
             self._last_ranking_diagnostics["ai_top_pick_rescue_attempts"],
             self._last_ranking_diagnostics["ai_top_pick_rescue_successes"],
@@ -4372,6 +4423,92 @@ class DiscoveryOracle:
         )
         return max(1, min(100, int(round(score))))
 
+    def _secondary_ai_priority_value(self, row: Dict[str, Any]) -> float:
+        cached = row.get("_secondary_ai_priority_value")
+        if isinstance(cached, (int, float)):
+            return float(cached)
+
+        candidate = row.get("candidate") if isinstance(row, dict) else {}
+        if not isinstance(candidate, dict):
+            candidate = {}
+        forecast = row.get("forecast")
+        prefilter_score = int(row.get("prefilter_score") or 0)
+        forecast_score = int(getattr(forecast, "forecast_score", 0) or 0)
+        probability_pct = float(getattr(forecast, "probability_upside_12m", 0.0) or 0.0) * 100.0
+
+        # Proxy-composite used only to prioritize non-covered candidates for extra AI budget.
+        composite_proxy = int(round((0.48 * forecast_score) + (0.32 * prefilter_score) + (0.20 * probability_pct)))
+        try:
+            if isinstance(forecast, ForecastInsight):
+                pattern_eval = self._evaluate_success_patterns(candidate)
+                pattern_score = int(
+                    self._effective_pattern_score(
+                        pattern_eval=pattern_eval,
+                        ai_fallback_used=False,
+                    )
+                )
+                history_30 = row.get("history_30") if isinstance(row.get("history_30"), list) else []
+                demand_proxy = int(
+                    self._estimate_market_demand(
+                        candidate,
+                        70,  # neutral proxy AI score
+                        forecast=forecast,
+                        recent_prices=history_30,
+                    )
+                )
+                historical_prior = self._historical_prior_for_candidate(candidate)
+                historical_score = (
+                    int(historical_prior.get("prior_score"))
+                    if isinstance(historical_prior, dict) and historical_prior.get("prior_score") is not None
+                    else None
+                )
+                composite_proxy = int(
+                    self._calculate_composite_score(
+                        ai_score=70,
+                        demand_score=demand_proxy,
+                        forecast_score=forecast_score,
+                        pattern_score=pattern_score,
+                        ai_fallback_used=False,
+                        historical_score=historical_score,
+                    )
+                )
+        except Exception:
+            # Keep ranking resilient even if pattern/historical helpers fail for one row.
+            pass
+
+        priority_value = float((composite_proxy * 1000) + (forecast_score * 10) + prefilter_score)
+        row["_secondary_ai_priority_composite_proxy"] = composite_proxy
+        row["_secondary_ai_priority_value"] = round(priority_value, 3)
+        return float(row["_secondary_ai_priority_value"])
+
+    def _select_secondary_batch_candidates(
+        self,
+        skipped: list[Dict[str, Any]],
+        ai_results: Dict[str, AIInsight],
+        attempted_set_ids: set[str],
+        *,
+        limit: int,
+    ) -> list[Dict[str, Any]]:
+        unresolved: list[Dict[str, Any]] = []
+        for row in skipped:
+            set_id = str(row.get("set_id") or "").strip()
+            if not set_id or set_id in attempted_set_ids:
+                continue
+            insight = ai_results.get(set_id)
+            if insight is not None and not bool(insight.fallback_used):
+                continue
+            unresolved.append(row)
+
+        unresolved.sort(
+            key=lambda row: (
+                self._secondary_ai_priority_value(row),
+                int(row.get("prefilter_score") or 0),
+                -int(row.get("prefilter_rank") or 9999),
+            ),
+            reverse=True,
+        )
+        return unresolved[: max(1, int(limit))]
+
     async def _score_ai_shortlist(
         self,
         shortlist: list[Dict[str, Any]],
@@ -5017,6 +5154,76 @@ class DiscoveryOracle:
         return None
 
     @classmethod
+    def _batch_insights_from_tagged_blocks(
+        cls,
+        raw_text: str,
+        candidate_by_set_id: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, AIInsight]:
+        text = str(raw_text or "")
+        if not text.strip() or not candidate_by_set_id:
+            return {}
+
+        insights: Dict[str, AIInsight] = {}
+
+        def _parse_tagged_block(block_text: str, attrs_text: str = "") -> None:
+            merged = f"{attrs_text}\n{block_text}".strip()
+            set_match = re.search(r'(?is)\b(?:set[_\s-]?id|id)\b\s*[:=]\s*["\']?(\d{4,6})["\']?\b', merged)
+            if not set_match:
+                return
+            set_id = str(set_match.group(1))
+            if set_id in insights:
+                return
+            candidate = candidate_by_set_id.get(set_id)
+            if candidate is None:
+                return
+
+            score_match = re.search(r'(?is)\bscore\b\s*[:=]\s*["\']?(100|[1-9]?\d)["\']?\b', merged)
+            if not score_match:
+                return
+            score = max(1, min(100, int(score_match.group(1))))
+
+            summary = ""
+            summary_match = re.search(
+                r"(?is)\bsummary\b\s*[:=]\s*(.+?)(?=\n\s*(?:set[_\s-]?id|id|score|predicted[_\s-]?eol[_\s-]?date|eol)\b|$)",
+                merged,
+            )
+            if summary_match:
+                summary = " ".join(str(summary_match.group(1) or "").strip().split())
+            if not summary:
+                free_lines = []
+                for line in str(block_text or "").splitlines():
+                    line_text = str(line or "").strip()
+                    if not line_text:
+                        continue
+                    if re.match(
+                        r"(?is)^(?:set[_\s-]?id|id|score|summary|predicted[_\s-]?eol[_\s-]?date|eol)\b",
+                        line_text,
+                    ):
+                        continue
+                    free_lines.append(line_text)
+                summary = " ".join(free_lines).strip()
+            if not summary:
+                summary = f"Output AI tagged non JSON: score {score}/100 estratto da blocco [SET]."
+
+            insights[set_id] = AIInsight(
+                score=score,
+                summary=summary[:1200],
+                predicted_eol_date=cls._extract_first_date(merged) or candidate.get("eol_date_prediction"),
+                fallback_used=False,
+                confidence="LOW_CONFIDENCE",
+                risk_note="Output AI tagged non JSON: score estratto da testo con parsing robusto.",
+            )
+
+        for match in re.finditer(r"(?is)\[SET(?P<attrs>[^\]]*)\](?P<body>.*?)\[/SET\]", text):
+            _parse_tagged_block(match.group("body") or "", match.group("attrs") or "")
+
+        if len(insights) < len(candidate_by_set_id):
+            for match in re.finditer(r"(?is)<set(?P<attrs>[^>]*)>(?P<body>.*?)</set>", text):
+                _parse_tagged_block(match.group("body") or "", match.group("attrs") or "")
+
+        return insights
+
+    @classmethod
     def _batch_insights_from_unstructured_text(
         cls,
         raw_text: str,
@@ -5032,6 +5239,13 @@ class DiscoveryOracle:
             for row in candidates
             if str(row.get("set_id") or "").strip()
         }
+
+        # Pass -1: explicit tagged blocks, e.g. [SET] ... [/SET] or <set> ... </set>.
+        tagged_insights = cls._batch_insights_from_tagged_blocks(text, candidate_by_set_id)
+        if tagged_insights:
+            insights.update(tagged_insights)
+            if len(insights) == len(candidate_by_set_id):
+                return insights
 
         # Pass 0: key-value/pipe rows, e.g. "set_id=76281|score=78|summary=...".
         for line in text.splitlines():
@@ -5183,14 +5397,20 @@ class DiscoveryOracle:
     def _build_batch_ai_prompt(candidates: list[Dict[str, Any]]) -> str:
         lines = [
             "Analizza i seguenti set LEGO per investimento a 12 mesi.",
-            "Rispondi SOLO con JSON valido.",
-            'Formato obbligatorio: {"results":[{"set_id":"...", "score":1-100, "summary":"max 2 frasi", "predicted_eol_date":"YYYY-MM-DD o null"}]}',
+            "Rispondi usando UNO dei formati validi sotto (in ordine di preferenza).",
+            "Formato 1 (preferito): JSON valido.",
+            'JSON: {"results":[{"set_id":"...", "score":1-100, "summary":"max 2 frasi", "predicted_eol_date":"YYYY-MM-DD o null"}]}',
             (
-                "Se il modello non riesce a produrre JSON valido, usa formato fallback "
-                "una riga per set: set_id=<ID>|score=<1-100>|summary=<max 12 parole>|predicted_eol_date=<YYYY-MM-DD|null>"
+                "Formato 2 (fallback tagged): per ogni set usa un blocco:\n"
+                "[SET]\nset_id: <ID>\nscore: <1-100>\nsummary: <max 12 parole>\n"
+                "predicted_eol_date: <YYYY-MM-DD|null>\n[/SET]"
+            ),
+            (
+                "Formato 3 (fallback compatibilita'): una riga per set:\n"
+                "set_id=<ID>|score=<1-100>|summary=<max 12 parole>|predicted_eol_date=<YYYY-MM-DD|null>"
             ),
             f"Devi restituire esattamente {len(candidates)} risultati (uno per ogni set_id). Non omettere nessun set.",
-            "Non aggiungere testo fuori dal JSON.",
+            "Non aggiungere testo fuori dal formato scelto.",
             "",
             "SET LIST:",
         ]
