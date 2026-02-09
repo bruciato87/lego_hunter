@@ -862,6 +862,8 @@ class LegoHunterTelegramBot:
             )
         total_non_json_rate = float(diagnostics.get("non_json_rate_total") or 0.0)
         total_fallback_rate = float(diagnostics.get("fallback_rate_total") or 0.0)
+        total_non_json_fresh_rate = float(diagnostics.get("non_json_rate_fresh_total") or 0.0)
+        total_non_json_cache_rate = float(diagnostics.get("non_json_rate_cache_total") or 0.0)
         if (
             diagnostics.get("non_json_rate_total") is not None
             or diagnostics.get("fallback_rate_total") is not None
@@ -872,6 +874,14 @@ class LegoHunterTelegramBot:
             lines.append(
                 f"📊 Copertura ranking totale: non-JSON {total_non_json_rate * 100.0:.0f}% | "
                 f"fallback {total_fallback_rate * 100.0:.0f}%"
+            )
+        if (
+            diagnostics.get("non_json_rate_fresh_total") is not None
+            or diagnostics.get("non_json_rate_cache_total") is not None
+        ) and (total_non_json_fresh_rate > 0.0 or total_non_json_cache_rate > 0.0):
+            lines.append(
+                f"🧾 Non-JSON origine: fresh {total_non_json_fresh_rate * 100.0:.0f}% | "
+                f"cache {total_non_json_cache_rate * 100.0:.0f}%"
             )
         ai_guardrails = int(diagnostics.get("ai_guardrail_applied_count") or 0)
         if ai_guardrails > 0:

@@ -871,6 +871,7 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
                 "ai_raw_score": 77,
                 "ai_shortlisted": True,
                 "ai_fallback_used": False,
+                "ai_source_origin": "cache_repository",
                 "risk_note": "Output AI non JSON: score estratto da testo con parsing robusto.",
             },
             {
@@ -904,6 +905,8 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(float(diagnostics["strict_pass_rate_shortlist"]), 1 / 3, places=4)
         self.assertAlmostEqual(float(diagnostics["fallback_rate_total"]), 0.5, places=4)
         self.assertAlmostEqual(float(diagnostics["non_json_rate_total"]), 0.25, places=4)
+        self.assertAlmostEqual(float(diagnostics["non_json_rate_cache_total"]), 0.25, places=4)
+        self.assertAlmostEqual(float(diagnostics["non_json_rate_fresh_total"]), 0.0, places=4)
 
     async def test_non_fallback_can_be_low_confidence_with_weak_quant_data(self) -> None:
         repo = FakeRepo()
@@ -1841,6 +1844,87 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(oracle.ai_calls, 0)
         self.assertGreaterEqual(int(report["diagnostics"]["ranking"].get("ai_persisted_cache_hits") or 0), 1)
         self.assertGreaterEqual(int(report["diagnostics"]["ranking"].get("ai_cache_hits") or 0), 1)
+
+    async def test_ai_persisted_non_json_cache_respects_short_ttl(self) -> None:
+        repo = FakeRepo()
+        now = datetime.now(timezone.utc)
+        repo.recent["75367"] = [
+            {
+                "set_id": "75367",
+                "price": 129.0,
+                "platform": "vinted",
+                "recorded_at": (now - timedelta(days=idx)).isoformat(),
+            }
+            for idx in range(4)
+        ]
+        repo.recent_ai_insights["75367"] = {
+            "set_id": "75367",
+            "ai_investment_score": 78,
+            "ai_analysis_summary": "Cache DB non-json",
+            "eol_date_prediction": "2026-12-01",
+            "last_seen_at": (now - timedelta(hours=10)).isoformat(),
+            "metadata": {
+                "ai_raw_score": 82,
+                "ai_fallback_used": False,
+                "ai_confidence": "LOW_CONFIDENCE",
+                "ai_risk_note": "Output AI non JSON: score estratto da testo con parsing robusto.",
+            },
+        }
+        candidates = [
+            {
+                "set_id": "75367",
+                "set_name": "LEGO Star Wars",
+                "theme": "Star Wars",
+                "source": "lego_proxy_reader",
+                "current_price": 129.99,
+                "eol_date_prediction": "2026-05-01",
+                "metadata": {},
+                "mock_score": 84,
+                "mock_fallback": False,
+            }
+        ]
+        oracle = DummyOracle(repo, candidates)
+        oracle.ai_rank_max_candidates = 1
+        oracle.ai_cache_ttl_sec = 86400.0
+        oracle.ai_persisted_cache_ttl_sec = 172800.0
+        oracle.ai_non_json_cache_ttl_sec = 6 * 3600.0
+
+        report = await oracle.discover_with_diagnostics(persist=False, top_limit=5, fallback_limit=1)
+
+        self.assertEqual(oracle.ai_calls, 1)
+        self.assertEqual(int(report["diagnostics"]["ranking"].get("ai_persisted_cache_hits") or 0), 0)
+        self.assertEqual(int(report["diagnostics"]["ranking"].get("ai_cache_hits") or 0), 0)
+
+    def test_set_cached_ai_insight_caps_non_json_ttl(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_cache_ttl_sec = 86400.0
+        oracle.ai_non_json_cache_ttl_sec = 7200.0
+        candidate = {
+            "set_id": "75367",
+            "set_name": "LEGO Star Wars",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 129.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+        insight = AIInsight(
+            score=78,
+            summary="Non json sample",
+            predicted_eol_date="2026-05-01",
+            fallback_used=False,
+            confidence="LOW_CONFIDENCE",
+            risk_note="Output AI non JSON: score estratto da testo con parsing robusto.",
+        )
+
+        now_ts = time.time()
+        oracle._set_cached_ai_insight(candidate, insight)
+        key = oracle._ai_cache_key(candidate)
+        self.assertIsNotNone(key)
+        cached = oracle._ai_insight_cache.get(str(key))
+        self.assertIsNotNone(cached)
+        expires_at, _insight = cached
+        self.assertLessEqual(float(expires_at - now_ts), 7205.0)
 
     def test_extract_json_from_wrapped_text(self) -> None:
         raw = "Risposta:\n{\"score\": 77, \"summary\": \"ok\"}\nfine"
@@ -2801,6 +2885,99 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             await oracle._rank_and_persist_candidates(source_candidates, persist=False)
 
         self.assertEqual(selected_orders[0], ["16003", "16004"])
+
+    async def test_rank_flow_non_json_high_priority_rescore_improves_top_candidate(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.openrouter_api_key = "test-key"
+        oracle.ai_single_call_scoring_enabled = True
+        oracle.ai_top_pick_rescue_enabled = False
+        oracle.ai_non_shortlist_cache_rescue_enabled = False
+        oracle.ai_single_call_secondary_batch_enabled = False
+        oracle.ai_non_json_rescore_enabled = True
+        oracle.ai_non_json_rescore_max_candidates = 2
+        oracle.ai_non_json_rescore_min_composite = 1
+        oracle.ai_non_json_rescore_min_budget_sec = 6.0
+        oracle.ai_non_json_rescore_timeout_sec = 10.0
+        oracle.ai_scoring_hard_budget_sec = 40.0
+
+        source_candidates = [{"set_id": "16501"}]
+        candidate = {
+            "set_id": "16501",
+            "set_name": "Set 16501",
+            "theme": "City",
+            "source": "lego_proxy_reader",
+            "current_price": 59.99,
+            "eol_date_prediction": "2026-10-01",
+            "metadata": {},
+        }
+        forecast = oracle.forecaster.forecast(candidate=candidate, history_rows=[], theme_baseline={})
+        prepared = [
+            {
+                "candidate": candidate,
+                "set_id": "16501",
+                "theme": candidate["theme"],
+                "forecast": forecast,
+                "history_30": [],
+                "prefilter_score": 92,
+                "prefilter_rank": 1,
+                "ai_shortlisted": True,
+            }
+        ]
+        shortlist = [prepared[0]]
+        skipped: list[dict] = []
+        ai_stats = {
+            "ai_scored_count": 1,
+            "ai_batch_scored_count": 0,
+            "ai_cache_hits": 0,
+            "ai_cache_misses": 1,
+            "ai_persisted_cache_hits": 0,
+            "ai_errors": 0,
+            "ai_budget_exhausted": 0,
+            "ai_timeout_count": 0,
+        }
+        initial_ai_results = {
+            "16501": AIInsight(
+                score=82,
+                summary="non json",
+                predicted_eol_date="2026-10-01",
+                fallback_used=False,
+                confidence="LOW_CONFIDENCE",
+                risk_note="Output AI non JSON: score estratto da testo con parsing robusto.",
+            )
+        }
+
+        async def fake_batch(entries, *, deadline, allow_repair_calls=True, allow_failover_call=True):  # noqa: ANN001
+            _ = (entries, deadline, allow_repair_calls, allow_failover_call)
+            return {
+                "16501": AIInsight(
+                    score=76,
+                    summary="strict json refreshed",
+                    predicted_eol_date="2026-10-01",
+                    fallback_used=False,
+                    confidence="HIGH_CONFIDENCE",
+                    risk_note=None,
+                )
+            }, None
+
+        with (
+            patch.object(oracle, "_prepare_quantitative_context", return_value=prepared),
+            patch.object(oracle, "_select_ai_shortlist", return_value=(shortlist, skipped)),
+            patch.object(oracle, "_score_ai_shortlist", new=AsyncMock(return_value=(initial_ai_results, ai_stats))),
+            patch.object(oracle, "_score_ai_shortlist_batch", new=AsyncMock(side_effect=fake_batch)) as mocked_batch,
+            patch.object(oracle, "_is_ai_score_collapse", return_value=False),
+        ):
+            ranked = await oracle._rank_and_persist_candidates(source_candidates, persist=False)
+
+        self.assertGreaterEqual(mocked_batch.await_count, 1)
+        ranked_by_set = {str(row.get("set_id")): row for row in ranked}
+        refreshed = ranked_by_set["16501"]
+        self.assertFalse(bool(refreshed.get("ai_fallback_used")))
+        self.assertNotIn("non json", str(refreshed.get("risk_note") or "").lower())
+        self.assertEqual(str(refreshed.get("ai_source_origin")), "non_json_rescore_fresh")
+        self.assertEqual(int(oracle._last_ranking_diagnostics.get("ai_non_json_rescore_attempted") or 0), 1)
+        self.assertGreaterEqual(int(oracle._last_ranking_diagnostics.get("ai_non_json_rescore_scored") or 0), 1)
+        self.assertGreaterEqual(int(oracle._last_ranking_diagnostics.get("ai_non_json_rescore_improved") or 0), 1)
 
     def test_build_ranked_payloads_uses_rescue_failure_note_instead_of_prefilter_note(self) -> None:
         repo = FakeRepo()

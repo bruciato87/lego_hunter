@@ -58,6 +58,7 @@ DEFAULT_AI_SCORING_CONCURRENCY = 4
 DEFAULT_AI_RANK_MAX_CANDIDATES = 12
 DEFAULT_AI_CACHE_TTL_SEC = 10800.0
 DEFAULT_AI_PERSISTED_CACHE_TTL_SEC = 129600.0
+DEFAULT_AI_NON_JSON_CACHE_TTL_SEC = 21600.0
 DEFAULT_AI_CACHE_MAX_ITEMS = 4000
 DEFAULT_OPENROUTER_MALFORMED_LIMIT = 3
 DEFAULT_AI_SCORING_HARD_BUDGET_SEC = 60.0
@@ -84,6 +85,11 @@ DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_MAX_CANDIDATES = 6
 DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_MAX_ROUNDS = 3
 DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_MIN_BUDGET_SEC = 14.0
 DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_TIMEOUT_SEC = 12.0
+DEFAULT_AI_NON_JSON_RESCORE_ENABLED = True
+DEFAULT_AI_NON_JSON_RESCORE_MAX_CANDIDATES = 4
+DEFAULT_AI_NON_JSON_RESCORE_MIN_COMPOSITE = 65
+DEFAULT_AI_NON_JSON_RESCORE_MIN_BUDGET_SEC = 10.0
+DEFAULT_AI_NON_JSON_RESCORE_TIMEOUT_SEC = 10.0
 DEFAULT_AI_SCORE_GUARDRAIL_ENABLED = True
 DEFAULT_AI_SCORE_SOFT_CAP = 95
 DEFAULT_AI_SCORE_SOFT_CAP_FACTOR = 0.35
@@ -471,6 +477,12 @@ class DiscoveryOracle:
             minimum=0.0,
             maximum=172800.0,
         )
+        self.ai_non_json_cache_ttl_sec = self._safe_env_float(
+            "AI_NON_JSON_CACHE_TTL_SEC",
+            default=DEFAULT_AI_NON_JSON_CACHE_TTL_SEC,
+            minimum=3600.0,
+            maximum=43200.0,
+        )
         self.ai_cache_max_items = self._safe_env_int(
             "AI_INSIGHT_CACHE_MAX_ITEMS",
             default=DEFAULT_AI_CACHE_MAX_ITEMS,
@@ -610,6 +622,34 @@ class DiscoveryOracle:
         self.ai_single_call_secondary_batch_timeout_sec = self._safe_env_float(
             "AI_SINGLE_CALL_SECONDARY_BATCH_TIMEOUT_SEC",
             default=DEFAULT_AI_SINGLE_CALL_SECONDARY_BATCH_TIMEOUT_SEC,
+            minimum=6.0,
+            maximum=40.0,
+        )
+        self.ai_non_json_rescore_enabled = self._safe_env_bool(
+            "AI_NON_JSON_RESCORE_ENABLED",
+            default=DEFAULT_AI_NON_JSON_RESCORE_ENABLED,
+        )
+        self.ai_non_json_rescore_max_candidates = self._safe_env_int(
+            "AI_NON_JSON_RESCORE_MAX_CANDIDATES",
+            default=DEFAULT_AI_NON_JSON_RESCORE_MAX_CANDIDATES,
+            minimum=1,
+            maximum=12,
+        )
+        self.ai_non_json_rescore_min_composite = self._safe_env_int(
+            "AI_NON_JSON_RESCORE_MIN_COMPOSITE",
+            default=DEFAULT_AI_NON_JSON_RESCORE_MIN_COMPOSITE,
+            minimum=1,
+            maximum=100,
+        )
+        self.ai_non_json_rescore_min_budget_sec = self._safe_env_float(
+            "AI_NON_JSON_RESCORE_MIN_BUDGET_SEC",
+            default=DEFAULT_AI_NON_JSON_RESCORE_MIN_BUDGET_SEC,
+            minimum=6.0,
+            maximum=120.0,
+        )
+        self.ai_non_json_rescore_timeout_sec = self._safe_env_float(
+            "AI_NON_JSON_RESCORE_TIMEOUT_SEC",
+            default=DEFAULT_AI_NON_JSON_RESCORE_TIMEOUT_SEC,
             minimum=6.0,
             maximum=40.0,
         )
@@ -961,6 +1001,7 @@ class DiscoveryOracle:
             "openrouter": {},
         }
         self._ai_insight_cache: Dict[str, tuple[float, AIInsight]] = {}
+        self._last_ai_cache_primed_set_ids: set[str] = set()
         self._ai_failover_lock: Optional[asyncio.Lock] = None
         self._last_ranking_diagnostics: Dict[str, Any] = {}
         self._historical_reference_cases: list[Dict[str, Any]] = []
@@ -1106,6 +1147,15 @@ class DiscoveryOracle:
             self.ai_single_call_secondary_batch_max_rounds,
             self.ai_single_call_secondary_batch_min_budget_sec,
             self.ai_single_call_secondary_batch_timeout_sec,
+        )
+        LOGGER.info(
+            "Non-JSON tuning | cache_ttl_sec=%.0f rescore_enabled=%s rescore_max=%s rescore_min_composite=%s rescore_min_budget_sec=%.1f rescore_timeout_sec=%.1f",
+            self.ai_non_json_cache_ttl_sec,
+            self.ai_non_json_rescore_enabled,
+            self.ai_non_json_rescore_max_candidates,
+            self.ai_non_json_rescore_min_composite,
+            self.ai_non_json_rescore_min_budget_sec,
+            self.ai_non_json_rescore_timeout_sec,
         )
         LOGGER.info(
             "Predictive tuning | min_composite=%s min_prob=%.2f min_confidence=%s history_days=%s target_roi=%.1f bootstrap_enabled=%s bootstrap_min_history=%s bootstrap_min_prob=%.2f bootstrap_min_confidence=%s historical_gate_required=%s historical_min_samples=%s historical_min_win_rate_pct=%.1f historical_min_support_confidence=%s historical_min_prior_score=%s adaptive_hist_thresholds=%s adaptive_quantile=%.2f contextual_hist_gate=%s contextual_pattern_min=%s contextual_win_relax=%.1f contextual_support_relax=%s contextual_prior_relax=%s",
@@ -3139,9 +3189,33 @@ class DiscoveryOracle:
                 str(row.get("risk_note") or row.get("metadata", {}).get("ai_risk_note") or "")
             )
 
+        def _ai_origin_bucket(row: Dict[str, Any]) -> str:
+            origin = str(
+                row.get("ai_source_origin")
+                or row.get("metadata", {}).get("ai_source_origin")
+                or ""
+            ).strip().lower()
+            if origin.startswith("cache"):
+                return "cache"
+            if origin:
+                return "fresh"
+            return "unknown"
+
         ai_non_json_total_count = sum(1 for row in ranked if _is_non_json_row(row))
         ai_shortlist_fallback_count = sum(1 for row in ai_shortlisted_rows if bool(row.get("ai_fallback_used")))
         ai_shortlist_non_json_count = sum(1 for row in ai_shortlisted_rows if _is_non_json_row(row))
+        ai_non_json_cache_total_count = sum(
+            1 for row in ranked if _is_non_json_row(row) and _ai_origin_bucket(row) == "cache"
+        )
+        ai_non_json_fresh_total_count = sum(
+            1 for row in ranked if _is_non_json_row(row) and _ai_origin_bucket(row) == "fresh"
+        )
+        ai_non_json_cache_shortlist_count = sum(
+            1 for row in ai_shortlisted_rows if _is_non_json_row(row) and _ai_origin_bucket(row) == "cache"
+        )
+        ai_non_json_fresh_shortlist_count = sum(
+            1 for row in ai_shortlisted_rows if _is_non_json_row(row) and _ai_origin_bucket(row) == "fresh"
+        )
         ai_shortlist_strict_pass_count = sum(
             1
             for row in ai_shortlisted_rows
@@ -3197,6 +3271,8 @@ class DiscoveryOracle:
             "ai_shortlist_effective_count": ai_shortlist_count,
             "ai_shortlist_fallback_count": ai_shortlist_fallback_count,
             "ai_shortlist_non_json_count": ai_shortlist_non_json_count,
+            "ai_shortlist_non_json_cache_count": ai_non_json_cache_shortlist_count,
+            "ai_shortlist_non_json_fresh_count": ai_non_json_fresh_shortlist_count,
             "ai_shortlist_strict_pass_count": ai_shortlist_strict_pass_count,
             "below_threshold_count": len(ranked) - len(above_threshold),
             "max_ai_score": max(
@@ -3249,6 +3325,8 @@ class DiscoveryOracle:
             "backtest_runtime": self._backtest_runtime_public(self.backtest_runtime),
             "ranking": dict(self._last_ranking_diagnostics or {}),
             "ai_non_json_count": ai_non_json_total_count,
+            "ai_non_json_cache_count": ai_non_json_cache_total_count,
+            "ai_non_json_fresh_count": ai_non_json_fresh_total_count,
         }
 
         ranked_count = max(1, len(ranked))
@@ -3261,6 +3339,22 @@ class DiscoveryOracle:
         )
         diagnostics["non_json_rate_shortlist"] = round(
             float(diagnostics["ai_shortlist_non_json_count"]) / shortlist_count_for_rate,
+            4,
+        )
+        diagnostics["non_json_rate_cache_total"] = round(
+            float(diagnostics["ai_non_json_cache_count"]) / ranked_count,
+            4,
+        )
+        diagnostics["non_json_rate_fresh_total"] = round(
+            float(diagnostics["ai_non_json_fresh_count"]) / ranked_count,
+            4,
+        )
+        diagnostics["non_json_rate_cache_shortlist"] = round(
+            float(diagnostics["ai_shortlist_non_json_cache_count"]) / shortlist_count_for_rate,
+            4,
+        )
+        diagnostics["non_json_rate_fresh_shortlist"] = round(
+            float(diagnostics["ai_shortlist_non_json_fresh_count"]) / shortlist_count_for_rate,
             4,
         )
         diagnostics["strict_pass_rate_shortlist"] = round(
@@ -3348,6 +3442,13 @@ class DiscoveryOracle:
                 "ai_secondary_batch_scored": 0,
                 "ai_secondary_batch_errors": 0,
                 "ai_secondary_batch_timeouts": 0,
+                "ai_non_json_rescore_attempted": 0,
+                "ai_non_json_rescore_candidates": 0,
+                "ai_non_json_rescore_scored": 0,
+                "ai_non_json_rescore_improved": 0,
+                "ai_non_json_rescore_errors": 0,
+                "ai_non_json_rescore_timeouts": 0,
+                "ai_non_json_rescore_skipped_budget": 0,
                 "ai_top_pick_rescue_attempts": 0,
                 "ai_top_pick_rescue_successes": 0,
                 "ai_top_pick_rescue_failures": 0,
@@ -3382,6 +3483,13 @@ class DiscoveryOracle:
             "ai_secondary_batch_scored": 0,
             "ai_secondary_batch_errors": 0,
             "ai_secondary_batch_timeouts": 0,
+            "ai_non_json_rescore_attempted": 0,
+            "ai_non_json_rescore_candidates": 0,
+            "ai_non_json_rescore_scored": 0,
+            "ai_non_json_rescore_improved": 0,
+            "ai_non_json_rescore_errors": 0,
+            "ai_non_json_rescore_timeouts": 0,
+            "ai_non_json_rescore_skipped_budget": 0,
         }
 
         if skipped and self.ai_non_shortlist_cache_rescue_enabled:
@@ -3399,6 +3507,7 @@ class DiscoveryOracle:
                     continue
                 ai_results[set_id] = cached
                 row["ai_skip_cache_rescued"] = True
+                row["ai_source_origin"] = "cache_skip"
                 post_shortlist_stats["ai_skip_cache_rescued"] += 1
 
         if skipped and self.ai_single_call_scoring_enabled and self.ai_single_call_secondary_batch_enabled:
@@ -3517,11 +3626,13 @@ class DiscoveryOracle:
                                 source_row["ai_secondary_batch_scored"] = True
                                 source_row["ai_secondary_batch_failed"] = False
                                 source_row["ai_secondary_batch_reason"] = "success"
+                                source_row["ai_source_origin"] = "secondary_batch_fresh"
                         else:
                             source_row = skipped_set_ids.get(set_id)
                             if source_row is not None:
                                 source_row["ai_secondary_batch_failed"] = True
                                 source_row["ai_secondary_batch_reason"] = "provider_fallback"
+                                source_row["ai_source_origin"] = "secondary_batch_provider_fallback"
 
                     LOGGER.info(
                         "AI single-call secondary batch round completed | round=%s scored=%s requested=%s",
@@ -3536,6 +3647,29 @@ class DiscoveryOracle:
             skipped_set_ids=skipped_set_ids,
             shortlist_count=len(shortlist),
         )
+        non_json_rescore_stats = await self._rescore_non_json_high_priority(
+            prepared=prepared,
+            ranked=ranked,
+            ai_results=ai_results,
+            ai_started=ai_started,
+        )
+        for key in (
+            "ai_non_json_rescore_attempted",
+            "ai_non_json_rescore_candidates",
+            "ai_non_json_rescore_scored",
+            "ai_non_json_rescore_improved",
+            "ai_non_json_rescore_errors",
+            "ai_non_json_rescore_timeouts",
+            "ai_non_json_rescore_skipped_budget",
+        ):
+            post_shortlist_stats[key] = int(non_json_rescore_stats.get(key, 0))
+        if int(non_json_rescore_stats.get("ai_non_json_rescore_scored") or 0) > 0:
+            ranked, opportunities = self._build_ranked_payloads(
+                prepared=prepared,
+                ai_results=ai_results,
+                skipped_set_ids=skipped_set_ids,
+                shortlist_count=len(shortlist),
+            )
 
         rescue_stats = {
             "ai_top_pick_rescue_attempts": 0,
@@ -3712,6 +3846,13 @@ class DiscoveryOracle:
             "ai_secondary_batch_scored": int(post_shortlist_stats.get("ai_secondary_batch_scored", 0)),
             "ai_secondary_batch_errors": int(post_shortlist_stats.get("ai_secondary_batch_errors", 0)),
             "ai_secondary_batch_timeouts": int(post_shortlist_stats.get("ai_secondary_batch_timeouts", 0)),
+            "ai_non_json_rescore_attempted": int(post_shortlist_stats.get("ai_non_json_rescore_attempted", 0)),
+            "ai_non_json_rescore_candidates": int(post_shortlist_stats.get("ai_non_json_rescore_candidates", 0)),
+            "ai_non_json_rescore_scored": int(post_shortlist_stats.get("ai_non_json_rescore_scored", 0)),
+            "ai_non_json_rescore_improved": int(post_shortlist_stats.get("ai_non_json_rescore_improved", 0)),
+            "ai_non_json_rescore_errors": int(post_shortlist_stats.get("ai_non_json_rescore_errors", 0)),
+            "ai_non_json_rescore_timeouts": int(post_shortlist_stats.get("ai_non_json_rescore_timeouts", 0)),
+            "ai_non_json_rescore_skipped_budget": int(post_shortlist_stats.get("ai_non_json_rescore_skipped_budget", 0)),
             "ai_top_pick_rescue_attempts": int(rescue_stats.get("ai_top_pick_rescue_attempts", 0)),
             "ai_top_pick_rescue_successes": int(rescue_stats.get("ai_top_pick_rescue_successes", 0)),
             "ai_top_pick_rescue_failures": int(rescue_stats.get("ai_top_pick_rescue_failures", 0)),
@@ -3729,7 +3870,7 @@ class DiscoveryOracle:
             "total_sec": round(total_duration, 2),
         }
         LOGGER.info(
-            "Ranking completed | candidates=%s shortlisted=%s ai_scored=%s cache_hits=%s persisted_cache_hits=%s skip_cache_rescued=%s secondary_batch_rounds=%s secondary_batch_scored=%s rescue_attempts=%s rescue_successes=%s final_pick_guarantee_rounds=%s final_pick_pending=%s historical_prior_applied=%s persisted_opportunities=%s persisted_snapshots=%s durations={prep:%.2fs ai:%.2fs persist:%.2fs total:%.2fs}",
+            "Ranking completed | candidates=%s shortlisted=%s ai_scored=%s cache_hits=%s persisted_cache_hits=%s skip_cache_rescued=%s secondary_batch_rounds=%s secondary_batch_scored=%s non_json_rescore_scored=%s rescue_attempts=%s rescue_successes=%s final_pick_guarantee_rounds=%s final_pick_pending=%s historical_prior_applied=%s persisted_opportunities=%s persisted_snapshots=%s durations={prep:%.2fs ai:%.2fs persist:%.2fs total:%.2fs}",
             len(source_candidates),
             len(shortlist),
             self._last_ranking_diagnostics["ai_scored_count"],
@@ -3738,6 +3879,7 @@ class DiscoveryOracle:
             self._last_ranking_diagnostics["ai_skip_cache_rescued"],
             self._last_ranking_diagnostics["ai_secondary_batch_rounds"],
             self._last_ranking_diagnostics["ai_secondary_batch_scored"],
+            self._last_ranking_diagnostics["ai_non_json_rescore_scored"],
             self._last_ranking_diagnostics["ai_top_pick_rescue_attempts"],
             self._last_ranking_diagnostics["ai_top_pick_rescue_successes"],
             self._last_ranking_diagnostics["ai_final_pick_guarantee_rounds"],
@@ -3838,6 +3980,20 @@ class DiscoveryOracle:
                             else f"AI non eseguita: pre-filter rank #{pre_rank} oltre top {shortlist_count}."
                         ),
                     )
+                if not row.get("ai_source_origin"):
+                    row["ai_source_origin"] = "heuristic_skipped_fallback"
+
+            ai_source_origin = str(row.get("ai_source_origin") or "").strip().lower()
+            if not ai_source_origin:
+                ai_source_origin = (
+                    "heuristic_fallback"
+                    if bool(ai.fallback_used)
+                    else "unknown_external"
+                )
+                row["ai_source_origin"] = ai_source_origin
+            ai_non_json_origin = "none"
+            if self._is_non_json_ai_note(ai.risk_note):
+                ai_non_json_origin = "cache" if ai_source_origin.startswith("cache") else "fresh"
 
             pattern_eval = self._evaluate_success_patterns(candidate)
             effective_pattern_score = self._effective_pattern_score(
@@ -3887,6 +4043,8 @@ class DiscoveryOracle:
                     "ai_fallback_used": bool(ai.fallback_used),
                     "ai_confidence": str(ai.confidence or "HIGH_CONFIDENCE"),
                     "ai_risk_note": ai.risk_note,
+                    "ai_source_origin": ai_source_origin,
+                    "ai_non_json_origin": ai_non_json_origin,
                     "ai_raw_score": int(ai.score),
                     "ai_model_raw_score": (
                         int(ai.model_raw_score)
@@ -3971,6 +4129,8 @@ class DiscoveryOracle:
             payload["pattern_signals"] = pattern_eval.signals
             payload["ai_fallback_used"] = bool(ai.fallback_used)
             payload["ai_confidence"] = str(ai.confidence or "HIGH_CONFIDENCE")
+            payload["ai_source_origin"] = ai_source_origin
+            payload["ai_non_json_origin"] = ai_non_json_origin
             payload["forecast_rationale"] = forecast.rationale
             payload["prefilter_score"] = int(row.get("prefilter_score") or 0)
             payload["prefilter_rank"] = int(row.get("prefilter_rank") or 0)
@@ -4079,6 +4239,7 @@ class DiscoveryOracle:
                     if prepared_row is not None:
                         prepared_row["ai_rescue_failed"] = False
                         prepared_row["ai_rescue_reason"] = "cache_hit"
+                        prepared_row["ai_source_origin"] = "cache_top_pick_rescue"
                     continue
                 if not external_available:
                     prepared_row = prepared_by_set.get(set_id)
@@ -4131,12 +4292,14 @@ class DiscoveryOracle:
                         if prepared_row is not None:
                             prepared_row["ai_rescue_failed"] = True
                             prepared_row["ai_rescue_reason"] = "provider_fallback"
+                            prepared_row["ai_source_origin"] = "top_pick_rescue_batch_provider_fallback"
                         continue
                     self._set_cached_ai_insight(candidate, insight)
                     stats["ai_top_pick_rescue_successes"] += 1
                     if prepared_row is not None:
                         prepared_row["ai_rescue_failed"] = False
                         prepared_row["ai_rescue_reason"] = "success"
+                        prepared_row["ai_source_origin"] = "top_pick_rescue_batch_fresh"
         else:
             for candidate in rescue_candidates:
                 set_id = str(candidate.get("set_id") or "").strip()
@@ -4149,6 +4312,7 @@ class DiscoveryOracle:
                     if prepared_row is not None:
                         prepared_row["ai_rescue_failed"] = False
                         prepared_row["ai_rescue_reason"] = "cache_hit"
+                        prepared_row["ai_source_origin"] = "cache_top_pick_rescue"
                     continue
                 if not external_available:
                     prepared_row = prepared_by_set.get(set_id)
@@ -4192,6 +4356,7 @@ class DiscoveryOracle:
                     if prepared_row is not None:
                         prepared_row["ai_rescue_failed"] = True
                         prepared_row["ai_rescue_reason"] = "provider_fallback"
+                        prepared_row["ai_source_origin"] = "top_pick_rescue_item_provider_fallback"
                     continue
                 self._set_cached_ai_insight(candidate, insight)
                 stats["ai_top_pick_rescue_successes"] += 1
@@ -4199,6 +4364,7 @@ class DiscoveryOracle:
                 if prepared_row is not None:
                     prepared_row["ai_rescue_failed"] = False
                     prepared_row["ai_rescue_reason"] = "success"
+                    prepared_row["ai_source_origin"] = "top_pick_rescue_item_fresh"
 
         if stats["ai_top_pick_rescue_attempts"] > 0:
             LOGGER.info(
@@ -4509,6 +4675,142 @@ class DiscoveryOracle:
         )
         return unresolved[: max(1, int(limit))]
 
+    async def _rescore_non_json_high_priority(
+        self,
+        *,
+        prepared: list[Dict[str, Any]],
+        ranked: list[Dict[str, Any]],
+        ai_results: Dict[str, AIInsight],
+        ai_started: float,
+    ) -> Dict[str, int]:
+        stats = {
+            "ai_non_json_rescore_attempted": 0,
+            "ai_non_json_rescore_candidates": 0,
+            "ai_non_json_rescore_scored": 0,
+            "ai_non_json_rescore_improved": 0,
+            "ai_non_json_rescore_errors": 0,
+            "ai_non_json_rescore_timeouts": 0,
+            "ai_non_json_rescore_skipped_budget": 0,
+        }
+        if not self.ai_non_json_rescore_enabled:
+            return stats
+        if not ranked or not self._external_ai_available():
+            return stats
+
+        min_composite = int(self.ai_non_json_rescore_min_composite)
+        target_rows = [
+            row
+            for row in sorted(
+                ranked,
+                key=lambda row: (
+                    int(row.get("composite_score") or row.get("ai_investment_score") or 0),
+                    int(row.get("forecast_score") or 0),
+                    int(row.get("market_demand_score") or 0),
+                ),
+                reverse=True,
+            )
+            if int(row.get("composite_score") or row.get("ai_investment_score") or 0) >= min_composite
+        ]
+        if not target_rows:
+            return stats
+
+        candidate_set_ids: list[str] = []
+        for row in target_rows:
+            set_id = str(row.get("set_id") or "").strip()
+            if not set_id or set_id in candidate_set_ids:
+                continue
+            ai = ai_results.get(set_id)
+            if ai is None or bool(ai.fallback_used):
+                continue
+            if not self._is_non_json_ai_note(ai.risk_note):
+                continue
+            candidate_set_ids.append(set_id)
+            if len(candidate_set_ids) >= max(1, int(self.ai_non_json_rescore_max_candidates)):
+                break
+
+        if not candidate_set_ids:
+            return stats
+
+        elapsed_so_far = max(0.0, time.monotonic() - ai_started)
+        budget_left = max(0.0, float(self.ai_scoring_hard_budget_sec) - elapsed_so_far)
+        min_budget = float(self.ai_non_json_rescore_min_budget_sec)
+        if budget_left < min_budget:
+            stats["ai_non_json_rescore_skipped_budget"] = 1
+            LOGGER.info(
+                "AI non-JSON rescore skipped | reason=insufficient_budget budget_left=%.2f min_budget=%.2f targets=%s",
+                budget_left,
+                min_budget,
+                len(candidate_set_ids),
+            )
+            return stats
+
+        prepared_by_set = {str(row.get("set_id") or "").strip(): row for row in prepared}
+        entries: list[Dict[str, Any]] = []
+        for set_id in candidate_set_ids:
+            prepared_row = prepared_by_set.get(set_id)
+            if prepared_row is None:
+                continue
+            entries.append(
+                {
+                    "set_id": set_id,
+                    "candidate": prepared_row.get("candidate") or {},
+                }
+            )
+        if not entries:
+            return stats
+
+        stats["ai_non_json_rescore_attempted"] = 1
+        stats["ai_non_json_rescore_candidates"] = len(entries)
+        timeout_sec = min(float(self.ai_non_json_rescore_timeout_sec), max(6.0, budget_left))
+        deadline = time.monotonic() + timeout_sec
+        LOGGER.info(
+            "AI non-JSON rescore round | candidates=%s budget_left=%.2fs timeout=%.2fs",
+            len(entries),
+            budget_left,
+            timeout_sec,
+        )
+        batch_results, batch_error = await self._score_ai_shortlist_batch(
+            entries,
+            deadline=deadline,
+            allow_repair_calls=True,
+            allow_failover_call=True,
+        )
+        if batch_error:
+            non_error_reasons = {"no_external_ai_available", "insufficient_budget_for_batch"}
+            if str(batch_error) in non_error_reasons:
+                return stats
+            stats["ai_non_json_rescore_errors"] += 1
+            if "timeout" in str(batch_error).lower():
+                stats["ai_non_json_rescore_timeouts"] += 1
+            LOGGER.warning(
+                "AI non-JSON rescore failed | candidates=%s error=%s",
+                len(entries),
+                str(batch_error)[:220],
+            )
+            return stats
+
+        for entry in entries:
+            set_id = str(entry.get("set_id") or "").strip()
+            if not set_id:
+                continue
+            insight = batch_results.get(set_id)
+            if insight is None or bool(insight.fallback_used):
+                continue
+            if self._is_non_json_ai_note(insight.risk_note):
+                continue
+            old = ai_results.get(set_id)
+            ai_results[set_id] = insight
+            self._set_cached_ai_insight(entry.get("candidate") or {}, insight)
+            prepared_row = prepared_by_set.get(set_id)
+            if prepared_row is not None:
+                prepared_row["ai_source_origin"] = "non_json_rescore_fresh"
+                prepared_row["ai_non_json_rescored"] = True
+            stats["ai_non_json_rescore_scored"] += 1
+            if old is not None and self._is_non_json_ai_note(old.risk_note):
+                stats["ai_non_json_rescore_improved"] += 1
+
+        return stats
+
     async def _score_ai_shortlist(
         self,
         shortlist: list[Dict[str, Any]],
@@ -4531,6 +4833,7 @@ class DiscoveryOracle:
         stats["ai_persisted_cache_hits"] = self._prime_ai_cache_from_repository(
             [entry.get("candidate") or {} for entry in shortlist],
         )
+        primed_set_ids = set(self._last_ai_cache_primed_set_ids)
 
         effective_concurrency = max(1, int(self.ai_scoring_concurrency))
         if str(self.ai_runtime.get("engine") or "") == "openrouter":
@@ -4558,6 +4861,7 @@ class DiscoveryOracle:
                 pending_entries.append(entry)
                 continue
             results[set_id] = cached
+            entry["ai_source_origin"] = "cache_repository" if set_id in primed_set_ids else "cache_memory"
             stats["ai_cache_hits"] += 1
 
         # Batch scoring pass: in single-call mode this is the only external scoring call.
@@ -4603,6 +4907,10 @@ class DiscoveryOracle:
                 if ai is None:
                     continue
                 results[set_id] = ai
+                if ai.fallback_used:
+                    entry["ai_source_origin"] = "batch_provider_fallback"
+                else:
+                    entry["ai_source_origin"] = "batch_fresh"
                 stats["ai_cache_misses"] += 1
                 if not ai.fallback_used:
                     stats["ai_scored_count"] += 1
@@ -4650,6 +4958,10 @@ class DiscoveryOracle:
                         if ai is None:
                             continue
                         results[set_id] = ai
+                        if ai.fallback_used:
+                            entry["ai_source_origin"] = "batch_rescue_provider_fallback"
+                        else:
+                            entry["ai_source_origin"] = "batch_rescue_fresh"
                         stats["ai_cache_misses"] += 1
                         if not ai.fallback_used:
                             stats["ai_scored_count"] += 1
@@ -4679,6 +4991,7 @@ class DiscoveryOracle:
                     ),
                 )
                 results[set_id] = fallback
+                entry["ai_source_origin"] = "heuristic_single_call_fallback"
                 stats["ai_cache_misses"] += 1
                 stats["ai_budget_exhausted"] += 1
 
@@ -4811,6 +5124,8 @@ class DiscoveryOracle:
                             ),
                         )
                         results[pending_set_id] = fallback
+                        if entry is not None:
+                            entry["ai_source_origin"] = "heuristic_budget_fallback"
                         stats["ai_cache_misses"] += 1
                         stats["ai_budget_exhausted"] += 1
                 tasks_by_set.clear()
@@ -4844,8 +5159,14 @@ class DiscoveryOracle:
 
                 if from_cache:
                     stats["ai_cache_hits"] += 1
+                    if entry is not None and not entry.get("ai_source_origin"):
+                        entry["ai_source_origin"] = "cache_memory"
                 else:
                     stats["ai_cache_misses"] += 1
+                    if entry is not None:
+                        entry["ai_source_origin"] = (
+                            "worker_provider_fallback" if bool(ai.fallback_used) else "worker_fresh"
+                        )
                     if not ai.fallback_used:
                         stats["ai_scored_count"] += 1
                         self._set_cached_ai_insight(candidate, ai)
@@ -4881,6 +5202,7 @@ class DiscoveryOracle:
                 risk_note="Score fallback: candidato non processato entro il budget AI del ciclo.",
             )
             results[set_id] = fallback
+            entry["ai_source_origin"] = "heuristic_safety_net_fallback"
             stats["ai_cache_misses"] += 1
             stats["ai_budget_exhausted"] += 1
 
@@ -6273,6 +6595,34 @@ class DiscoveryOracle:
             return base
         return f"{base.rstrip('.')} | {addition}"
 
+    @staticmethod
+    def _row_age_seconds(
+        row: Dict[str, Any],
+        *,
+        keys: tuple[str, ...] = ("last_seen_at", "recorded_at", "updated_at", "created_at"),
+    ) -> Optional[float]:
+        now_utc = datetime.now(timezone.utc)
+        for key in keys:
+            raw = row.get(key)
+            if not raw:
+                continue
+            try:
+                parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            age_sec = (now_utc - parsed).total_seconds()
+            if age_sec >= 0:
+                return float(age_sec)
+        return None
+
+    def _effective_cache_ttl_for_insight(self, insight: AIInsight) -> float:
+        ttl_sec = float(self.ai_cache_ttl_sec)
+        if self._is_non_json_ai_note(insight.risk_note):
+            ttl_sec = min(ttl_sec, float(self.ai_non_json_cache_ttl_sec))
+        return max(0.0, ttl_sec)
+
     def _normalize_ai_insight(self, insight: AIInsight, candidate: Dict[str, Any]) -> AIInsight:
         score = max(1, min(100, int(insight.score)))
         model_raw_score = (
@@ -6334,6 +6684,7 @@ class DiscoveryOracle:
         )
 
     def _prime_ai_cache_from_repository(self, candidates: list[Dict[str, Any]]) -> int:
+        self._last_ai_cache_primed_set_ids = set()
         if self.ai_cache_ttl_sec <= 0:
             return 0
         if self.ai_persisted_cache_ttl_sec <= 0:
@@ -6376,13 +6727,22 @@ class DiscoveryOracle:
             if insight is None:
                 continue
             insight = self._normalize_ai_insight(insight, candidate)
+            non_json_output = self._is_non_json_ai_note(insight.risk_note)
+            if non_json_output:
+                age_sec = self._row_age_seconds(row, keys=("last_seen_at", "recorded_at", "updated_at", "created_at"))
+                if age_sec is not None and age_sec > float(self.ai_non_json_cache_ttl_sec):
+                    continue
             key = self._ai_cache_key(candidate)
             if not key:
                 continue
+            ttl_sec = min(self._effective_cache_ttl_for_insight(insight), float(self.ai_persisted_cache_ttl_sec))
+            if ttl_sec <= 0.0:
+                continue
             self._ai_insight_cache[key] = (
-                now_ts + min(self.ai_cache_ttl_sec, self.ai_persisted_cache_ttl_sec),
+                now_ts + ttl_sec,
                 self._clone_ai_insight(insight),
             )
+            self._last_ai_cache_primed_set_ids.add(str(set_id))
             primed += 1
         return primed
 
@@ -6410,6 +6770,10 @@ class DiscoveryOracle:
             or candidate.get("eol_date_prediction")
         )
         confidence = str(metadata.get("ai_confidence") or "HIGH_CONFIDENCE")
+        risk_note_raw = metadata.get("ai_risk_note")
+        risk_note = str(risk_note_raw).strip() if risk_note_raw is not None else None
+        if risk_note == "":
+            risk_note = None
         model_raw_score = metadata.get("ai_model_raw_score")
         try:
             parsed_model_raw = int(float(model_raw_score)) if model_raw_score is not None else None
@@ -6421,7 +6785,7 @@ class DiscoveryOracle:
             predicted_eol_date=predicted,
             fallback_used=False,
             confidence=confidence,
-            risk_note=None,
+            risk_note=risk_note,
             model_raw_score=(parsed_model_raw if parsed_model_raw != score else None),
         )
 
@@ -6444,6 +6808,9 @@ class DiscoveryOracle:
     def _set_cached_ai_insight(self, candidate: Dict[str, Any], insight: AIInsight) -> None:
         if self.ai_cache_ttl_sec <= 0 or insight.fallback_used:
             return
+        ttl_sec = self._effective_cache_ttl_for_insight(insight)
+        if ttl_sec <= 0:
+            return
         key = self._ai_cache_key(candidate)
         if not key:
             return
@@ -6461,7 +6828,7 @@ class DiscoveryOracle:
                 self._ai_insight_cache.pop(oldest_key, None)
 
         self._ai_insight_cache[key] = (
-            now_ts + self.ai_cache_ttl_sec,
+            now_ts + ttl_sec,
             self._clone_ai_insight(insight),
         )
 
