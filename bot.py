@@ -5,13 +5,14 @@ import asyncio
 import html
 import logging
 import os
+import re
 from datetime import date, datetime
 from typing import Any, Awaitable, Callable, Iterable, Optional
 from urllib.parse import quote_plus
 
 from telegram import Bot, BotCommand, Update
 from telegram.constants import ParseMode
-from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from fiscal import FiscalGuardian
@@ -56,6 +57,14 @@ async def _telegram_call_with_retry(
                     return None
                 raise
             await asyncio.sleep(retry_seconds)
+        except BadRequest as exc:
+            # Parse/entity errors are deterministic for the same payload: do not retry here.
+            if "Can't parse entities" in str(exc):
+                raise
+            if non_fatal:
+                LOGGER.exception("Non-fatal Telegram operation failed: %s", operation_name)
+                return None
+            raise
         except (TimedOut, NetworkError) as exc:
             if isinstance(exc, TimedOut) and not retry_timeouts:
                 if timeout_assume_delivered:
@@ -90,6 +99,17 @@ async def _telegram_call_with_retry(
                 LOGGER.exception("Non-fatal Telegram operation failed: %s", operation_name)
                 return None
             raise
+
+
+def _html_to_plain_text_for_telegram(text: str) -> str:
+    if not text:
+        return ""
+
+    anchor_pattern = re.compile(r'<a\s+href="([^"]+)">([^<]*)</a>', flags=re.IGNORECASE)
+    plain = anchor_pattern.sub(lambda match: f"{html.unescape(match.group(2))}: {html.unescape(match.group(1))}", text)
+    plain = re.sub(r"</?(?:b|i|code)>", "", plain, flags=re.IGNORECASE)
+    plain = re.sub(r"<[^>]+>", "", plain)
+    return html.unescape(plain)
 
 
 async def validate_secondary_deals_with_scrapers(
@@ -683,7 +703,7 @@ class LegoHunterTelegramBot:
         if no_signal_low_strict:
             lines.append(
                 "⚠️ Nessun segnale operativo nel ciclo: qualità AI insufficiente "
-                f"(strict-pass shortlist {no_signal_strict_rate * 100.0:.0f}% < {no_signal_min_rate * 100.0:.0f}%)."
+                f"(strict-pass shortlist {no_signal_strict_rate * 100.0:.0f}% &lt; {no_signal_min_rate * 100.0:.0f}%)."
             )
         elif diagnostics.get("fallback_used"):
             above_threshold_count = int(diagnostics.get("above_threshold_count") or 0)
@@ -1139,23 +1159,48 @@ async def run_scheduled_cycle(
             len(payload),
             len(holdings),
         )
-        send_result = await _telegram_call_with_retry(
-            operation_name="bot.send_message",
-            fn=lambda: bot.send_message(
-                chat_id=chat_id,
-                text=payload,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                connect_timeout=15,
-                read_timeout=45,
-                write_timeout=30,
-                pool_timeout=15,
-            ),
-            max_attempts=4,
-            non_fatal=False,
-            retry_timeouts=False,
-            timeout_assume_delivered=True,
-        )
+        try:
+            send_result = await _telegram_call_with_retry(
+                operation_name="bot.send_message",
+                fn=lambda: bot.send_message(
+                    chat_id=chat_id,
+                    text=payload,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    connect_timeout=15,
+                    read_timeout=45,
+                    write_timeout=30,
+                    pool_timeout=15,
+                ),
+                max_attempts=4,
+                non_fatal=False,
+                retry_timeouts=False,
+                timeout_assume_delivered=True,
+            )
+        except BadRequest as exc:
+            if "Can't parse entities" not in str(exc):
+                raise
+            LOGGER.warning(
+                "Telegram HTML parse error on scheduled report; retrying with plain-text fallback: %s",
+                exc,
+            )
+            plain_payload = _html_to_plain_text_for_telegram(payload)
+            send_result = await _telegram_call_with_retry(
+                operation_name="bot.send_message_plain_fallback",
+                fn=lambda: bot.send_message(
+                    chat_id=chat_id,
+                    text=plain_payload,
+                    disable_web_page_preview=True,
+                    connect_timeout=15,
+                    read_timeout=45,
+                    write_timeout=30,
+                    pool_timeout=15,
+                ),
+                max_attempts=2,
+                non_fatal=False,
+                retry_timeouts=False,
+                timeout_assume_delivered=True,
+            )
         if isinstance(send_result, dict) and send_result.get("delivery") == "uncertain_timeout_assumed":
             LOGGER.warning("Scheduled Telegram report delivery uncertain (timeout); duplicate-safe mode prevented retries")
         else:

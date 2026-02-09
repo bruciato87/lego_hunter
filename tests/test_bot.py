@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from telegram.error import TimedOut
+from telegram.error import BadRequest, TimedOut
 
 from bot import LegoHunterTelegramBot, build_application, run_scheduled_cycle
 
@@ -577,6 +577,30 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("📊 Copertura ranking totale: non-JSON 5% | fallback 71%", joined)
         self.assertIn("🛡️ AI guardrail: 2 score normalizzati | Max AI raw 99", joined)
 
+    def test_format_discovery_report_no_signal_line_is_html_safe(self) -> None:
+        report = {
+            "selected": [],
+            "diagnostics": {
+                "fallback_used": True,
+                "no_signal_due_to_low_strict_pass": True,
+                "no_signal_strict_pass_rate_shortlist": 0.2,
+                "no_signal_strict_pass_min_rate": 0.5,
+                "source_raw_counts": {},
+                "dedup_candidates": 0,
+                "threshold": 60,
+                "above_threshold_count": 0,
+                "max_ai_score": 0,
+                "source_strategy": "external_first",
+                "selected_source": "external_proxy",
+                "ai_runtime": {"engine": "openrouter", "model": "x/y:free", "mode": "api"},
+            },
+        }
+
+        lines = LegoHunterTelegramBot._format_discovery_report(report, top_limit=3)
+        joined = "\n".join(lines)
+        self.assertIn("strict-pass shortlist 20% &lt; 50%", joined)
+        self.assertNotIn("strict-pass shortlist 20% < 50%", joined)
+
     async def test_scheduled_cycle_continues_when_command_sync_times_out(self) -> None:
         bot_mock = AsyncMock()
         bot_mock.set_my_commands = AsyncMock(side_effect=TimedOut("timed out"))
@@ -623,6 +647,37 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot_mock.send_message.await_count, 1)
         self.assertEqual(bot_mock.shutdown.await_count, 1)
         self.assertEqual(sleep_mock.await_count, 0)
+
+    async def test_scheduled_cycle_falls_back_to_plain_text_on_html_parse_error(self) -> None:
+        bot_mock = AsyncMock()
+        bot_mock.set_my_commands = AsyncMock(return_value=True)
+        bot_mock.send_message = AsyncMock(
+            side_effect=[
+                BadRequest('Can\'t parse entities: unsupported start tag "" at byte offset 158'),
+                {"ok": True},
+            ]
+        )
+        bot_mock.shutdown = AsyncMock(return_value=None)
+
+        with (
+            patch("bot.Bot", return_value=bot_mock),
+            patch("bot.PLAYWRIGHT_AVAILABLE", False),
+            patch("bot.asyncio.sleep", new=AsyncMock()),
+        ):
+            await run_scheduled_cycle(
+                token="token",
+                chat_id="123",
+                oracle=FakeOracle(),
+                repository=FakeRepo(),
+                fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+            )
+
+        self.assertEqual(bot_mock.send_message.await_count, 2)
+        first_kwargs = bot_mock.send_message.await_args_list[0].kwargs
+        second_kwargs = bot_mock.send_message.await_args_list[1].kwargs
+        self.assertEqual(first_kwargs.get("parse_mode"), "HTML")
+        self.assertNotIn("parse_mode", second_kwargs)
+        self.assertIn("LEGO HUNTER", str(second_kwargs.get("text") or ""))
 
 
 if __name__ == "__main__":
