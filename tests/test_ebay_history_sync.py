@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -229,6 +230,118 @@ class EbayHistorySyncTests(unittest.TestCase):
         )
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["market_country"], "IT")
+
+    def test_merge_reference_rows_upserts_without_losing_old_history(self) -> None:
+        existing = [
+            {
+                "set_id": "76281",
+                "set_number": "76281-1",
+                "set_name": "X-Jet",
+                "theme": "Marvel",
+                "source_dataset": "ebay_sold_it_90d",
+                "market_country": "IT",
+                "end_date": "2026-02-01",
+                "roi_12m_pct": "10.0000",
+                "sold_listing_count": "4",
+            },
+            {
+                "set_id": "76281",
+                "set_number": "76281-1",
+                "set_name": "X-Jet",
+                "theme": "Marvel",
+                "source_dataset": "ebay_sold_it_90d",
+                "market_country": "IT",
+                "end_date": "2026-01-25",
+                "roi_12m_pct": "8.0000",
+                "sold_listing_count": "4",
+            },
+        ]
+        incoming = [
+            {
+                "set_id": "76281",
+                "set_number": "76281-1",
+                "set_name": "X-Jet",
+                "theme": "Marvel",
+                "source_dataset": "ebay_sold_it_90d",
+                "market_country": "IT",
+                "end_date": "2026-02-01",
+                "roi_12m_pct": "12.0000",
+                "sold_listing_count": "6",
+            },
+            {
+                "set_id": "76441",
+                "set_number": "76441-1",
+                "set_name": "Club dei Duellanti",
+                "theme": "Harry Potter",
+                "source_dataset": "vinted_active_it_30d",
+                "market_country": "IT",
+                "end_date": "2026-02-01",
+                "roi_12m_pct": "15.0000",
+                "sold_listing_count": "5",
+            },
+        ]
+
+        merged, stats = self.mod.merge_reference_rows(existing, incoming)
+        keys = {
+            (
+                row["set_id"],
+                row["source_dataset"],
+                row["market_country"],
+                row["end_date"],
+            )
+            for row in merged
+        }
+        self.assertEqual(len(merged), 3)
+        self.assertEqual(stats["added"], 1)
+        self.assertEqual(stats["updated"], 1)
+        self.assertEqual(stats["unchanged"], 0)
+        self.assertIn(("76281", "ebay_sold_it_90d", "IT", "2026-01-25"), keys)
+        self.assertIn(("76281", "ebay_sold_it_90d", "IT", "2026-02-01"), keys)
+        self.assertIn(("76441", "vinted_active_it_30d", "IT", "2026-02-01"), keys)
+        latest = next(
+            row
+            for row in merged
+            if row["set_id"] == "76281" and row["end_date"] == "2026-02-01"
+        )
+        self.assertEqual(latest["roi_12m_pct"], "12.0000")
+        self.assertEqual(latest["sold_listing_count"], "6")
+
+    def test_load_and_write_rows_roundtrip_and_dedup_existing(self) -> None:
+        rows = [
+            {
+                "set_id": "40220",
+                "set_number": "40220-1",
+                "set_name": "Autobus",
+                "theme": "Icons",
+                "source_dataset": "ebay_sold_it_90d",
+                "market_country": "IT",
+                "end_date": "2026-02-03",
+                "roi_12m_pct": "9.1000",
+                "sold_listing_count": "4",
+            },
+            # Duplicate same key: last one should win.
+            {
+                "set_id": "40220",
+                "set_number": "40220-1",
+                "set_name": "Autobus",
+                "theme": "Icons",
+                "source_dataset": "ebay_sold_it_90d",
+                "market_country": "IT",
+                "end_date": "2026-02-03",
+                "roi_12m_pct": "11.5000",
+                "sold_listing_count": "6",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            csv_path = Path(tmp_dir) / "seed.csv"
+            self.mod.write_rows(csv_path, rows)
+            loaded = self.mod.load_existing_rows(csv_path)
+            merged, stats = self.mod.merge_reference_rows(loaded, [])
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(stats["dropped_existing_duplicates"], 1)
+        self.assertEqual(merged[0]["roi_12m_pct"], "11.5000")
+        self.assertEqual(merged[0]["sold_listing_count"], "6")
 
 
 if __name__ == "__main__":

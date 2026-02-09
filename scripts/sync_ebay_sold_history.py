@@ -27,6 +27,36 @@ from models import LegoHunterRepository
 
 LOGGER = logging.getLogger("ebay_history_sync")
 DEFAULT_OUTPUT_PATH = Path("data/historical_seed/ebay_reference_cases.csv")
+HISTORICAL_FIELDNAMES = [
+    "set_id",
+    "set_number",
+    "set_name",
+    "theme",
+    "release_year",
+    "msrp_usd",
+    "start_date",
+    "end_date",
+    "observation_months",
+    "start_price_usd",
+    "price_12m_usd",
+    "price_24m_usd",
+    "roi_12m_pct",
+    "roi_24m_pct",
+    "annualized_roi_pct",
+    "max_drawdown_pct",
+    "win_12m",
+    "win_24m",
+    "source_dataset",
+    "pattern_tags",
+    "market_country",
+    "market_region",
+    "market_scope",
+    "recency_weight",
+    "case_weight",
+    "sold_listing_count",
+    "sold_avg_price",
+    "sold_stdev_price",
+]
 
 EBAY_MARKETS = {
     "IT": "https://www.ebay.it",
@@ -290,6 +320,97 @@ def _extract_set_id(*texts: Optional[str]) -> str:
 
 def _country_to_region(country: str) -> str:
     return "EU" if country in {"IT", "DE", "FR", "ES", "NL"} else "OTHER"
+
+
+def _normalize_row_for_storage(row: Dict[str, Any]) -> Dict[str, str]:
+    normalized: Dict[str, str] = {}
+    for field in HISTORICAL_FIELDNAMES:
+        value = row.get(field, "")
+        normalized[field] = "" if value is None else str(value)
+    return normalized
+
+
+def _historical_row_key(row: Dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(row.get("set_id") or "").strip(),
+        str(row.get("source_dataset") or "").strip().lower(),
+        str(row.get("market_country") or "").strip().upper(),
+        str(row.get("end_date") or "").strip(),
+    )
+
+
+def _row_sort_key(row: Dict[str, Any]) -> tuple[str, str, str, str]:
+    end_date = str(row.get("end_date") or "").strip()
+    set_id = str(row.get("set_id") or "").strip()
+    source_dataset = str(row.get("source_dataset") or "").strip().lower()
+    market_country = str(row.get("market_country") or "").strip().upper()
+    # Desc on end_date for easier inspection of freshest records.
+    return (end_date, set_id, source_dataset, market_country)
+
+
+def load_existing_rows(path: Path) -> list[Dict[str, str]]:
+    if not path.exists():
+        return []
+    rows: list[Dict[str, str]] = []
+    with path.open("r", newline="", encoding="utf-8") as fp:
+        reader = csv.DictReader(fp)
+        for row in reader:
+            if not row:
+                continue
+            rows.append(_normalize_row_for_storage(row))
+    return rows
+
+
+def merge_reference_rows(
+    existing_rows: list[Dict[str, Any]],
+    incoming_rows: list[Dict[str, Any]],
+) -> tuple[list[Dict[str, str]], Dict[str, int]]:
+    index: Dict[tuple[str, str, str, str], Dict[str, str]] = {}
+    dropped_existing_duplicates = 0
+    for row in existing_rows:
+        normalized = _normalize_row_for_storage(row)
+        key = _historical_row_key(normalized)
+        if not all(key):
+            continue
+        if key in index:
+            dropped_existing_duplicates += 1
+        index[key] = normalized
+
+    added = 0
+    updated = 0
+    unchanged = 0
+    dropped_incoming_duplicates = 0
+    for row in incoming_rows:
+        normalized = _normalize_row_for_storage(row)
+        key = _historical_row_key(normalized)
+        if not all(key):
+            continue
+        previous = index.get(key)
+        if previous is None:
+            index[key] = normalized
+            added += 1
+            continue
+        if previous == normalized:
+            unchanged += 1
+            continue
+        # Same key with changed payload -> update in place.
+        if key in index:
+            updated += 1
+            dropped_incoming_duplicates += 1
+        index[key] = normalized
+
+    merged_rows = sorted(index.values(), key=_row_sort_key, reverse=True)
+    stats = {
+        "existing_valid": len(index) - added,
+        "incoming_valid": added + updated + unchanged,
+        "added": added,
+        "updated": updated,
+        "unchanged": unchanged,
+        "dropped_existing_duplicates": dropped_existing_duplicates,
+        "dropped_incoming_duplicates": dropped_incoming_duplicates,
+        "merged_total": len(merged_rows),
+    }
+    return merged_rows, stats
 
 
 def _discover_targets_from_supabase(limit: int, lookback_days: int) -> list[Dict[str, Any]]:
@@ -615,41 +736,11 @@ def _build_vinted_case_rows(
 
 def write_rows(path: Path, rows: list[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "set_id",
-        "set_number",
-        "set_name",
-        "theme",
-        "release_year",
-        "msrp_usd",
-        "start_date",
-        "end_date",
-        "observation_months",
-        "start_price_usd",
-        "price_12m_usd",
-        "price_24m_usd",
-        "roi_12m_pct",
-        "roi_24m_pct",
-        "annualized_roi_pct",
-        "max_drawdown_pct",
-        "win_12m",
-        "win_24m",
-        "source_dataset",
-        "pattern_tags",
-        "market_country",
-        "market_region",
-        "market_scope",
-        "recency_weight",
-        "case_weight",
-        "sold_listing_count",
-        "sold_avg_price",
-        "sold_stdev_price",
-    ]
     with path.open("w", newline="", encoding="utf-8") as fp:
-        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer = csv.DictWriter(fp, fieldnames=HISTORICAL_FIELDNAMES)
         writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            writer.writerow(_normalize_row_for_storage(row))
 
 
 def main() -> int:
@@ -722,12 +813,21 @@ def main() -> int:
         )
         rows.extend(vinted_rows)
 
-    write_rows(args.out, rows)
+    existing_rows = load_existing_rows(args.out)
+    merged_rows, merge_stats = merge_reference_rows(existing_rows, rows)
+    write_rows(args.out, merged_rows)
     LOGGER.info(
-        "Secondary market sync completed | ebay_rows=%s vinted_rows=%s total_rows=%s out=%s",
+        "Secondary market sync completed | ebay_rows=%s vinted_rows=%s incoming_total=%s existing_rows=%s added=%s updated=%s unchanged=%s merged_total=%s dropped_existing_dups=%s dropped_incoming_dups=%s out=%s",
         len(ebay_rows),
         len(vinted_rows),
         len(rows),
+        len(existing_rows),
+        merge_stats.get("added", 0),
+        merge_stats.get("updated", 0),
+        merge_stats.get("unchanged", 0),
+        merge_stats.get("merged_total", 0),
+        merge_stats.get("dropped_existing_duplicates", 0),
+        merge_stats.get("dropped_incoming_duplicates", 0),
         args.out,
     )
     return 0
