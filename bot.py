@@ -675,9 +675,17 @@ class LegoHunterTelegramBot:
             strength == "HIGH_CONFIDENCE_BOOTSTRAP"
             for strength in selected_strengths
         )
+        no_signal_low_strict = bool(diagnostics.get("no_signal_due_to_low_strict_pass"))
+        no_signal_strict_rate = float(diagnostics.get("no_signal_strict_pass_rate_shortlist") or 0.0)
+        no_signal_min_rate = float(diagnostics.get("no_signal_strict_pass_min_rate") or 0.0)
 
         lines: list[str] = []
-        if diagnostics.get("fallback_used"):
+        if no_signal_low_strict:
+            lines.append(
+                "⚠️ Nessun segnale operativo nel ciclo: qualità AI insufficiente "
+                f"(strict-pass shortlist {no_signal_strict_rate * 100.0:.0f}% < {no_signal_min_rate * 100.0:.0f}%)."
+            )
+        elif diagnostics.get("fallback_used"):
             above_threshold_count = int(diagnostics.get("above_threshold_count") or 0)
             high_conf_count = int(diagnostics.get("above_threshold_high_confidence_count") or 0)
             if above_threshold_count > 0 and high_conf_count == 0:

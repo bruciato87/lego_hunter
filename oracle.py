@@ -76,6 +76,8 @@ DEFAULT_AI_SINGLE_CALL_SCORING_ENABLED = False
 DEFAULT_AI_SINGLE_CALL_ALLOW_REPAIR_CALLS = False
 DEFAULT_AI_SINGLE_CALL_MAX_CANDIDATES = 12
 DEFAULT_AI_SINGLE_CALL_DYNAMIC_MAX_CANDIDATES = 16
+DEFAULT_AI_SINGLE_CALL_BATCH_CHUNK_SIZE = 8
+DEFAULT_AI_SINGLE_CALL_BATCH_MAX_CALLS = 2
 DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_ENABLED = True
 DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_MAX_CANDIDATES = 3
 DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_TIMEOUT_SEC = 10.0
@@ -95,6 +97,8 @@ DEFAULT_AI_SCORE_SOFT_CAP = 95
 DEFAULT_AI_SCORE_SOFT_CAP_FACTOR = 0.35
 DEFAULT_AI_LOW_CONFIDENCE_SCORE_CAP = 90
 DEFAULT_AI_NON_JSON_SCORE_CAP = 85
+DEFAULT_AI_NO_SIGNAL_ON_LOW_STRICT_PASS = True
+DEFAULT_AI_NO_SIGNAL_MIN_STRICT_PASS_RATE = 0.50
 DEFAULT_BOOTSTRAP_THRESHOLDS_ENABLED = False
 DEFAULT_BOOTSTRAP_MIN_HISTORY_POINTS = 45
 DEFAULT_BOOTSTRAP_MIN_UPSIDE_PROBABILITY = 0.56
@@ -129,6 +133,9 @@ DEFAULT_AI_MODEL_BAN_SEC = 1800.0
 DEFAULT_AI_MODEL_BAN_FAILURES = 2
 DEFAULT_AI_MODEL_FAILURE_PENALTY = 22
 DEFAULT_AI_MODEL_SUCCESS_REWARD = 3
+DEFAULT_AI_MODEL_QUALITY_MIN_SAMPLES = 6
+DEFAULT_AI_MODEL_QUALITY_MIN_STRICT_RATE = 0.55
+DEFAULT_AI_MODEL_QUALITY_MAX_NON_JSON_RATE = 0.25
 DEFAULT_AI_STRICT_PROBE_VALIDATION = True
 DEFAULT_OPENROUTER_OPPORTUNISTIC_ENABLED = True
 DEFAULT_OPENROUTER_OPPORTUNISTIC_ATTEMPTS = 3
@@ -577,6 +584,18 @@ class DiscoveryOracle:
             minimum=3,
             maximum=60,
         )
+        self.ai_single_call_batch_chunk_size = self._safe_env_int(
+            "AI_SINGLE_CALL_BATCH_CHUNK_SIZE",
+            default=DEFAULT_AI_SINGLE_CALL_BATCH_CHUNK_SIZE,
+            minimum=1,
+            maximum=20,
+        )
+        self.ai_single_call_batch_max_calls = self._safe_env_int(
+            "AI_SINGLE_CALL_BATCH_MAX_CALLS",
+            default=DEFAULT_AI_SINGLE_CALL_BATCH_MAX_CALLS,
+            minimum=1,
+            maximum=6,
+        )
         self.ai_single_call_missing_rescue_enabled = self._safe_env_bool(
             "AI_SINGLE_CALL_MISSING_RESCUE_ENABLED",
             default=DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_ENABLED,
@@ -680,6 +699,16 @@ class DiscoveryOracle:
             default=DEFAULT_AI_NON_JSON_SCORE_CAP,
             minimum=40,
             maximum=100,
+        )
+        self.ai_no_signal_on_low_strict_pass = self._safe_env_bool(
+            "AI_NO_SIGNAL_ON_LOW_STRICT_PASS",
+            default=DEFAULT_AI_NO_SIGNAL_ON_LOW_STRICT_PASS,
+        )
+        self.ai_no_signal_min_strict_pass_rate = self._safe_env_float(
+            "AI_NO_SIGNAL_MIN_STRICT_PASS_RATE",
+            default=DEFAULT_AI_NO_SIGNAL_MIN_STRICT_PASS_RATE,
+            minimum=0.0,
+            maximum=1.0,
         )
         self.ai_top_pick_rescue_enabled = self._safe_env_bool(
             "AI_TOP_PICK_RESCUE_ENABLED",
@@ -972,6 +1001,24 @@ class DiscoveryOracle:
             minimum=1,
             maximum=30,
         )
+        self.ai_model_quality_min_samples = self._safe_env_int(
+            "AI_MODEL_QUALITY_MIN_SAMPLES",
+            default=DEFAULT_AI_MODEL_QUALITY_MIN_SAMPLES,
+            minimum=1,
+            maximum=100,
+        )
+        self.ai_model_quality_min_strict_rate = self._safe_env_float(
+            "AI_MODEL_QUALITY_MIN_STRICT_RATE",
+            default=DEFAULT_AI_MODEL_QUALITY_MIN_STRICT_RATE,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        self.ai_model_quality_max_non_json_rate = self._safe_env_float(
+            "AI_MODEL_QUALITY_MAX_NON_JSON_RATE",
+            default=DEFAULT_AI_MODEL_QUALITY_MAX_NON_JSON_RATE,
+            minimum=0.0,
+            maximum=1.0,
+        )
         requested_mode = (os.getenv("DISCOVERY_SOURCE_MODE") or DEFAULT_DISCOVERY_SOURCE_MODE).strip().lower()
         if requested_mode not in DISCOVERY_SOURCE_MODES:
             LOGGER.warning(
@@ -1092,7 +1139,7 @@ class DiscoveryOracle:
             self.openrouter_free_tier_only,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s floor_multi_model=%s per_model=%s bonus=%s cache_ttl_sec=%.0f persisted_cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f ai_single_call=%s ai_single_call_allow_repair=%s ai_single_call_max_candidates=%s ai_single_call_missing_rescue_enabled=%s ai_single_call_missing_rescue_max=%s ai_single_call_missing_rescue_timeout_sec=%.1f ai_guardrail_enabled=%s ai_soft_cap=%s ai_soft_cap_factor=%.2f ai_low_conf_cap=%s ai_non_json_cap=%s ai_top_pick_rescue_enabled=%s ai_top_pick_rescue_count=%s ai_top_pick_rescue_timeout_sec=%.1f ai_final_pick_guarantee_count=%s ai_final_pick_guarantee_rounds=%s openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s floor_multi_model=%s per_model=%s bonus=%s cache_ttl_sec=%.0f persisted_cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f ai_single_call=%s ai_single_call_allow_repair=%s ai_single_call_max_candidates=%s ai_single_call_missing_rescue_enabled=%s ai_single_call_missing_rescue_max=%s ai_single_call_missing_rescue_timeout_sec=%.1f ai_guardrail_enabled=%s ai_soft_cap=%s ai_soft_cap_factor=%.2f ai_low_conf_cap=%s ai_non_json_cap=%s ai_top_pick_rescue_enabled=%s ai_top_pick_rescue_count=%s ai_top_pick_rescue_timeout_sec=%.1f ai_final_pick_guarantee_count=%s ai_final_pick_guarantee_rounds=%s openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f single_call_batch_chunk=%s single_call_batch_max_calls=%s no_signal_low_strict=%s no_signal_min_strict_rate=%.2f model_quality_min_samples=%s model_quality_min_strict=%.2f model_quality_max_non_json=%.2f",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
             self.ai_dynamic_shortlist_enabled,
@@ -1137,10 +1184,19 @@ class DiscoveryOracle:
             self.openrouter_opportunistic_enabled,
             self.openrouter_opportunistic_attempts,
             self.openrouter_opportunistic_timeout_sec,
+            self.ai_single_call_batch_chunk_size,
+            self.ai_single_call_batch_max_calls,
+            self.ai_no_signal_on_low_strict_pass,
+            self.ai_no_signal_min_strict_pass_rate,
+            self.ai_model_quality_min_samples,
+            self.ai_model_quality_min_strict_rate,
+            self.ai_model_quality_max_non_json_rate,
         )
         LOGGER.info(
-            "Single-call expansion tuning | dynamic_max=%s non_shortlist_cache_rescue=%s secondary_batch_enabled=%s secondary_batch_max=%s secondary_batch_rounds=%s secondary_batch_min_budget_sec=%.1f secondary_batch_timeout_sec=%.1f",
+            "Single-call expansion tuning | dynamic_max=%s batch_chunk=%s batch_max_calls=%s non_shortlist_cache_rescue=%s secondary_batch_enabled=%s secondary_batch_max=%s secondary_batch_rounds=%s secondary_batch_min_budget_sec=%.1f secondary_batch_timeout_sec=%.1f",
             self.ai_single_call_dynamic_max_candidates,
+            self.ai_single_call_batch_chunk_size,
+            self.ai_single_call_batch_max_calls,
             self.ai_non_shortlist_cache_rescue_enabled,
             self.ai_single_call_secondary_batch_enabled,
             self.ai_single_call_secondary_batch_max_candidates,
@@ -1545,6 +1601,10 @@ class DiscoveryOracle:
                 "consecutive_failures": 0,
                 "total_failures": 0,
                 "total_successes": 0,
+                "quality_total": 0,
+                "quality_strict": 0,
+                "quality_non_json": 0,
+                "quality_fallback": 0,
                 "banned_until": 0.0,
                 "last_error": None,
                 "last_event_at": None,
@@ -1631,6 +1691,72 @@ class DiscoveryOracle:
                 str(reason)[:220],
             )
         return should_ban
+
+    def _record_model_quality(
+        self,
+        provider: str,
+        model_name: str,
+        insights: Dict[str, "AIInsight"],
+        *,
+        phase: str,
+    ) -> None:
+        if not insights:
+            return
+        row = self._get_model_health(provider, model_name)
+        total = 0
+        strict = 0
+        non_json = 0
+        fallback = 0
+        for insight in insights.values():
+            if insight is None:
+                continue
+            total += 1
+            if bool(insight.fallback_used):
+                fallback += 1
+                continue
+            if self._is_non_json_ai_note(insight.risk_note):
+                non_json += 1
+                continue
+            strict += 1
+        if total <= 0:
+            return
+
+        row["quality_total"] = int(row.get("quality_total") or 0) + total
+        row["quality_strict"] = int(row.get("quality_strict") or 0) + strict
+        row["quality_non_json"] = int(row.get("quality_non_json") or 0) + non_json
+        row["quality_fallback"] = int(row.get("quality_fallback") or 0) + fallback
+        row["last_event_at"] = datetime.now(timezone.utc).isoformat()
+
+        quality_adjustment = 0
+        quality_adjustment += min(8, strict * 2)
+        quality_adjustment -= min(18, non_json * 6)
+        quality_adjustment -= min(24, fallback * 8)
+        if quality_adjustment != 0:
+            row["score"] = max(1, min(100, int(row.get("score") or 100) + quality_adjustment))
+
+        quality_total = int(row.get("quality_total") or 0)
+        quality_strict = int(row.get("quality_strict") or 0)
+        quality_non_json = int(row.get("quality_non_json") or 0)
+        strict_rate = (float(quality_strict) / float(quality_total)) if quality_total > 0 else 0.0
+        non_json_rate = (float(quality_non_json) / float(quality_total)) if quality_total > 0 else 0.0
+
+        if quality_total >= int(self.ai_model_quality_min_samples):
+            low_strict = strict_rate < float(self.ai_model_quality_min_strict_rate)
+            high_non_json = non_json_rate > float(self.ai_model_quality_max_non_json_rate)
+            if low_strict or high_non_json:
+                reason = (
+                    f"quality gate (strict={strict_rate:.2f}, non_json={non_json_rate:.2f}, samples={quality_total})"
+                )
+                self._record_model_failure(provider, model_name, reason, phase=f"{phase}_quality")
+                LOGGER.warning(
+                    "AI model quality degraded | provider=%s model=%s strict_rate=%.2f non_json_rate=%.2f samples=%s score=%s",
+                    self._provider_health_key(provider),
+                    model_name,
+                    strict_rate,
+                    non_json_rate,
+                    quality_total,
+                    row.get("score"),
+                )
 
     def _rank_candidate_models(
         self,
@@ -3361,10 +3487,30 @@ class DiscoveryOracle:
             float(diagnostics["ai_shortlist_strict_pass_count"]) / shortlist_count_for_rate,
             4,
         )
+        diagnostics["no_signal_due_to_low_strict_pass"] = False
         diagnostics["high_conf_strict_rate"] = round(
             float(diagnostics["above_threshold_high_confidence_strict_count"]) / max(1, int(diagnostics["above_threshold_count"])),
             4,
         )
+        strict_pass_rate_shortlist = float(diagnostics["strict_pass_rate_shortlist"])
+        if (
+            self.ai_no_signal_on_low_strict_pass
+            and (not above_threshold_high_conf)
+            and ai_shortlist_count > 0
+            and strict_pass_rate_shortlist < float(self.ai_no_signal_min_strict_pass_rate)
+        ):
+            selected = []
+            fallback_used = True
+            diagnostics["fallback_used"] = True
+            diagnostics["no_signal_due_to_low_strict_pass"] = True
+            diagnostics["no_signal_reason"] = (
+                "Strict-pass shortlist insufficiente: nessun segnale operativo nel ciclo corrente."
+            )
+            diagnostics["no_signal_strict_pass_rate_shortlist"] = round(strict_pass_rate_shortlist, 4)
+            diagnostics["no_signal_strict_pass_min_rate"] = round(
+                float(self.ai_no_signal_min_strict_pass_rate),
+                4,
+            )
         diagnostics["fallback_rate"] = diagnostics["fallback_rate_shortlist"]
         diagnostics["non_json_rate"] = diagnostics["non_json_rate_shortlist"]
         diagnostics["strict_pass_rate"] = diagnostics["strict_pass_rate_shortlist"]
@@ -4216,7 +4362,7 @@ class DiscoveryOracle:
             if not set_id:
                 continue
             current_ai = ai_results.get(set_id)
-            if current_ai is not None and not current_ai.fallback_used:
+            if self._is_strict_ai_insight(current_ai):
                 continue
             prepared_row = prepared_by_set.get(set_id)
             if prepared_row is None:
@@ -4880,7 +5026,67 @@ class DiscoveryOracle:
         # Batch scoring pass: in single-call mode this is the only external scoring call.
         if pending_entries and (self.ai_batch_scoring_enabled or single_call_mode):
             if single_call_mode:
-                batch_entries = list(pending_entries)
+                chunk_size = max(1, int(self.ai_single_call_batch_chunk_size))
+                max_calls = max(1, int(self.ai_single_call_batch_max_calls))
+                batch_chunks: list[list[Dict[str, Any]]] = [
+                    pending_entries[idx : idx + chunk_size]
+                    for idx in range(0, len(pending_entries), chunk_size)
+                ][:max_calls]
+                if len(pending_entries) > (chunk_size * max_calls):
+                    LOGGER.info(
+                        "AI single-call chunk cap reached | pending=%s chunk_size=%s max_calls=%s",
+                        len(pending_entries),
+                        chunk_size,
+                        max_calls,
+                    )
+                for chunk_idx, batch_entries in enumerate(batch_chunks, start=1):
+                    chunk_deadline = deadline
+                    batch_results: Dict[str, AIInsight] = {}
+                    batch_error: Optional[str] = None
+                    if batch_entries:
+                        batch_results, batch_error = await self._score_ai_shortlist_batch(
+                            batch_entries,
+                            deadline=chunk_deadline,
+                            allow_repair_calls=bool(self.ai_single_call_allow_repair_calls),
+                            allow_failover_call=True,
+                        )
+
+                    if batch_error:
+                        non_error_reasons = {"no_external_ai_available", "insufficient_budget_for_batch"}
+                        if str(batch_error) in non_error_reasons:
+                            LOGGER.info(
+                                "AI single-call chunk skipped | chunk=%s/%s candidates=%s reason=%s",
+                                chunk_idx,
+                                len(batch_chunks),
+                                len(batch_entries),
+                                str(batch_error)[:220],
+                            )
+                        else:
+                            stats["ai_errors"] += 1
+                            LOGGER.warning(
+                                "AI single-call chunk failed | chunk=%s/%s candidates=%s error=%s",
+                                chunk_idx,
+                                len(batch_chunks),
+                                len(batch_entries),
+                                str(batch_error)[:220],
+                            )
+
+                    for entry in batch_entries:
+                        set_id = str(entry["set_id"])
+                        ai = batch_results.get(set_id)
+                        if ai is None:
+                            continue
+                        results[set_id] = ai
+                        if ai.fallback_used:
+                            entry["ai_source_origin"] = "batch_provider_fallback"
+                        else:
+                            entry["ai_source_origin"] = "batch_fresh"
+                        stats["ai_cache_misses"] += 1
+                        if not ai.fallback_used:
+                            stats["ai_scored_count"] += 1
+                            stats["ai_batch_scored_count"] += 1
+                            self._set_cached_ai_insight(entry["candidate"], ai)
+                pending_entries = [entry for entry in pending_entries if str(entry["set_id"]) not in results]
             else:
                 min_batch = int(self.ai_batch_min_candidates)
                 if len(pending_entries) < min_batch:
@@ -4888,48 +5094,47 @@ class DiscoveryOracle:
                 else:
                     batch_cap = max(min_batch, int(self.ai_batch_max_candidates))
                     batch_entries = pending_entries[: min(len(pending_entries), batch_cap)]
-
-            batch_results: Dict[str, AIInsight] = {}
-            batch_error: Optional[str] = None
-            if batch_entries:
-                batch_results, batch_error = await self._score_ai_shortlist_batch(
-                    batch_entries,
-                    deadline=deadline,
-                    allow_repair_calls=(not single_call_mode) or bool(self.ai_single_call_allow_repair_calls),
-                    allow_failover_call=not single_call_mode,
-                )
-
-            if batch_error:
-                non_error_reasons = {"no_external_ai_available", "insufficient_budget_for_batch"}
-                if str(batch_error) in non_error_reasons:
-                    LOGGER.info(
-                        "AI batch scoring skipped | candidates=%s reason=%s",
-                        len(batch_entries),
-                        str(batch_error)[:220],
+                batch_results: Dict[str, AIInsight] = {}
+                batch_error: Optional[str] = None
+                if batch_entries:
+                    batch_results, batch_error = await self._score_ai_shortlist_batch(
+                        batch_entries,
+                        deadline=deadline,
+                        allow_repair_calls=True,
+                        allow_failover_call=True,
                     )
-                else:
-                    stats["ai_errors"] += 1
-                    LOGGER.warning(
-                        "AI batch scoring failed | candidates=%s error=%s",
-                        len(batch_entries),
-                        str(batch_error)[:220],
-                    )
-            for entry in batch_entries:
-                set_id = str(entry["set_id"])
-                ai = batch_results.get(set_id)
-                if ai is None:
-                    continue
-                results[set_id] = ai
-                if ai.fallback_used:
-                    entry["ai_source_origin"] = "batch_provider_fallback"
-                else:
-                    entry["ai_source_origin"] = "batch_fresh"
-                stats["ai_cache_misses"] += 1
-                if not ai.fallback_used:
-                    stats["ai_scored_count"] += 1
-                    stats["ai_batch_scored_count"] += 1
-                    self._set_cached_ai_insight(entry["candidate"], ai)
-            pending_entries = [entry for entry in pending_entries if str(entry["set_id"]) not in results]
+
+                if batch_error:
+                    non_error_reasons = {"no_external_ai_available", "insufficient_budget_for_batch"}
+                    if str(batch_error) in non_error_reasons:
+                        LOGGER.info(
+                            "AI batch scoring skipped | candidates=%s reason=%s",
+                            len(batch_entries),
+                            str(batch_error)[:220],
+                        )
+                    else:
+                        stats["ai_errors"] += 1
+                        LOGGER.warning(
+                            "AI batch scoring failed | candidates=%s error=%s",
+                            len(batch_entries),
+                            str(batch_error)[:220],
+                        )
+                for entry in batch_entries:
+                    set_id = str(entry["set_id"])
+                    ai = batch_results.get(set_id)
+                    if ai is None:
+                        continue
+                    results[set_id] = ai
+                    if ai.fallback_used:
+                        entry["ai_source_origin"] = "batch_provider_fallback"
+                    else:
+                        entry["ai_source_origin"] = "batch_fresh"
+                    stats["ai_cache_misses"] += 1
+                    if not ai.fallback_used:
+                        stats["ai_scored_count"] += 1
+                        stats["ai_batch_scored_count"] += 1
+                        self._set_cached_ai_insight(entry["candidate"], ai)
+                pending_entries = [entry for entry in pending_entries if str(entry["set_id"]) not in results]
 
         if single_call_mode:
             if pending_entries and self.ai_single_call_missing_rescue_enabled:
@@ -5285,6 +5490,7 @@ class DiscoveryOracle:
             if insights:
                 if current_model:
                     self._record_model_success("gemini", current_model, phase="batch_scoring")
+                    self._record_model_quality("gemini", current_model, insights, phase="batch_scoring")
                 LOGGER.info(
                     "AI batch scoring success | provider=gemini model=%s candidates=%s scored=%s",
                     current_model or "unknown",
@@ -5292,6 +5498,8 @@ class DiscoveryOracle:
                     len(insights),
                 )
                 return insights, None
+            if current_model:
+                self._record_model_failure("gemini", current_model, "batch_payload_no_valid_rows", phase="batch_scoring")
             return {}, "batch_payload_no_valid_rows"
 
         if self._openrouter_model_id is not None:
@@ -5323,6 +5531,7 @@ class DiscoveryOracle:
                 insights = self._normalize_batch_ai_insights(insights, candidates)
                 if insights:
                     self._record_model_success("openrouter", current_model, phase="batch_scoring")
+                    self._record_model_quality("openrouter", current_model, insights, phase="batch_scoring")
                     LOGGER.info(
                         "AI batch scoring success | provider=openrouter model=%s candidates=%s scored=%s",
                         current_model,
@@ -5330,6 +5539,7 @@ class DiscoveryOracle:
                         len(insights),
                     )
                     return insights, None
+                self._record_model_failure("openrouter", current_model, "batch_payload_no_valid_rows", phase="batch_scoring")
                 return {}, "batch_payload_no_valid_rows"
             except Exception as exc:  # noqa: BLE001
                 self._record_model_failure("openrouter", current_model, str(exc), phase="batch_scoring")
@@ -5348,6 +5558,12 @@ class DiscoveryOracle:
                         insights = self._normalize_batch_ai_insights(insights, candidates)
                         if insights:
                             self._record_model_success("openrouter", rotated_model, phase="batch_scoring_after_failover")
+                            self._record_model_quality(
+                                "openrouter",
+                                rotated_model,
+                                insights,
+                                phase="batch_scoring_after_failover",
+                            )
                             LOGGER.info(
                                 "AI batch scoring success after failover | provider=openrouter model=%s candidates=%s scored=%s",
                                 rotated_model,
@@ -5355,6 +5571,12 @@ class DiscoveryOracle:
                                 len(insights),
                             )
                             return insights, None
+                        self._record_model_failure(
+                            "openrouter",
+                            rotated_model,
+                            "batch_payload_no_valid_rows",
+                            phase="batch_scoring_after_failover",
+                        )
                     except Exception as exc_after_switch:  # noqa: BLE001
                         self._record_model_failure(
                             "openrouter",

@@ -908,6 +908,69 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(float(diagnostics["non_json_rate_cache_total"]), 0.25, places=4)
         self.assertAlmostEqual(float(diagnostics["non_json_rate_fresh_total"]), 0.0, places=4)
 
+    async def test_discovery_no_signal_when_strict_pass_shortlist_is_low(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_no_signal_on_low_strict_pass = True
+        oracle.ai_no_signal_min_strict_pass_rate = 0.5
+        oracle._last_source_diagnostics = {
+            "source_strategy": "external_first",
+            "source_order": ["external_proxy", "playwright"],
+            "selected_source": "external_proxy",
+            "source_raw_counts": {"lego_proxy_reader": 2, "amazon_proxy_reader": 2},
+            "source_dedup_counts": {"lego_proxy_reader": 2, "amazon_proxy_reader": 2},
+            "source_failures": [],
+            "source_signals": {},
+            "dedup_candidates": 4,
+            "fallback_source_used": False,
+            "fallback_notes": [],
+            "anti_bot_alert": False,
+            "anti_bot_message": None,
+            "root_cause_hint": None,
+        }
+        ranked_rows = [
+            {
+                "set_id": "201",
+                "source": "lego_proxy_reader",
+                "composite_score": 70,
+                "forecast_score": 60,
+                "forecast_probability_upside_12m": 64.0,
+                "confidence_score": 58,
+                "market_demand_score": 90,
+                "ai_raw_score": 80,
+                "ai_shortlisted": True,
+                "ai_fallback_used": False,
+                "ai_strict_pass": False,
+                "risk_note": "Output AI non JSON: score estratto da testo con parsing robusto.",
+            },
+            {
+                "set_id": "202",
+                "source": "amazon_proxy_reader",
+                "composite_score": 69,
+                "forecast_score": 59,
+                "forecast_probability_upside_12m": 63.0,
+                "confidence_score": 57,
+                "market_demand_score": 89,
+                "ai_raw_score": 78,
+                "ai_shortlisted": True,
+                "ai_fallback_used": True,
+                "ai_strict_pass": False,
+                "risk_note": "AI single-call batch non ha restituito output valido per questo set: applicato fallback euristico.",
+            },
+        ]
+        source_candidates = [{"set_id": row["set_id"]} for row in ranked_rows]
+
+        with (
+            patch.object(oracle, "_collect_source_candidates", new=AsyncMock(return_value=source_candidates)),
+            patch.object(oracle, "_rank_and_persist_candidates", new=AsyncMock(return_value=ranked_rows)),
+        ):
+            report = await oracle.discover_with_diagnostics(persist=False, top_limit=10, fallback_limit=3)
+
+        diagnostics = report["diagnostics"]
+        self.assertTrue(bool(diagnostics.get("no_signal_due_to_low_strict_pass")))
+        self.assertTrue(bool(diagnostics.get("fallback_used")))
+        self.assertEqual(report["selected"], [])
+
     async def test_non_fallback_can_be_low_confidence_with_weak_quant_data(self) -> None:
         repo = FakeRepo()
         candidates = [
@@ -1050,6 +1113,7 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         ]
         oracle = DummyOracle(repo, candidates)
         oracle.min_composite_score = 1
+        oracle.ai_no_signal_on_low_strict_pass = False
 
         report = await oracle.discover_with_diagnostics(persist=False, top_limit=10, fallback_limit=3)
         selected = report["selected"]
@@ -2676,6 +2740,134 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertFalse(bool(ranked_by_set["14002"].get("ai_fallback_used")))
         self.assertGreaterEqual(int(oracle._last_ranking_diagnostics.get("ai_skip_cache_rescued") or 0), 1)
         self.assertEqual(int(oracle._last_ranking_diagnostics.get("ai_secondary_batch_attempted") or 0), 0)
+
+    async def test_single_call_scoring_uses_chunked_batches(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_single_call_scoring_enabled = True
+        oracle.ai_single_call_allow_repair_calls = True
+        oracle.ai_single_call_batch_chunk_size = 2
+        oracle.ai_single_call_batch_max_calls = 2
+        oracle.ai_single_call_missing_rescue_enabled = False
+        oracle.ai_scoring_hard_budget_sec = 75.0
+
+        shortlist: list[dict[str, Any]] = []
+        for idx in range(1, 6):
+            set_id = f"9900{idx}"
+            shortlist.append(
+                {
+                    "set_id": set_id,
+                    "candidate": {
+                        "set_id": set_id,
+                        "set_name": f"Set {set_id}",
+                        "theme": "City",
+                        "source": "lego_proxy_reader",
+                        "current_price": 49.99,
+                        "eol_date_prediction": "2026-10-01",
+                    },
+                }
+            )
+
+        async def fake_batch(
+            entries: list[dict[str, Any]],
+            *,
+            deadline: float,
+            allow_repair_calls: bool = True,
+            allow_failover_call: bool = True,
+        ):
+            _ = (deadline, allow_repair_calls, allow_failover_call)
+            scored = {}
+            for entry in entries:
+                set_id = str(entry.get("set_id") or "")
+                scored[set_id] = AIInsight(
+                    score=80,
+                    summary=f"strict {set_id}",
+                    predicted_eol_date="2026-10-01",
+                    fallback_used=False,
+                    confidence="HIGH_CONFIDENCE",
+                )
+            return scored, None
+
+        with patch.object(oracle, "_score_ai_shortlist_batch", new=AsyncMock(side_effect=fake_batch)) as mocked_batch:
+            results, stats = await oracle._score_ai_shortlist(shortlist)
+
+        self.assertEqual(mocked_batch.await_count, 2)
+        strict_count = sum(1 for insight in results.values() if not bool(insight.fallback_used))
+        fallback_count = sum(1 for insight in results.values() if bool(insight.fallback_used))
+        self.assertEqual(strict_count, 4)
+        self.assertEqual(fallback_count, 1)
+        self.assertEqual(int(stats.get("ai_batch_scored_count") or 0), 4)
+
+    async def test_top_pick_rescue_retries_non_strict_ai_results(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="x")
+        oracle.ai_single_call_scoring_enabled = True
+        oracle.ai_top_pick_rescue_count = 1
+
+        candidate = {
+            "set_id": "99701",
+            "set_name": "Set 99701",
+            "theme": "City",
+            "source": "lego_proxy_reader",
+            "current_price": 69.99,
+            "eol_date_prediction": "2026-10-01",
+        }
+        prepared = [
+            {
+                "set_id": "99701",
+                "candidate": candidate,
+            }
+        ]
+        ranked = [
+            {
+                "set_id": "99701",
+                "composite_score": 75,
+                "ai_investment_score": 75,
+                "forecast_score": 60,
+                "market_demand_score": 90,
+            }
+        ]
+        ai_results = {
+            "99701": AIInsight(
+                score=79,
+                summary="non json result",
+                predicted_eol_date="2026-10-01",
+                fallback_used=False,
+                confidence="LOW_CONFIDENCE",
+                risk_note="Output AI non JSON: score estratto da testo con parsing robusto.",
+            )
+        }
+
+        async def fake_batch(
+            entries: list[dict[str, Any]],
+            *,
+            deadline: float,
+            allow_repair_calls: bool = True,
+            allow_failover_call: bool = True,
+        ):
+            _ = (deadline, allow_repair_calls, allow_failover_call)
+            return {
+                "99701": AIInsight(
+                    score=82,
+                    summary="strict rescue",
+                    predicted_eol_date="2026-10-01",
+                    fallback_used=False,
+                    confidence="HIGH_CONFIDENCE",
+                )
+            }, None
+
+        with patch.object(oracle, "_score_ai_shortlist_batch", new=AsyncMock(side_effect=fake_batch)):
+            stats = await oracle._rescue_top_pick_ai_scores(
+                prepared=prepared,
+                ranked=ranked,
+                ai_results=ai_results,
+            )
+
+        rescued = ai_results["99701"]
+        self.assertFalse(bool(rescued.fallback_used))
+        self.assertNotIn("non json", str(rescued.risk_note or "").lower())
+        self.assertGreaterEqual(int(stats.get("ai_top_pick_rescue_attempts") or 0), 1)
+        self.assertGreaterEqual(int(stats.get("ai_top_pick_rescue_successes") or 0), 1)
 
     async def test_rank_flow_secondary_batch_scores_unresolved_skipped_candidates(self) -> None:
         repo = FakeRepo()
