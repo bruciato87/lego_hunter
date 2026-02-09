@@ -1819,6 +1819,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
                 "ai_raw_score": 86,
                 "ai_fallback_used": False,
                 "ai_confidence": "HIGH_CONFIDENCE",
+                "ai_strict_pass": True,
             },
         }
         candidates = [
@@ -1867,6 +1868,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
                 "ai_raw_score": 82,
                 "ai_fallback_used": False,
                 "ai_confidence": "LOW_CONFIDENCE",
+                "ai_strict_pass": False,
                 "ai_risk_note": "Output AI non JSON: score estratto da testo con parsing robusto.",
             },
         }
@@ -1895,7 +1897,81 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(int(report["diagnostics"]["ranking"].get("ai_persisted_cache_hits") or 0), 0)
         self.assertEqual(int(report["diagnostics"]["ranking"].get("ai_cache_hits") or 0), 0)
 
-    def test_set_cached_ai_insight_caps_non_json_ttl(self) -> None:
+    async def test_ai_persisted_cache_requires_strict_pass_metadata(self) -> None:
+        repo = FakeRepo()
+        now = datetime.now(timezone.utc)
+        repo.recent["75367"] = [
+            {
+                "set_id": "75367",
+                "price": 129.0,
+                "platform": "vinted",
+                "recorded_at": (now - timedelta(days=idx)).isoformat(),
+            }
+            for idx in range(4)
+        ]
+        repo.recent_ai_insights["75367"] = {
+            "set_id": "75367",
+            "ai_investment_score": 74,
+            "ai_analysis_summary": "Cache legacy without strict flag",
+            "eol_date_prediction": "2026-12-01",
+            "metadata": {
+                "ai_raw_score": 86,
+                "ai_fallback_used": False,
+                "ai_confidence": "HIGH_CONFIDENCE",
+            },
+        }
+        candidates = [
+            {
+                "set_id": "75367",
+                "set_name": "LEGO Star Wars",
+                "theme": "Star Wars",
+                "source": "lego_proxy_reader",
+                "current_price": 129.99,
+                "eol_date_prediction": "2026-05-01",
+                "metadata": {},
+                "mock_score": 83,
+                "mock_fallback": False,
+            }
+        ]
+        oracle = DummyOracle(repo, candidates)
+        oracle.ai_rank_max_candidates = 1
+        oracle.ai_cache_ttl_sec = 3600.0
+        oracle.ai_persisted_cache_ttl_sec = 172800.0
+
+        report = await oracle.discover_with_diagnostics(persist=False, top_limit=5, fallback_limit=1)
+
+        self.assertEqual(oracle.ai_calls, 1)
+        self.assertEqual(int(report["diagnostics"]["ranking"].get("ai_persisted_cache_hits") or 0), 0)
+        self.assertEqual(int(report["diagnostics"]["ranking"].get("ai_cache_hits") or 0), 0)
+
+    def test_set_cached_ai_insight_skips_non_json_by_default(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_cache_ttl_sec = 86400.0
+        oracle.ai_non_json_cache_ttl_sec = 7200.0
+        candidate = {
+            "set_id": "75367",
+            "set_name": "LEGO Star Wars",
+            "theme": "Star Wars",
+            "source": "lego_proxy_reader",
+            "current_price": 129.99,
+            "eol_date_prediction": "2026-05-01",
+        }
+        insight = AIInsight(
+            score=78,
+            summary="Non json sample",
+            predicted_eol_date="2026-05-01",
+            fallback_used=False,
+            confidence="LOW_CONFIDENCE",
+            risk_note="Output AI non JSON: score estratto da testo con parsing robusto.",
+        )
+
+        oracle._set_cached_ai_insight(candidate, insight)
+        key = oracle._ai_cache_key(candidate)
+        self.assertIsNotNone(key)
+        self.assertIsNone(oracle._ai_insight_cache.get(str(key)))
+
+    def test_set_cached_ai_insight_allows_non_json_in_emergency_mode(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
         oracle.ai_cache_ttl_sec = 86400.0
@@ -1918,7 +1994,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         )
 
         now_ts = time.time()
-        oracle._set_cached_ai_insight(candidate, insight)
+        oracle._set_cached_ai_insight(candidate, insight, allow_non_strict=True)
         key = oracle._ai_cache_key(candidate)
         self.assertIsNotNone(key)
         cached = oracle._ai_insight_cache.get(str(key))
@@ -2533,6 +2609,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
                 "ai_raw_score": 79,
                 "ai_confidence": "HIGH_CONFIDENCE",
                 "ai_fallback_used": False,
+                "ai_strict_pass": True,
             },
         }
 

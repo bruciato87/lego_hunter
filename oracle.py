@@ -3994,6 +3994,7 @@ class DiscoveryOracle:
             ai_non_json_origin = "none"
             if self._is_non_json_ai_note(ai.risk_note):
                 ai_non_json_origin = "cache" if ai_source_origin.startswith("cache") else "fresh"
+            ai_strict_pass = self._is_strict_ai_insight(ai)
 
             pattern_eval = self._evaluate_success_patterns(candidate)
             effective_pattern_score = self._effective_pattern_score(
@@ -4042,6 +4043,7 @@ class DiscoveryOracle:
                     "source_metadata": candidate.get("metadata", {}),
                     "ai_fallback_used": bool(ai.fallback_used),
                     "ai_confidence": str(ai.confidence or "HIGH_CONFIDENCE"),
+                    "ai_strict_pass": bool(ai_strict_pass),
                     "ai_risk_note": ai.risk_note,
                     "ai_source_origin": ai_source_origin,
                     "ai_non_json_origin": ai_non_json_origin,
@@ -4129,6 +4131,7 @@ class DiscoveryOracle:
             payload["pattern_signals"] = pattern_eval.signals
             payload["ai_fallback_used"] = bool(ai.fallback_used)
             payload["ai_confidence"] = str(ai.confidence or "HIGH_CONFIDENCE")
+            payload["ai_strict_pass"] = bool(ai_strict_pass)
             payload["ai_source_origin"] = ai_source_origin
             payload["ai_non_json_origin"] = ai_non_json_origin
             payload["forecast_rationale"] = forecast.rationale
@@ -4224,15 +4227,22 @@ class DiscoveryOracle:
         if not rescue_candidates:
             return stats
 
-        stats["ai_top_pick_rescue_cache_hits"] = self._prime_ai_cache_from_repository(rescue_candidates)
         external_available = self._external_ai_available()
+        allow_non_strict_cache = not external_available
+        stats["ai_top_pick_rescue_cache_hits"] = self._prime_ai_cache_from_repository(
+            rescue_candidates,
+            allow_non_strict=allow_non_strict_cache,
+        )
         if self.ai_single_call_scoring_enabled:
             unresolved: list[Dict[str, Any]] = []
             for candidate in rescue_candidates:
                 set_id = str(candidate.get("set_id") or "").strip()
                 if not set_id:
                     continue
-                cached = self._get_cached_ai_insight(candidate)
+                cached = self._get_cached_ai_insight(
+                    candidate,
+                    allow_non_strict=allow_non_strict_cache,
+                )
                 if cached is not None and not cached.fallback_used:
                     ai_results[set_id] = cached
                     prepared_row = prepared_by_set.get(set_id)
@@ -4305,7 +4315,10 @@ class DiscoveryOracle:
                 set_id = str(candidate.get("set_id") or "").strip()
                 if not set_id:
                     continue
-                cached = self._get_cached_ai_insight(candidate)
+                cached = self._get_cached_ai_insight(
+                    candidate,
+                    allow_non_strict=allow_non_strict_cache,
+                )
                 if cached is not None and not cached.fallback_used:
                     ai_results[set_id] = cached
                     prepared_row = prepared_by_set.get(set_id)
@@ -6586,6 +6599,13 @@ class DiscoveryOracle:
             return False
         return ("non json" in lowered) or ("parsing robusto" in lowered)
 
+    def _is_strict_ai_insight(self, insight: Optional[AIInsight]) -> bool:
+        if insight is None:
+            return False
+        if bool(insight.fallback_used):
+            return False
+        return not self._is_non_json_ai_note(insight.risk_note)
+
     @staticmethod
     def _merge_risk_note(existing: Optional[str], addition: str) -> str:
         base = str(existing or "").strip()
@@ -6594,6 +6614,21 @@ class DiscoveryOracle:
         if addition.lower() in base.lower():
             return base
         return f"{base.rstrip('.')} | {addition}"
+
+    @staticmethod
+    def _coerce_optional_bool(value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(int(value))
+        lowered = str(value).strip().lower()
+        if lowered in {"true", "1", "yes", "y", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "off"}:
+            return False
+        return None
 
     @staticmethod
     def _row_age_seconds(
@@ -6683,7 +6718,12 @@ class DiscoveryOracle:
             model_raw_score=(model_raw_score if final_score != model_raw_score else None),
         )
 
-    def _prime_ai_cache_from_repository(self, candidates: list[Dict[str, Any]]) -> int:
+    def _prime_ai_cache_from_repository(
+        self,
+        candidates: list[Dict[str, Any]],
+        *,
+        allow_non_strict: bool = False,
+    ) -> int:
         self._last_ai_cache_primed_set_ids = set()
         if self.ai_cache_ttl_sec <= 0:
             return 0
@@ -6703,7 +6743,7 @@ class DiscoveryOracle:
                 continue
             seen.add(set_id)
             candidate_by_set[set_id] = candidate
-            if self._get_cached_ai_insight(candidate) is None:
+            if self._get_cached_ai_insight(candidate, allow_non_strict=allow_non_strict) is None:
                 fetch_set_ids.append(set_id)
 
         if not fetch_set_ids:
@@ -6723,10 +6763,16 @@ class DiscoveryOracle:
             candidate = candidate_by_set.get(str(set_id))
             if candidate is None:
                 continue
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            strict_flag = self._coerce_optional_bool(metadata.get("ai_strict_pass"))
+            if (not allow_non_strict) and strict_flag is not True:
+                continue
             insight = self._insight_from_persisted_row(row, candidate)
             if insight is None:
                 continue
             insight = self._normalize_ai_insight(insight, candidate)
+            if (not allow_non_strict) and (not self._is_strict_ai_insight(insight)):
+                continue
             non_json_output = self._is_non_json_ai_note(insight.risk_note)
             if non_json_output:
                 age_sec = self._row_age_seconds(row, keys=("last_seen_at", "recorded_at", "updated_at", "created_at"))
@@ -6746,8 +6792,8 @@ class DiscoveryOracle:
             primed += 1
         return primed
 
-    @staticmethod
-    def _insight_from_persisted_row(row: Dict[str, Any], candidate: Dict[str, Any]) -> Optional[AIInsight]:
+    @classmethod
+    def _insight_from_persisted_row(cls, row: Dict[str, Any], candidate: Dict[str, Any]) -> Optional[AIInsight]:
         metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         if bool(metadata.get("ai_fallback_used")):
             return None
@@ -6774,6 +6820,12 @@ class DiscoveryOracle:
         risk_note = str(risk_note_raw).strip() if risk_note_raw is not None else None
         if risk_note == "":
             risk_note = None
+        strict_flag = cls._coerce_optional_bool(metadata.get("ai_strict_pass"))
+        if strict_flag is False and not cls._is_non_json_ai_note(risk_note):
+            risk_note = cls._merge_risk_note(
+                risk_note,
+                "Output AI non JSON: flagged non-strict in metadata.",
+            )
         model_raw_score = metadata.get("ai_model_raw_score")
         try:
             parsed_model_raw = int(float(model_raw_score)) if model_raw_score is not None else None
@@ -6789,7 +6841,12 @@ class DiscoveryOracle:
             model_raw_score=(parsed_model_raw if parsed_model_raw != score else None),
         )
 
-    def _get_cached_ai_insight(self, candidate: Dict[str, Any]) -> Optional[AIInsight]:
+    def _get_cached_ai_insight(
+        self,
+        candidate: Dict[str, Any],
+        *,
+        allow_non_strict: bool = False,
+    ) -> Optional[AIInsight]:
         if self.ai_cache_ttl_sec <= 0:
             return None
         key = self._ai_cache_key(candidate)
@@ -6803,12 +6860,24 @@ class DiscoveryOracle:
         if expires_at <= now_ts:
             self._ai_insight_cache.pop(key, None)
             return None
-        return self._normalize_ai_insight(self._clone_ai_insight(cached), candidate)
+        insight = self._normalize_ai_insight(self._clone_ai_insight(cached), candidate)
+        if (not allow_non_strict) and (not self._is_strict_ai_insight(insight)):
+            return None
+        return insight
 
-    def _set_cached_ai_insight(self, candidate: Dict[str, Any], insight: AIInsight) -> None:
+    def _set_cached_ai_insight(
+        self,
+        candidate: Dict[str, Any],
+        insight: AIInsight,
+        *,
+        allow_non_strict: bool = False,
+    ) -> None:
         if self.ai_cache_ttl_sec <= 0 or insight.fallback_used:
             return
-        ttl_sec = self._effective_cache_ttl_for_insight(insight)
+        normalized = self._normalize_ai_insight(insight, candidate)
+        if (not allow_non_strict) and (not self._is_strict_ai_insight(normalized)):
+            return
+        ttl_sec = self._effective_cache_ttl_for_insight(normalized)
         if ttl_sec <= 0:
             return
         key = self._ai_cache_key(candidate)
@@ -6829,7 +6898,7 @@ class DiscoveryOracle:
 
         self._ai_insight_cache[key] = (
             now_ts + ttl_sec,
-            self._clone_ai_insight(insight),
+            self._clone_ai_insight(normalized),
         )
 
     @staticmethod
