@@ -3734,6 +3734,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         short_history_row = {
             "set_id": "77051",
             "ai_fallback_used": False,
+            "ai_strict_pass": True,
             "composite_score": 71,
             "forecast_probability_upside_12m": 55.6,
             "confidence_score": 52,
@@ -3742,6 +3743,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         long_history_row = {
             "set_id": "77051",
             "ai_fallback_used": False,
+            "ai_strict_pass": True,
             "composite_score": 71,
             "forecast_probability_upside_12m": 55.6,
             "confidence_score": 52,
@@ -3775,6 +3777,27 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertIn("Bootstrap soglie attivo", note)
         self.assertIn("50.0% < 52%", note)
         self.assertIn("45 < 50", note)
+
+    def test_high_confidence_requires_ai_strict_pass(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_high_conf_required = False
+        oracle.min_upside_probability = 0.60
+        oracle.min_confidence_score = 68
+        oracle.min_composite_score = 60
+
+        row = {
+            "set_id": "77047",
+            "ai_fallback_used": False,
+            "ai_strict_pass": False,
+            "composite_score": 72,
+            "forecast_probability_upside_12m": 65.0,
+            "confidence_score": 72,
+            "forecast_data_points": 60,
+        }
+        self.assertFalse(oracle._is_high_confidence_pick(row))
+        note = oracle._build_low_confidence_note(row)
+        self.assertIn("AI strict-pass assente", note)
 
     def test_adaptive_historical_thresholds_relax_gate_using_reference_distribution(self) -> None:
         repo = FakeRepo()
@@ -3815,6 +3838,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         row = {
             "set_id": "76281",
             "ai_fallback_used": False,
+            "ai_strict_pass": True,
             "composite_score": 74,
             "forecast_probability_upside_12m": 64.0,
             "confidence_score": 72,
@@ -3848,6 +3872,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         row = {
             "set_id": "76281",
             "ai_fallback_used": False,
+            "ai_strict_pass": True,
             "composite_score": 74,
             "forecast_probability_upside_12m": 64.0,
             "confidence_score": 72,
@@ -3880,6 +3905,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         row = {
             "set_id": "76281",
             "ai_fallback_used": False,
+            "ai_strict_pass": True,
             "composite_score": 74,
             "forecast_probability_upside_12m": 64.0,
             "confidence_score": 72,
@@ -3916,6 +3942,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             "set_id": "76281",
             "theme": "Marvel",
             "ai_fallback_used": False,
+            "ai_strict_pass": True,
             "composite_score": 75,
             "forecast_probability_upside_12m": 65.0,
             "confidence_score": 72,
@@ -3955,6 +3982,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             "set_id": "77051",
             "theme": "Animal Crossing",
             "ai_fallback_used": False,
+            "ai_strict_pass": True,
             "composite_score": 73,
             "forecast_probability_upside_12m": 64.0,
             "confidence_score": 72,
@@ -4016,6 +4044,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         row = {
             "set_id": "11199",
             "ai_fallback_used": False,
+            "ai_strict_pass": True,
             "composite_score": 74,
             "forecast_probability_upside_12m": 66.0,
             "confidence_score": 72,

@@ -8666,6 +8666,9 @@ class DiscoveryOracle:
     def _high_confidence_signal_strength(self, row: Dict[str, Any]) -> str:
         if row.get("ai_fallback_used"):
             return "LOW_CONFIDENCE"
+        strict_pass = self._coerce_optional_bool(row.get("ai_strict_pass"))
+        if strict_pass is not True:
+            return "LOW_CONFIDENCE"
         probability_pct = float(row.get("forecast_probability_upside_12m") or 0.0)
         confidence_score = int(row.get("confidence_score") or 0)
         composite_score = int(row.get("composite_score") or row.get("ai_investment_score") or 0)
@@ -8692,6 +8695,11 @@ class DiscoveryOracle:
             return "Score AI in fallback nel ciclo corrente: verifica manuale consigliata."
 
         reasons: list[str] = []
+        strict_pass = self._coerce_optional_bool(row.get("ai_strict_pass"))
+        if strict_pass is not True:
+            reasons.append(
+                "AI strict-pass assente nel ciclo corrente (output AI non strutturato o non validato)"
+            )
         probability_pct = float(row.get("forecast_probability_upside_12m") or 0.0)
         probability_threshold, confidence_threshold, bootstrap_active, data_points = self._effective_high_confidence_thresholds(row)
         min_probability_pct = probability_threshold * 100.0
