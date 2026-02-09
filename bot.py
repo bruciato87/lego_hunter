@@ -1306,7 +1306,28 @@ async def run_scheduled_cycle(
                     "selected": [target_row],
                     "diagnostics": report.get("diagnostics") or {},
                 }
-                lines.extend(LegoHunterTelegramBot._format_discovery_report(focused_report, top_limit=1))
+                focused_lines = LegoHunterTelegramBot._format_discovery_report(
+                    focused_report,
+                    top_limit=1,
+                )
+                if focused_lines:
+                    signal_strength = str(target_row.get("signal_strength") or "")
+                    if signal_strength == "LOW_CONFIDENCE":
+                        focused_lines[0] = (
+                            "⚠️ Set richiesto trovato ma <b>LOW_CONFIDENCE</b>: "
+                            "richiede verifica manuale."
+                        )
+                    elif signal_strength == "HIGH_CONFIDENCE_BOOTSTRAP":
+                        focused_lines[0] = (
+                            "🧪 Set richiesto sopra soglia in <b>BOOTSTRAP</b> "
+                            "(confidenza preliminare)."
+                        )
+                    elif signal_strength.startswith("HIGH_CONFIDENCE"):
+                        focused_lines[0] = (
+                            "✅ Set richiesto sopra soglia con segnale "
+                            "<b>HIGH_CONFIDENCE</b>."
+                        )
+                lines.extend(focused_lines)
             else:
                 lines.append("⚠️ Set richiesto non trovato tra i candidati del ciclo corrente.")
                 lines.extend(

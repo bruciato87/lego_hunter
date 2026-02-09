@@ -835,6 +835,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         text = str(bot_mock.send_message.await_args.kwargs.get("text") or "")
         self.assertIn("Analisi approfondita singolo set", text)
         self.assertIn("Set richiesto: <b>76441</b>", text)
+        self.assertIn("Set richiesto trovato ma <b>LOW_CONFIDENCE</b>", text)
         self.assertIn("Castello di Hogwarts", text)
 
 
