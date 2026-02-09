@@ -3507,6 +3507,198 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(results["76281"].score, 71)
         mocked_repair.assert_not_awaited()
 
+    async def test_score_ai_shortlist_batch_quality_failover_switches_model(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle._openrouter_model_id = "vendor/model-a:free"
+        oracle._openrouter_candidates = ["vendor/model-a:free", "vendor/model-b:free"]
+        oracle._openrouter_available_candidates = ["vendor/model-a:free", "vendor/model-b:free"]
+        oracle.ai_runtime = {
+            "engine": "openrouter",
+            "provider": "openrouter",
+            "model": "vendor/model-a:free",
+            "mode": "api_openrouter_inventory",
+            "inventory_available": 2,
+        }
+        oracle.ai_no_signal_min_strict_pass_rate = 0.5
+        oracle.ai_model_quality_min_samples = 2
+        oracle.ai_model_quality_max_non_json_rate = 0.4
+
+        entries = [
+            {
+                "set_id": "75367",
+                "candidate": {
+                    "set_id": "75367",
+                    "set_name": "Set 75367",
+                    "theme": "Star Wars",
+                    "source": "lego_proxy_reader",
+                    "current_price": 99.99,
+                    "eol_date_prediction": "2026-12-01",
+                },
+            },
+            {
+                "set_id": "76281",
+                "candidate": {
+                    "set_id": "76281",
+                    "set_name": "Set 76281",
+                    "theme": "Marvel",
+                    "source": "lego_proxy_reader",
+                    "current_price": 79.99,
+                    "eol_date_prediction": "2026-10-01",
+                },
+            },
+        ]
+
+        raw_non_json = (
+            "set_id=75367|score=72|summary=non json a|predicted_eol_date=2026-12-01\n"
+            "set_id=76281|score=69|summary=non json b|predicted_eol_date=2026-10-01"
+        )
+        strict_json = (
+            '{"results": ['
+            '{"set_id":"75367","score":86,"summary":"strict a","predicted_eol_date":"2026-12-01"},'
+            '{"set_id":"76281","score":81,"summary":"strict b","predicted_eol_date":"2026-10-01"}'
+            "]}"
+        )
+
+        async def fake_rotate(reason: str) -> bool:  # noqa: ARG001
+            oracle._openrouter_model_id = "vendor/model-b:free"
+            return True
+
+        with patch.object(
+            oracle,
+            "_openrouter_generate",
+            side_effect=[raw_non_json, strict_json],
+        ) as mocked_generate, patch.object(
+            oracle,
+            "_advance_openrouter_model_locked",
+            new=AsyncMock(side_effect=fake_rotate),
+        ) as mocked_rotate:
+            results, error = await oracle._score_ai_shortlist_batch(
+                entries,
+                deadline=time.monotonic() + 10.0,
+                allow_repair_calls=False,
+                allow_failover_call=True,
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(mocked_generate.call_count, 2)
+        mocked_rotate.assert_awaited_once()
+        self.assertEqual(results["75367"].score, 86)
+        self.assertEqual(results["76281"].score, 81)
+        self.assertFalse(bool(results["75367"].fallback_used))
+        self.assertFalse(bool(results["76281"].fallback_used))
+        self.assertFalse(DiscoveryOracle._is_non_json_ai_note(results["75367"].risk_note))
+        self.assertFalse(DiscoveryOracle._is_non_json_ai_note(results["76281"].risk_note))
+
+    async def test_rank_flow_reranks_once_when_shortlist_strict_pass_is_too_low(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle.ai_no_signal_on_low_strict_pass = True
+        oracle.ai_no_signal_min_strict_pass_rate = 0.5
+        oracle.ai_top_pick_rescue_enabled = False
+        oracle.ai_single_call_secondary_batch_enabled = False
+        oracle.ai_non_shortlist_cache_rescue_enabled = False
+        oracle.ai_non_json_rescore_enabled = False
+        oracle._openrouter_model_id = "vendor/model-a:free"
+        oracle._openrouter_candidates = ["vendor/model-a:free", "vendor/model-b:free"]
+        oracle._openrouter_available_candidates = ["vendor/model-a:free", "vendor/model-b:free"]
+        oracle.ai_runtime = {
+            "engine": "openrouter",
+            "provider": "openrouter",
+            "model": "vendor/model-a:free",
+            "mode": "api_openrouter_inventory",
+            "inventory_available": 2,
+        }
+
+        candidate = {
+            "set_id": "76281",
+            "set_name": "X-Jet",
+            "theme": "Marvel",
+            "source": "lego_proxy_reader",
+            "current_price": 79.99,
+            "eol_date_prediction": "2026-10-01",
+            "metadata": {},
+        }
+        forecast = oracle.forecaster.forecast(candidate=candidate, history_rows=[], theme_baseline={})
+        source_candidates = [candidate]
+        prepared = [
+            {
+                "candidate": candidate,
+                "set_id": "76281",
+                "theme": "Marvel",
+                "forecast": forecast,
+                "history_30": [],
+                "prefilter_score": 95,
+                "prefilter_rank": 1,
+                "ai_shortlisted": True,
+            }
+        ]
+        shortlist = [prepared[0]]
+        skipped: list[dict] = []
+        ai_stats_template = {
+            "ai_scored_count": 1,
+            "ai_batch_scored_count": 0,
+            "ai_cache_hits": 0,
+            "ai_cache_misses": 1,
+            "ai_persisted_cache_hits": 0,
+            "ai_errors": 0,
+            "ai_budget_exhausted": 0,
+            "ai_timeout_count": 0,
+        }
+        low_strict = {
+            "76281": AIInsight(
+                score=79,
+                summary="non json",
+                predicted_eol_date="2026-10-01",
+                fallback_used=False,
+                confidence="LOW_CONFIDENCE",
+                risk_note="Output AI non JSON: score estratto da testo con parsing robusto.",
+            )
+        }
+        strict = {
+            "76281": AIInsight(
+                score=82,
+                summary="strict json",
+                predicted_eol_date="2026-10-01",
+                fallback_used=False,
+                confidence="HIGH_CONFIDENCE",
+            )
+        }
+
+        def rotate_model(reason: str) -> bool:  # noqa: ARG001
+            oracle._openrouter_model_id = "vendor/model-b:free"
+            oracle.ai_runtime["model"] = "vendor/model-b:free"
+            return True
+
+        with (
+            patch.object(oracle, "_prepare_quantitative_context", return_value=prepared),
+            patch.object(oracle, "_select_ai_shortlist", return_value=(shortlist, skipped)),
+            patch.object(
+                oracle,
+                "_score_ai_shortlist",
+                new=AsyncMock(
+                    side_effect=[
+                        (low_strict, dict(ai_stats_template)),
+                        (strict, dict(ai_stats_template)),
+                    ]
+                ),
+            ) as mocked_score,
+            patch.object(oracle, "_advance_openrouter_model", side_effect=rotate_model) as mocked_rotate,
+            patch.object(oracle, "_is_ai_score_collapse", return_value=False),
+        ):
+            ranked = await oracle._rank_and_persist_candidates(source_candidates, persist=False)
+
+        self.assertEqual(mocked_score.await_count, 2)
+        mocked_rotate.assert_called_once()
+        self.assertEqual(int(oracle._last_ranking_diagnostics.get("rerank_attempt") or 0), 1)
+        self.assertEqual(int(oracle._last_ranking_diagnostics.get("ai_quality_total") or 0), 1)
+        self.assertEqual(int(oracle._last_ranking_diagnostics.get("ai_quality_strict") or 0), 1)
+        ranked_by_set = {str(row.get("set_id")): row for row in ranked}
+        self.assertFalse(bool(ranked_by_set["76281"].get("ai_fallback_used")))
+        self.assertNotIn("non json", str(ranked_by_set["76281"].get("risk_note") or "").lower())
+
     async def test_score_ai_shortlist_single_call_mode_uses_one_batch_for_all_pending(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)

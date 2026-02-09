@@ -1758,6 +1758,36 @@ class DiscoveryOracle:
                     row.get("score"),
                 )
 
+    def _ai_insight_quality_breakdown(
+        self,
+        insights: Dict[str, "AIInsight"],
+    ) -> Dict[str, float]:
+        total = 0
+        strict = 0
+        non_json = 0
+        fallback = 0
+        for insight in insights.values():
+            if insight is None:
+                continue
+            total += 1
+            if bool(insight.fallback_used):
+                fallback += 1
+                continue
+            if self._is_non_json_ai_note(insight.risk_note):
+                non_json += 1
+                continue
+            strict += 1
+        denom = max(1, total)
+        return {
+            "total": int(total),
+            "strict": int(strict),
+            "non_json": int(non_json),
+            "fallback": int(fallback),
+            "strict_rate": float(strict) / float(denom),
+            "non_json_rate": float(non_json) / float(denom),
+            "fallback_rate": float(fallback) / float(denom),
+        }
+
     def _rank_candidate_models(
         self,
         provider: str,
@@ -3620,6 +3650,72 @@ class DiscoveryOracle:
 
         ai_started = time.monotonic()
         ai_results, ai_stats = await self._score_ai_shortlist(shortlist)
+        shortlist_set_ids = [
+            str(row.get("set_id") or "").strip()
+            for row in shortlist
+            if str(row.get("set_id") or "").strip()
+        ]
+        shortlist_quality = self._ai_insight_quality_breakdown(
+            {
+                set_id: ai_results[set_id]
+                for set_id in shortlist_set_ids
+                if set_id in ai_results
+            }
+        )
+        ai_stats["ai_quality_total"] = int(shortlist_quality.get("total", 0))
+        ai_stats["ai_quality_strict"] = int(shortlist_quality.get("strict", 0))
+        ai_stats["ai_quality_non_json"] = int(shortlist_quality.get("non_json", 0))
+        ai_stats["ai_quality_fallback"] = int(shortlist_quality.get("fallback", 0))
+        ai_stats["ai_quality_strict_rate_pct"] = round(float(shortlist_quality.get("strict_rate", 0.0)) * 100.0, 2)
+        ai_stats["ai_quality_non_json_rate_pct"] = round(float(shortlist_quality.get("non_json_rate", 0.0)) * 100.0, 2)
+
+        strict_rate_threshold = float(self.ai_no_signal_min_strict_pass_rate)
+        strict_rate_value = float(shortlist_quality.get("strict_rate", 0.0))
+        should_quality_rerank = (
+            rerank_attempt < 1
+            and self.ai_no_signal_on_low_strict_pass
+            and int(shortlist_quality.get("total", 0)) > 0
+            and strict_rate_value < strict_rate_threshold
+        )
+        if should_quality_rerank:
+            switched = False
+            prev_model = str(self.ai_runtime.get("model") or "")
+            if self._openrouter_model_id:
+                openrouter_pool = [
+                    name
+                    for name in (self._openrouter_available_candidates or self._openrouter_candidates)
+                    if name and name != self._openrouter_model_id
+                ]
+                if openrouter_pool:
+                    switched = self._advance_openrouter_model(
+                        reason=f"low_strict_pass_rerank strict={strict_rate_value:.2f} threshold={strict_rate_threshold:.2f}"
+                    )
+            elif self._model is not None:
+                gemini_pool = [
+                    name
+                    for name in (self._gemini_available_candidates or self._gemini_candidates)
+                    if name and name != str(self.gemini_model or "")
+                ]
+                if gemini_pool:
+                    switched = self._advance_gemini_model(
+                        reason=f"low_strict_pass_rerank strict={strict_rate_value:.2f} threshold={strict_rate_threshold:.2f}"
+                    )
+
+            if switched:
+                LOGGER.warning(
+                    "AI low strict-pass rerank | strict_rate=%.2f threshold=%.2f rerank_attempt=%s model_before=%s model_after=%s",
+                    strict_rate_value,
+                    strict_rate_threshold,
+                    rerank_attempt + 1,
+                    prev_model or "unknown",
+                    str(self.ai_runtime.get("model") or ""),
+                )
+                return await self._rank_and_persist_candidates(
+                    source_candidates,
+                    persist=persist,
+                    rerank_attempt=rerank_attempt + 1,
+                )
+
         post_shortlist_stats = {
             "ai_skip_cache_primed": 0,
             "ai_skip_cache_rescued": 0,
@@ -4009,6 +4105,13 @@ class DiscoveryOracle:
             "ai_final_pick_guarantee_pending_after_rounds": int(
                 rescue_stats.get("ai_final_pick_guarantee_pending_after_rounds", 0)
             ),
+            "rerank_attempt": int(rerank_attempt),
+            "ai_quality_total": int(ai_stats.get("ai_quality_total", 0)),
+            "ai_quality_strict": int(ai_stats.get("ai_quality_strict", 0)),
+            "ai_quality_non_json": int(ai_stats.get("ai_quality_non_json", 0)),
+            "ai_quality_fallback": int(ai_stats.get("ai_quality_fallback", 0)),
+            "ai_quality_strict_rate_pct": float(ai_stats.get("ai_quality_strict_rate_pct", 0.0)),
+            "ai_quality_non_json_rate_pct": float(ai_stats.get("ai_quality_non_json_rate_pct", 0.0)),
             "historical_prior_applied_count": historical_prior_applied,
             "quant_prep_sec": round(prep_duration, 2),
             "ai_scoring_sec": round(ai_duration, 2),
@@ -5517,75 +5620,101 @@ class DiscoveryOracle:
                         raw_text=raw_text,
                         candidates=candidates,
                         timeout_sec=timeout_sec,
-                    )
+                        )
                     return repaired or {}
 
             current_model = str(self._openrouter_model_id or "")
-            try:
-                text = await asyncio.to_thread(
-                    self._openrouter_generate,
-                    prompt,
-                    request_timeout=timeout_sec,
-                )
-                insights = await _insights_from_openrouter_text(text)
-                insights = self._normalize_batch_ai_insights(insights, candidates)
-                if insights:
-                    self._record_model_success("openrouter", current_model, phase="batch_scoring")
-                    self._record_model_quality("openrouter", current_model, insights, phase="batch_scoring")
-                    LOGGER.info(
-                        "AI batch scoring success | provider=openrouter model=%s candidates=%s scored=%s",
-                        current_model,
-                        len(candidates),
-                        len(insights),
+            quality_failover_attempts = 0
+            max_quality_failover_attempts = 1 if allow_failover_call else 0
+            min_quality_samples = max(2, min(int(self.ai_model_quality_min_samples), len(candidates)))
+            strict_quality_threshold = float(self.ai_no_signal_min_strict_pass_rate)
+            non_json_quality_threshold = float(self.ai_model_quality_max_non_json_rate)
+
+            while True:
+                try:
+                    text = await asyncio.to_thread(
+                        self._openrouter_generate,
+                        prompt,
+                        request_timeout=timeout_sec,
                     )
-                    return insights, None
-                self._record_model_failure("openrouter", current_model, "batch_payload_no_valid_rows", phase="batch_scoring")
-                return {}, "batch_payload_no_valid_rows"
-            except Exception as exc:  # noqa: BLE001
-                self._record_model_failure("openrouter", current_model, str(exc), phase="batch_scoring")
-                if not allow_failover_call:
-                    return {}, str(exc)
-                rotated = await self._advance_openrouter_model_locked(reason=f"batch_scoring:{exc}")
-                if rotated:
-                    rotated_model = str(self._openrouter_model_id or "")
-                    try:
-                        text = await asyncio.to_thread(
-                            self._openrouter_generate,
-                            prompt,
-                            request_timeout=timeout_sec,
+                    insights = await _insights_from_openrouter_text(text)
+                    insights = self._normalize_batch_ai_insights(insights, candidates)
+                    if insights:
+                        quality = self._ai_insight_quality_breakdown(insights)
+                        low_quality = (
+                            int(quality.get("total", 0)) >= min_quality_samples
+                            and (
+                                float(quality.get("strict_rate", 0.0)) < strict_quality_threshold
+                                or float(quality.get("non_json_rate", 0.0)) > non_json_quality_threshold
+                            )
                         )
-                        insights = await _insights_from_openrouter_text(text)
-                        insights = self._normalize_batch_ai_insights(insights, candidates)
-                        if insights:
-                            self._record_model_success("openrouter", rotated_model, phase="batch_scoring_after_failover")
-                            self._record_model_quality(
+                        if low_quality and quality_failover_attempts < max_quality_failover_attempts:
+                            reason = (
+                                "batch_quality_low("
+                                f"strict={float(quality.get('strict_rate', 0.0)):.2f},"
+                                f"non_json={float(quality.get('non_json_rate', 0.0)):.2f},"
+                                f"samples={int(quality.get('total', 0))})"
+                            )
+                            self._record_model_failure(
                                 "openrouter",
-                                rotated_model,
-                                insights,
-                                phase="batch_scoring_after_failover",
+                                current_model,
+                                reason,
+                                phase="batch_scoring_quality_gate",
                             )
-                            LOGGER.info(
-                                "AI batch scoring success after failover | provider=openrouter model=%s candidates=%s scored=%s",
-                                rotated_model,
-                                len(candidates),
-                                len(insights),
+                            LOGGER.warning(
+                                "AI batch quality low, attempting failover | model=%s strict_rate=%.2f non_json_rate=%.2f samples=%s threshold_strict=%.2f threshold_non_json=%.2f",
+                                current_model,
+                                float(quality.get("strict_rate", 0.0)),
+                                float(quality.get("non_json_rate", 0.0)),
+                                int(quality.get("total", 0)),
+                                strict_quality_threshold,
+                                non_json_quality_threshold,
                             )
-                            return insights, None
-                        self._record_model_failure(
-                            "openrouter",
-                            rotated_model,
-                            "batch_payload_no_valid_rows",
-                            phase="batch_scoring_after_failover",
+                            rotated = await self._advance_openrouter_model_locked(
+                                reason=reason,
+                            )
+                            rotated_model = str(self._openrouter_model_id or "")
+                            if rotated and rotated_model and rotated_model != current_model:
+                                quality_failover_attempts += 1
+                                current_model = rotated_model
+                                continue
+
+                        self._record_model_success("openrouter", current_model, phase="batch_scoring")
+                        self._record_model_quality("openrouter", current_model, insights, phase="batch_scoring")
+                        LOGGER.info(
+                            "AI batch scoring success | provider=openrouter model=%s candidates=%s scored=%s",
+                            current_model,
+                            len(candidates),
+                            len(insights),
                         )
-                    except Exception as exc_after_switch:  # noqa: BLE001
-                        self._record_model_failure(
-                            "openrouter",
-                            rotated_model,
-                            str(exc_after_switch),
-                            phase="batch_scoring_after_failover",
+                        return insights, None
+
+                    self._record_model_failure(
+                        "openrouter",
+                        current_model,
+                        "batch_payload_no_valid_rows",
+                        phase="batch_scoring",
+                    )
+                    if quality_failover_attempts < max_quality_failover_attempts:
+                        rotated = await self._advance_openrouter_model_locked(
+                            reason="batch_payload_no_valid_rows",
                         )
-                        return {}, str(exc_after_switch)
-                return {}, str(exc)
+                        rotated_model = str(self._openrouter_model_id or "")
+                        if rotated and rotated_model and rotated_model != current_model:
+                            quality_failover_attempts += 1
+                            current_model = rotated_model
+                            continue
+                    return {}, "batch_payload_no_valid_rows"
+                except Exception as exc:  # noqa: BLE001
+                    self._record_model_failure("openrouter", current_model, str(exc), phase="batch_scoring")
+                    if quality_failover_attempts < max_quality_failover_attempts:
+                        rotated = await self._advance_openrouter_model_locked(reason=f"batch_scoring:{exc}")
+                        rotated_model = str(self._openrouter_model_id or "")
+                        if rotated and rotated_model and rotated_model != current_model:
+                            quality_failover_attempts += 1
+                            current_model = rotated_model
+                            continue
+                    return {}, str(exc)
 
         return {}, "no_external_ai_available"
 
