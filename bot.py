@@ -44,6 +44,33 @@ def _normalize_set_id_token(raw_value: Any) -> str:
     return token if SET_ID_PATTERN.match(token) else ""
 
 
+def _parse_eur_amount(raw_value: Any) -> float:
+    text = str(raw_value or "").strip().lower()
+    if not text:
+        raise ValueError("Prezzo mancante")
+    cleaned = text.replace("eur", "").replace("€", "").replace(" ", "")
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            # Format like 1.234,56 -> comma decimal separator
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            # Format like 1,234.56 -> dot decimal separator
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        cleaned = cleaned.replace(",", ".")
+    value = float(cleaned)
+    if value <= 0:
+        raise ValueError("Prezzo deve essere positivo")
+    return round(value, 2)
+
+
+def _parse_positive_quantity(raw_value: Any) -> int:
+    qty = int(str(raw_value or "").strip())
+    if qty <= 0:
+        raise ValueError("Quantita deve essere > 0")
+    return qty
+
+
 def _github_dispatch_repository() -> str:
     repo = str(os.getenv("GITHUB_REPO") or os.getenv("GITHUB_REPOSITORY") or "").strip()
     return repo
@@ -301,6 +328,7 @@ class LegoHunterTelegramBot:
         return [
             BotCommand("start", "Attiva il bot e mostra guida rapida"),
             BotCommand("scova", "Scopre i migliori set da monitorare/acquistare"),
+            BotCommand("acquista", "Registra acquisto in collezione: /acquista 76441 34,99"),
             BotCommand("analizza", "Analisi approfondita set su GitHub Actions: /analizza 76441"),
             BotCommand("radar", "Mostra le opportunita' piu' forti in radar"),
             BotCommand("cerca", "Cerca un set nel radar: /cerca 75367"),
@@ -327,6 +355,7 @@ class LegoHunterTelegramBot:
             "🧱 LEGO HUNTER - Guida comandi\n\n"
             "Comandi principali:\n"
             "/scova - Discovery completa (LEGO + Amazon + ranking AI) e Top Picks del ciclo.\n"
+            "/acquista <set_id> <prezzo> [quantita] - Registra un acquisto in collezione (es. /acquista 76441 34,99 1).\n"
             "/analizza <set_id> - Avvia su GitHub un'analisi approfondita singolo set (es. /analizza 76441).\n"
             "/radar - Mostra le opportunita' gia' in Opportunity Radar, ordinate per score.\n"
             "/cerca <id|nome|tema> - Cerca set nel radar (es. /cerca 75367).\n"
@@ -342,6 +371,7 @@ class LegoHunterTelegramBot:
             "/portfolio -> /collezione\n"
             "/sell_signal -> /vendi\n\n"
             "Esempi rapidi:\n"
+            "/acquista 76441 34,99\n"
             "/analizza 76441\n"
             "/cerca millennium falcon\n"
             "/cerca 10332\n"
@@ -422,6 +452,70 @@ class LegoHunterTelegramBot:
             "Config richiesta su Vercel: GITHUB_ACTIONS_DISPATCH_TOKEN, GITHUB_REPO, "
             "GITHUB_WORKFLOW_FILE (opzionale), GITHUB_WORKFLOW_REF (opzionale)."
         )
+
+    async def cmd_acquista(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "Uso: /acquista <set_id> <prezzo> [quantita]\n"
+                "Esempio: /acquista 76441 34,99 1"
+            )
+            return
+
+        set_id = _normalize_set_id_token(context.args[0])
+        if not set_id:
+            await update.message.reply_text("Set ID non valido. Esempio corretto: /acquista 76441 34,99 1")
+            return
+
+        try:
+            paid_price = _parse_eur_amount(context.args[1])
+        except Exception:  # noqa: BLE001
+            await update.message.reply_text("Prezzo non valido. Usa formato numerico, es: 34,99")
+            return
+
+        quantity = 1
+        if len(context.args) >= 3:
+            try:
+                quantity = _parse_positive_quantity(context.args[2])
+            except Exception:  # noqa: BLE001
+                await update.message.reply_text("Quantita non valida. Deve essere un intero > 0.")
+                return
+
+        identity = await asyncio.to_thread(self.repository.resolve_set_identity, set_id)
+        set_name = str(identity.get("set_name") or "").strip() or f"LEGO {set_id}"
+        theme = str(identity.get("theme") or "").strip() or None
+        name_auto_resolved = bool(str(identity.get("set_name") or "").strip())
+
+        try:
+            row = await asyncio.to_thread(
+                self.repository.add_portfolio_purchase,
+                set_id=set_id,
+                set_name=set_name,
+                theme=theme,
+                purchase_price=paid_price,
+                quantity=quantity,
+                purchase_platform="telegram_manual",
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Failed to register purchase in portfolio")
+            await update.message.reply_text(f"Errore registrazione acquisto: {exc}")
+            return
+
+        total_qty = int(row.get("quantity") or quantity)
+        avg_price = float(row.get("purchase_price") or paid_price)
+        resolved_name = str(row.get("set_name") or set_name)
+
+        lines = [
+            "✅ Acquisto registrato in collezione.",
+            f"📦 {resolved_name} ({set_id})",
+            f"Prezzo pagato: {self._fmt_eur(paid_price)} | Quantita aggiunta: {quantity}",
+            f"Totale in collezione: {total_qty} | Prezzo medio carico: {self._fmt_eur(avg_price)}",
+        ]
+        if not name_auto_resolved:
+            lines.append("ℹ️ Nome set non trovato nello storico: usato fallback dal codice set.")
+        await update.message.reply_text("\n".join(lines))
 
     async def cmd_radar(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update):
@@ -1189,6 +1283,8 @@ def build_application(
 
     # New LEGO-focused commands.
     app.add_handler(CommandHandler("scova", manager.cmd_scova))
+    app.add_handler(CommandHandler("acquista", manager.cmd_acquista))
+    app.add_handler(CommandHandler("compra", manager.cmd_acquista))
     app.add_handler(CommandHandler("analizza", manager.cmd_analizza))
     app.add_handler(CommandHandler("analisi", manager.cmd_analizza))
     app.add_handler(CommandHandler("radar", manager.cmd_radar))

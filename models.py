@@ -210,6 +210,136 @@ class LegoHunterRepository:
         data = result.data or []
         return data[0] if data else payload
 
+    def get_portfolio_item(self, set_id: str) -> Optional[Dict[str, Any]]:
+        key = str(set_id or "").strip()
+        if not key:
+            return None
+
+        result = self._with_retry(
+            "get_portfolio_item",
+            lambda: self.client.table("portfolio")
+            .select("*")
+            .eq("set_id", key)
+            .limit(1)
+            .execute(),
+        )
+        rows = result.data or []
+        return rows[0] if rows else None
+
+    def resolve_set_identity(self, set_id: str) -> Dict[str, Optional[str]]:
+        key = str(set_id or "").strip()
+        if not key:
+            return {"set_id": "", "set_name": None, "theme": None}
+
+        radar_result = self._with_retry(
+            "resolve_set_identity_radar",
+            lambda: self.client.table("opportunity_radar")
+            .select("set_id,set_name,theme,last_seen_at")
+            .eq("set_id", key)
+            .eq("is_archived", False)
+            .order("last_seen_at", desc=True)
+            .limit(1)
+            .execute(),
+        )
+        radar_rows = radar_result.data or []
+        if radar_rows:
+            row = radar_rows[0]
+            return {
+                "set_id": key,
+                "set_name": str(row.get("set_name") or "").strip() or None,
+                "theme": str(row.get("theme") or "").strip() or None,
+            }
+
+        market_result = self._with_retry(
+            "resolve_set_identity_market",
+            lambda: self.client.table("market_time_series")
+            .select("set_id,set_name")
+            .eq("set_id", key)
+            .order("recorded_at", desc=True)
+            .limit(1)
+            .execute(),
+        )
+        market_rows = market_result.data or []
+        if market_rows:
+            row = market_rows[0]
+            return {
+                "set_id": key,
+                "set_name": str(row.get("set_name") or "").strip() or None,
+                "theme": None,
+            }
+
+        return {"set_id": key, "set_name": None, "theme": None}
+
+    def add_portfolio_purchase(
+        self,
+        *,
+        set_id: str,
+        purchase_price: float,
+        quantity: int = 1,
+        purchase_date: Optional[str] = None,
+        shipping_in_cost: float = 0.0,
+        purchase_platform: Optional[str] = None,
+        notes: Optional[str] = None,
+        set_name: Optional[str] = None,
+        theme: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        key = str(set_id or "").strip()
+        if not key:
+            raise ValueError("set_id mancante")
+
+        safe_qty = max(1, int(quantity or 1))
+        safe_price = round(max(0.0, float(purchase_price or 0.0)), 2)
+        safe_shipping = round(max(0.0, float(shipping_in_cost or 0.0)), 2)
+        safe_date = str(purchase_date or date.today().isoformat())
+
+        existing = self.get_portfolio_item(key)
+        if existing:
+            prev_qty = max(0, int(existing.get("quantity") or 0))
+            prev_price = round(max(0.0, float(existing.get("purchase_price") or 0.0)), 2)
+            prev_shipping = round(max(0.0, float(existing.get("shipping_in_cost") or 0.0)), 2)
+            total_qty = max(1, prev_qty + safe_qty)
+            averaged_price = round(((prev_price * prev_qty) + (safe_price * safe_qty)) / total_qty, 2)
+
+            prev_platform = str(existing.get("purchase_platform") or "").strip()
+            new_platform = str(purchase_platform or "").strip()
+            merged_platform = prev_platform or new_platform
+            if prev_platform and new_platform and prev_platform.lower() != new_platform.lower():
+                merged_platform = "multiple"
+
+            payload = {
+                "set_id": key,
+                "set_name": str(set_name or existing.get("set_name") or key).strip() or key,
+                "theme": str(theme or existing.get("theme") or "").strip() or None,
+                "purchase_price": averaged_price,
+                "purchase_date": str(existing.get("purchase_date") or safe_date),
+                "quantity": total_qty,
+                "purchase_platform": merged_platform or None,
+                "shipping_in_cost": round(prev_shipping + safe_shipping, 2),
+                "estimated_market_price": existing.get("estimated_market_price"),
+                "status": "holding",
+                "notes": str(notes or existing.get("notes") or "").strip() or None,
+            }
+            result = self._with_retry(
+                "add_portfolio_purchase_update",
+                lambda: self.client.table("portfolio").upsert(payload, on_conflict="set_id").execute(),
+            )
+            rows = result.data or []
+            return rows[0] if rows else payload
+
+        record = PortfolioRecord(
+            set_id=key,
+            set_name=str(set_name or key).strip() or key,
+            theme=str(theme or "").strip() or None,
+            purchase_price=safe_price,
+            purchase_date=safe_date,
+            quantity=safe_qty,
+            purchase_platform=str(purchase_platform or "").strip() or None,
+            shipping_in_cost=safe_shipping,
+            status="holding",
+            notes=str(notes or "").strip() or None,
+        )
+        return self.upsert_portfolio_item(record)
+
     def get_portfolio(self, status: str = "holding") -> list[Dict[str, Any]]:
         result = self._with_retry(
             "get_portfolio",

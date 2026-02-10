@@ -122,7 +122,7 @@ async def _send_webhook_light_notice(
 
     notice = (
         "Comando non disponibile nel webhook leggero.\n"
-        "Usa /analizza, /radar, /cerca, /collezione, /vendi, /help.\n"
+        "Usa /acquista, /analizza, /radar, /cerca, /collezione, /vendi, /help.\n"
         "La discovery completa (/scova) gira nei cicli schedulati cloud."
     )
     bot = Bot(token=token)

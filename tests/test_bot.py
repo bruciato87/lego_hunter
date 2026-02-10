@@ -9,6 +9,8 @@ from telegram.error import BadRequest, TimedOut
 from bot import (
     LegoHunterTelegramBot,
     _dispatch_single_set_analysis_workflow,
+    _parse_eur_amount,
+    _parse_positive_quantity,
     build_application,
     run_scheduled_cycle,
 )
@@ -39,6 +41,9 @@ class DummyContext:
 
 
 class FakeRepo:
+    def __init__(self) -> None:
+        self.last_purchase_payload = None
+
     def get_top_opportunities(self, limit=8, min_score=50):  # noqa: ANN001
         return [
             {
@@ -83,6 +88,24 @@ class FakeRepo:
 
     def get_latest_price(self, set_id, platform=None):  # noqa: ANN001
         return {"platform": platform or "vinted", "price": 140.0}
+
+    def resolve_set_identity(self, set_id):  # noqa: ANN001
+        if str(set_id) == "76441":
+            return {"set_id": "76441", "set_name": "Castello di Hogwarts™: Club dei Duellanti", "theme": "Harry Potter"}
+        return {"set_id": str(set_id), "set_name": None, "theme": None}
+
+    def add_portfolio_purchase(self, **kwargs):  # noqa: ANN003
+        self.last_purchase_payload = dict(kwargs)
+        quantity = int(kwargs.get("quantity") or 1)
+        return {
+            "set_id": kwargs.get("set_id"),
+            "set_name": kwargs.get("set_name"),
+            "theme": kwargs.get("theme"),
+            "purchase_price": kwargs.get("purchase_price"),
+            "quantity": quantity,
+            "purchase_platform": kwargs.get("purchase_platform"),
+            "status": "holding",
+        }
 
 
 class FakeOracle:
@@ -141,6 +164,17 @@ class FakeFiscal:
 
 
 class BotTests(unittest.IsolatedAsyncioTestCase):
+    def test_parse_eur_amount_supports_common_formats(self) -> None:
+        self.assertEqual(_parse_eur_amount("34,99"), 34.99)
+        self.assertEqual(_parse_eur_amount("34.99"), 34.99)
+        self.assertEqual(_parse_eur_amount("1.234,56"), 1234.56)
+        self.assertEqual(_parse_eur_amount("1,234.56"), 1234.56)
+
+    def test_parse_positive_quantity_requires_positive_int(self) -> None:
+        self.assertEqual(_parse_positive_quantity("2"), 2)
+        with self.assertRaises(ValueError):
+            _parse_positive_quantity("0")
+
     def test_dispatch_single_set_analysis_requires_config(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             ok, detail = _dispatch_single_set_analysis_workflow(set_id="76441", chat_id="123")
@@ -197,6 +231,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(update.message.replies)
         text = update.message.replies[-1]
         self.assertIn("/scova", text)
+        self.assertIn("/acquista <set_id> <prezzo>", text)
         self.assertIn("/analizza <set_id>", text)
         self.assertIn("/offerte", text)
         self.assertIn("/collezione", text)
@@ -282,6 +317,56 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Impossibile avviare l'analisi su GitHub", update.message.replies[-1])
         self.assertIn("missing token", update.message.replies[-1])
 
+    async def test_acquista_requires_required_args(self) -> None:
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        await manager.cmd_acquista(update, DummyContext(args=[]))
+
+        self.assertTrue(update.message.replies)
+        self.assertIn("Uso: /acquista", update.message.replies[-1])
+
+    async def test_acquista_registers_purchase_with_auto_set_name(self) -> None:
+        repo = FakeRepo()
+        manager = LegoHunterTelegramBot(
+            repository=repo,
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        await manager.cmd_acquista(update, DummyContext(args=["76441", "34,99", "2"]))
+
+        self.assertIsNotNone(repo.last_purchase_payload)
+        self.assertEqual(repo.last_purchase_payload.get("set_id"), "76441")
+        self.assertEqual(float(repo.last_purchase_payload.get("purchase_price") or 0.0), 34.99)
+        self.assertEqual(int(repo.last_purchase_payload.get("quantity") or 0), 2)
+        self.assertEqual(repo.last_purchase_payload.get("set_name"), "Castello di Hogwarts™: Club dei Duellanti")
+        self.assertTrue(update.message.replies)
+        self.assertIn("Acquisto registrato in collezione", update.message.replies[-1])
+        self.assertIn("Club dei Duellanti", update.message.replies[-1])
+        self.assertIn("Quantita aggiunta: 2", update.message.replies[-1])
+
+    async def test_acquista_uses_set_id_fallback_when_name_not_found(self) -> None:
+        repo = FakeRepo()
+        manager = LegoHunterTelegramBot(
+            repository=repo,
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        await manager.cmd_acquista(update, DummyContext(args=["99999", "10"]))
+
+        self.assertIsNotNone(repo.last_purchase_payload)
+        self.assertEqual(repo.last_purchase_payload.get("set_name"), "LEGO 99999")
+        self.assertTrue(update.message.replies)
+        self.assertIn("Nome set non trovato nello storico", update.message.replies[-1])
+
     async def test_offerte_uses_cloud_cache_in_light_runtime_without_oracle(self) -> None:
         oracle_factory = Mock(return_value=FakeOracle())
         manager = LegoHunterTelegramBot(
@@ -311,6 +396,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
         await manager.cmd_start(DummyUpdate(), DummyContext())
         await manager.cmd_help(DummyUpdate(), DummyContext())
+        await manager.cmd_acquista(DummyUpdate(), DummyContext(args=["76441", "34,99", "1"]))
         await manager.cmd_radar(DummyUpdate(), DummyContext())
         await manager.cmd_cerca(DummyUpdate(), DummyContext(args=["Rivendell"]))
         await manager.cmd_collezione(DummyUpdate(), DummyContext())
