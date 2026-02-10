@@ -3217,10 +3217,28 @@ class DiscoveryOracle:
             persist=persist,
             top_limit=top_limit,
             fallback_limit=3,
+            exclude_owned=True,
         )
         if include_low_confidence:
             return report["selected"][:top_limit]
         return report["above_threshold"][:top_limit]
+
+    def _load_owned_set_ids(self) -> set[str]:
+        get_portfolio = getattr(self.repository, "get_portfolio", None)
+        if not callable(get_portfolio):
+            return set()
+        try:
+            rows = get_portfolio("holding")
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Owned-set filter unavailable: get_portfolio failed: %s", exc)
+            return set()
+
+        owned: set[str] = set()
+        for row in rows or []:
+            set_id = str((row or {}).get("set_id") or "").strip()
+            if set_id:
+                owned.add(set_id)
+        return owned
 
     async def discover_with_diagnostics(
         self,
@@ -3228,15 +3246,17 @@ class DiscoveryOracle:
         persist: bool = True,
         top_limit: int = 25,
         fallback_limit: int = 3,
+        exclude_owned: bool = True,
     ) -> Dict[str, Any]:
         """Run discovery and return picks plus execution diagnostics."""
         self._openrouter_recovery_attempted = False
         LOGGER.info(
-            "Discovery start | persist=%s top_limit=%s fallback_limit=%s threshold=%s",
+            "Discovery start | persist=%s top_limit=%s fallback_limit=%s threshold=%s exclude_owned=%s",
             persist,
             top_limit,
             fallback_limit,
             self.min_composite_score,
+            exclude_owned,
         )
         source_candidates = await self._collect_source_candidates()
         source_diagnostics = self._last_source_diagnostics
@@ -3248,6 +3268,27 @@ class DiscoveryOracle:
             source_diagnostics.get("anti_bot_alert"),
         )
         ranked = await self._rank_and_persist_candidates(source_candidates, persist=persist)
+        ranked_total_pre_owned = len(ranked)
+        owned_set_ids: set[str] = set()
+        excluded_owned_count = 0
+        if exclude_owned:
+            owned_set_ids = self._load_owned_set_ids()
+            if owned_set_ids:
+                filtered_ranked = [
+                    row
+                    for row in ranked
+                    if str(row.get("set_id") or "").strip() not in owned_set_ids
+                ]
+                excluded_owned_count = len(ranked) - len(filtered_ranked)
+                ranked = filtered_ranked
+                if excluded_owned_count > 0:
+                    LOGGER.info(
+                        "Owned-set exclusion applied | owned=%s excluded=%s ranked_before=%s ranked_after=%s",
+                        len(owned_set_ids),
+                        excluded_owned_count,
+                        ranked_total_pre_owned,
+                        len(ranked),
+                    )
 
         ranked.sort(
             key=lambda row: (
@@ -3418,6 +3459,10 @@ class DiscoveryOracle:
             "source_signals": source_diagnostics.get("source_signals", {}),
             "dedup_candidates": source_diagnostics["dedup_candidates"],
             "ranked_candidates": len(ranked),
+            "ranked_candidates_pre_owned_filter": ranked_total_pre_owned,
+            "owned_filter_enabled": bool(exclude_owned),
+            "owned_holding_count": len(owned_set_ids),
+            "owned_excluded_count": excluded_owned_count,
             "above_threshold_count": len(above_threshold),
             "above_threshold_high_confidence_count": len(above_threshold_high_conf),
             "above_threshold_high_confidence_strict_count": len(above_threshold_high_conf_strict),

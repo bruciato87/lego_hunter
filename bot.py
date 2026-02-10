@@ -329,6 +329,7 @@ class LegoHunterTelegramBot:
             BotCommand("start", "Attiva il bot e mostra guida rapida"),
             BotCommand("scova", "Scopre i migliori set da monitorare/acquistare"),
             BotCommand("acquista", "Registra acquisto in collezione: /acquista 76441 34,99"),
+            BotCommand("venduto", "Registra vendita e aggiorna collezione: /venduto 76441 89,90"),
             BotCommand("analizza", "Analisi approfondita set su GitHub Actions: /analizza 76441"),
             BotCommand("radar", "Mostra le opportunita' piu' forti in radar"),
             BotCommand("cerca", "Cerca un set nel radar: /cerca 75367"),
@@ -356,6 +357,7 @@ class LegoHunterTelegramBot:
             "Comandi principali:\n"
             "/scova - Discovery completa (LEGO + Amazon + ranking AI) e Top Picks del ciclo.\n"
             "/acquista <set_id> <prezzo> [quantita] - Registra un acquisto in collezione (es. /acquista 76441 34,99 1).\n"
+            "/venduto <set_id> <prezzo_vendita> [quantita] [piattaforma] - Registra una vendita e aggiorna la collezione (es. /venduto 76441 89,90 1 ebay).\n"
             "/analizza <set_id> - Avvia su GitHub un'analisi approfondita singolo set (es. /analizza 76441).\n"
             "/radar - Mostra le opportunita' gia' in Opportunity Radar, ordinate per score.\n"
             "/cerca <id|nome|tema> - Cerca set nel radar (es. /cerca 75367).\n"
@@ -372,6 +374,7 @@ class LegoHunterTelegramBot:
             "/sell_signal -> /vendi\n\n"
             "Esempi rapidi:\n"
             "/acquista 76441 34,99\n"
+            "/venduto 76441 89,90\n"
             "/analizza 76441\n"
             "/cerca millennium falcon\n"
             "/cerca 10332\n"
@@ -390,6 +393,7 @@ class LegoHunterTelegramBot:
                 persist=True,
                 top_limit=20,
                 fallback_limit=3,
+                exclude_owned=True,
             )
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("Discovery failed")
@@ -515,6 +519,84 @@ class LegoHunterTelegramBot:
         ]
         if not name_auto_resolved:
             lines.append("ℹ️ Nome set non trovato nello storico: usato fallback dal codice set.")
+        await update.message.reply_text("\n".join(lines))
+
+    async def cmd_venduto(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "Uso: /venduto <set_id> <prezzo_vendita> [quantita] [piattaforma]\n"
+                "Esempio: /venduto 76441 89,90 1 ebay"
+            )
+            return
+
+        set_id = _normalize_set_id_token(context.args[0])
+        if not set_id:
+            await update.message.reply_text("Set ID non valido. Esempio corretto: /venduto 76441 89,90 1 ebay")
+            return
+
+        try:
+            sale_price = _parse_eur_amount(context.args[1])
+        except Exception:  # noqa: BLE001
+            await update.message.reply_text("Prezzo vendita non valido. Usa formato numerico, es: 89,90")
+            return
+
+        quantity = 1
+        sale_platform = "telegram_manual"
+        if len(context.args) >= 3:
+            third_arg = str(context.args[2] or "").strip()
+            if re.fullmatch(r"[+-]?\d+", third_arg):
+                try:
+                    quantity = _parse_positive_quantity(third_arg)
+                except Exception:  # noqa: BLE001
+                    await update.message.reply_text("Quantita non valida. Deve essere un intero > 0.")
+                    return
+                if len(context.args) >= 4:
+                    sale_platform = str(context.args[3] or "").strip().lower() or "telegram_manual"
+            else:
+                # Accept shorthand /venduto <set_id> <prezzo> <piattaforma>
+                quantity = 1
+                sale_platform = third_arg.lower() or "telegram_manual"
+
+        try:
+            result = await asyncio.to_thread(
+                self.repository.register_portfolio_sale,
+                set_id=set_id,
+                sale_price=sale_price,
+                quantity=quantity,
+                platform=sale_platform,
+            )
+        except ValueError as exc:
+            await update.message.reply_text(f"Vendita non registrata: {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Failed to register sale in portfolio")
+            await update.message.reply_text(f"Errore registrazione vendita: {exc}")
+            return
+
+        safety = await asyncio.to_thread(self.fiscal_guardian.check_safety_status)
+        sold_units = int(result.get("sold_units") or quantity)
+        gross_amount = float(result.get("gross_amount") or sale_price * sold_units)
+        set_name = str(result.get("set_name") or f"LEGO {set_id}")
+        sold_all = bool(result.get("sold_all"))
+        remaining_qty = int(result.get("remaining_quantity") or 0)
+        effective_platform = str(result.get("platform") or sale_platform or "telegram_manual")
+
+        lines = [
+            "✅ Vendita registrata.",
+            f"📦 {set_name} ({set_id})",
+            f"Prezzo vendita unitario: {self._fmt_eur(sale_price)} | Quantita venduta: {sold_units}",
+            f"Incasso lordo registrato: {self._fmt_eur(gross_amount)} | Piattaforma: {effective_platform}",
+        ]
+        if sold_all:
+            lines.append("📤 Posizione rimossa dalla collezione.")
+        else:
+            lines.append(f"📦 Residuo in collezione: {remaining_qty}")
+        lines.append(
+            f"Fiscal Guard: {safety.get('status')} | {safety.get('message')}"
+        )
         await update.message.reply_text("\n".join(lines))
 
     async def cmd_radar(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1081,6 +1163,14 @@ class LegoHunterTelegramBot:
             f"{int(source_raw.get('amazon_http_fallback', 0))} | "
             f"Dedup: {int(diagnostics.get('dedup_candidates', 0))}"
         )
+        if bool(diagnostics.get("owned_filter_enabled")):
+            lines.append(
+                "📦 Filtro collezione: "
+                f"holding {int(diagnostics.get('owned_holding_count', 0))} | "
+                f"esclusi {int(diagnostics.get('owned_excluded_count', 0))} | "
+                f"ranked {int(diagnostics.get('ranked_candidates', 0))}/"
+                f"{int(diagnostics.get('ranked_candidates_pre_owned_filter', diagnostics.get('ranked_candidates', 0)))}"
+            )
         lines.append(
             f"Soglia composita: {int(diagnostics.get('threshold', 0))} | "
             f"Min Prob: {float(diagnostics.get('min_probability_high_confidence', 0.0)) * 100.0:.0f}% | "
@@ -1285,6 +1375,8 @@ def build_application(
     app.add_handler(CommandHandler("scova", manager.cmd_scova))
     app.add_handler(CommandHandler("acquista", manager.cmd_acquista))
     app.add_handler(CommandHandler("compra", manager.cmd_acquista))
+    app.add_handler(CommandHandler("venduto", manager.cmd_venduto))
+    app.add_handler(CommandHandler("registra_vendita", manager.cmd_venduto))
     app.add_handler(CommandHandler("analizza", manager.cmd_analizza))
     app.add_handler(CommandHandler("analisi", manager.cmd_analizza))
     app.add_handler(CommandHandler("radar", manager.cmd_radar))
@@ -1351,6 +1443,7 @@ async def run_scheduled_cycle(
             persist=True,
             top_limit=12,
             fallback_limit=3,
+            exclude_owned=not bool(requested_single_set_id),
         )
         diagnostics = report.get("diagnostics") or {}
         LOGGER.info(

@@ -340,6 +340,110 @@ class LegoHunterRepository:
         )
         return self.upsert_portfolio_item(record)
 
+    def delete_portfolio_item(self, set_id: str) -> None:
+        key = str(set_id or "").strip()
+        if not key:
+            raise ValueError("set_id mancante")
+
+        self._with_retry(
+            "delete_portfolio_item",
+            lambda: self.client.table("portfolio").delete().eq("set_id", key).execute(),
+        )
+
+    def register_portfolio_sale(
+        self,
+        *,
+        set_id: str,
+        sale_price: float,
+        quantity: int = 1,
+        sale_date: Optional[str] = None,
+        platform: Optional[str] = None,
+        shipping_cost: float = 0.0,
+        fees: float = 0.0,
+        notes: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        key = str(set_id or "").strip()
+        if not key:
+            raise ValueError("set_id mancante")
+
+        existing = self.get_portfolio_item(key)
+        if not existing:
+            raise ValueError("Set non presente in collezione.")
+        if str(existing.get("status") or "holding").strip().lower() != "holding":
+            raise ValueError("Set non in stato holding: impossibile registrare vendita.")
+
+        available_qty = max(0, int(existing.get("quantity") or 0))
+        if available_qty <= 0:
+            raise ValueError("Quantita disponibile non valida in portfolio.")
+
+        sold_qty = max(1, int(quantity or 1))
+        if sold_qty > available_qty:
+            raise ValueError(
+                f"Quantita vendita superiore al possesso: richieste {sold_qty}, disponibili {available_qty}."
+            )
+
+        sale_unit_price = round(max(0.0, float(sale_price or 0.0)), 2)
+        if sale_unit_price <= 0:
+            raise ValueError("Prezzo vendita deve essere positivo.")
+
+        safe_shipping = round(max(0.0, float(shipping_cost or 0.0)), 2)
+        safe_fees = round(max(0.0, float(fees or 0.0)), 2)
+        safe_date = str(sale_date or date.today().isoformat())
+        sale_platform = str(platform or "").strip() or "telegram_manual"
+        gross_amount = round(sale_unit_price * sold_qty, 2)
+
+        fiscal_row = self.insert_fiscal_log(
+            FiscalLogRecord(
+                event_date=safe_date,
+                platform=sale_platform,
+                event_type="sell",
+                set_id=key,
+                units=sold_qty,
+                gross_amount=gross_amount,
+                shipping_cost=safe_shipping,
+                fees=safe_fees,
+                notes=str(notes or "").strip() or None,
+            )
+        )
+
+        remaining_qty = available_qty - sold_qty
+        sold_all = remaining_qty <= 0
+
+        if sold_all:
+            self.delete_portfolio_item(key)
+        else:
+            updated = PortfolioRecord(
+                set_id=key,
+                set_name=str(existing.get("set_name") or key).strip() or key,
+                theme=str(existing.get("theme") or "").strip() or None,
+                purchase_price=round(max(0.0, float(existing.get("purchase_price") or 0.0)), 2),
+                purchase_date=str(existing.get("purchase_date") or safe_date),
+                quantity=remaining_qty,
+                purchase_platform=str(existing.get("purchase_platform") or "").strip() or None,
+                shipping_in_cost=round(max(0.0, float(existing.get("shipping_in_cost") or 0.0)), 2),
+                estimated_market_price=(
+                    float(existing.get("estimated_market_price"))
+                    if existing.get("estimated_market_price") is not None
+                    else None
+                ),
+                status="holding",
+                notes=str(existing.get("notes") or "").strip() or None,
+            )
+            self.upsert_portfolio_item(updated)
+
+        return {
+            "set_id": key,
+            "set_name": str(existing.get("set_name") or key).strip() or key,
+            "sold_units": sold_qty,
+            "sale_unit_price": sale_unit_price,
+            "gross_amount": gross_amount,
+            "remaining_quantity": max(0, remaining_qty),
+            "sold_all": sold_all,
+            "platform": sale_platform,
+            "event_date": safe_date,
+            "fiscal_log_id": fiscal_row.get("id") if isinstance(fiscal_row, dict) else None,
+        }
+
     def get_portfolio(self, status: str = "holding") -> list[Dict[str, Any]]:
         result = self._with_retry(
             "get_portfolio",

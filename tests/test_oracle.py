@@ -21,6 +21,7 @@ class FakeRepo:
         self.recent = {}
         self.theme_baselines = {}
         self.recent_ai_insights = {}
+        self.holdings = []
 
     def upsert_opportunity(self, record):  # noqa: ANN001
         self.upserted.append(record)
@@ -60,6 +61,11 @@ class FakeRepo:
             for set_id in set_ids
             if str(set_id) in self.recent_ai_insights
         }
+
+    def get_portfolio(self, status="holding"):  # noqa: ANN001
+        if status != "holding":
+            return []
+        return list(self.holdings)
 
 
 class DummyOracle(DiscoveryOracle):
@@ -816,6 +822,43 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(int(row["composite_score"]), 100)
         self.assertIn("threshold_profile", diagnostics)
         self.assertIn("backtest_runtime", diagnostics)
+
+    async def test_discovery_excludes_owned_sets_from_results(self) -> None:
+        repo = FakeRepo()
+        repo.holdings = [{"set_id": "75367"}]
+        candidates = [
+            {
+                "set_id": "75367",
+                "set_name": "Owned set",
+                "theme": "Star Wars",
+                "source": "lego_proxy_reader",
+                "current_price": 129.99,
+                "metadata": {},
+                "mock_score": 90,
+            },
+            {
+                "set_id": "10332",
+                "set_name": "Candidate set",
+                "theme": "Icons",
+                "source": "lego_proxy_reader",
+                "current_price": 229.99,
+                "metadata": {},
+                "mock_score": 88,
+            },
+        ]
+        oracle = DummyOracle(repo, candidates)
+        oracle.min_composite_score = 1
+        oracle.ai_no_signal_on_low_strict_pass = False
+
+        report = await oracle.discover_with_diagnostics(persist=False, top_limit=10, fallback_limit=3)
+        diagnostics = report["diagnostics"]
+
+        ranked_ids = {str(row.get("set_id") or "") for row in report["ranked"]}
+        selected_ids = {str(row.get("set_id") or "") for row in report["selected"]}
+        self.assertNotIn("75367", ranked_ids)
+        self.assertNotIn("75367", selected_ids)
+        self.assertEqual(int(diagnostics.get("owned_holding_count") or 0), 1)
+        self.assertEqual(int(diagnostics.get("owned_excluded_count") or 0), 1)
 
     async def test_discovery_diagnostics_expose_shortlist_quality_separately_from_total(self) -> None:
         repo = FakeRepo()

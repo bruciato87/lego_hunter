@@ -43,6 +43,7 @@ class DummyContext:
 class FakeRepo:
     def __init__(self) -> None:
         self.last_purchase_payload = None
+        self.last_sale_payload = None
 
     def get_top_opportunities(self, limit=8, min_score=50):  # noqa: ANN001
         return [
@@ -107,6 +108,26 @@ class FakeRepo:
             "status": "holding",
         }
 
+    def register_portfolio_sale(self, **kwargs):  # noqa: ANN003
+        self.last_sale_payload = dict(kwargs)
+        set_id = str(kwargs.get("set_id") or "").strip()
+        if set_id != "76441":
+            raise ValueError("Set non presente in collezione.")
+
+        sold_units = int(kwargs.get("quantity") or 1)
+        sale_price = float(kwargs.get("sale_price") or 0.0)
+        remaining = max(0, 3 - sold_units)
+        return {
+            "set_id": set_id,
+            "set_name": "Castello di Hogwarts™: Club dei Duellanti",
+            "sold_units": sold_units,
+            "sale_unit_price": sale_price,
+            "gross_amount": round(sale_price * sold_units, 2),
+            "remaining_quantity": remaining,
+            "sold_all": remaining == 0,
+            "platform": str(kwargs.get("platform") or "telegram_manual"),
+        }
+
 
 class FakeOracle:
     async def discover_opportunities(self, persist=True, top_limit=20):  # noqa: ANN001
@@ -131,7 +152,13 @@ class FakeOracle:
             }
         ]
 
-    async def discover_with_diagnostics(self, persist=True, top_limit=12, fallback_limit=3):  # noqa: ANN001
+    async def discover_with_diagnostics(
+        self,
+        persist=True,
+        top_limit=12,
+        fallback_limit=3,
+        exclude_owned=True,
+    ):  # noqa: ANN001
         return {
             "selected": [],
             "diagnostics": {
@@ -232,6 +259,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         text = update.message.replies[-1]
         self.assertIn("/scova", text)
         self.assertIn("/acquista <set_id> <prezzo>", text)
+        self.assertIn("/venduto <set_id> <prezzo_vendita>", text)
         self.assertIn("/analizza <set_id>", text)
         self.assertIn("/offerte", text)
         self.assertIn("/collezione", text)
@@ -367,6 +395,86 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(update.message.replies)
         self.assertIn("Nome set non trovato nello storico", update.message.replies[-1])
 
+    async def test_venduto_requires_required_args(self) -> None:
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        await manager.cmd_venduto(update, DummyContext(args=[]))
+
+        self.assertTrue(update.message.replies)
+        self.assertIn("Uso: /venduto", update.message.replies[-1])
+
+    async def test_venduto_registers_sale_and_removes_position(self) -> None:
+        repo = FakeRepo()
+        manager = LegoHunterTelegramBot(
+            repository=repo,
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        await manager.cmd_venduto(update, DummyContext(args=["76441", "89,90", "3", "ebay"]))
+
+        self.assertIsNotNone(repo.last_sale_payload)
+        self.assertEqual(repo.last_sale_payload.get("set_id"), "76441")
+        self.assertEqual(float(repo.last_sale_payload.get("sale_price") or 0.0), 89.9)
+        self.assertEqual(int(repo.last_sale_payload.get("quantity") or 0), 3)
+        self.assertEqual(repo.last_sale_payload.get("platform"), "ebay")
+        self.assertTrue(update.message.replies)
+        reply = update.message.replies[-1]
+        self.assertIn("Vendita registrata", reply)
+        self.assertIn("Posizione rimossa dalla collezione", reply)
+        self.assertIn("Fiscal Guard: GREEN", reply)
+
+    async def test_venduto_partial_sale_updates_remaining(self) -> None:
+        repo = FakeRepo()
+        manager = LegoHunterTelegramBot(
+            repository=repo,
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        await manager.cmd_venduto(update, DummyContext(args=["76441", "89,90", "2"]))
+
+        self.assertIsNotNone(repo.last_sale_payload)
+        self.assertEqual(int(repo.last_sale_payload.get("quantity") or 0), 2)
+        self.assertTrue(update.message.replies)
+        self.assertIn("Residuo in collezione: 1", update.message.replies[-1])
+
+    async def test_venduto_rejects_negative_quantity(self) -> None:
+        repo = FakeRepo()
+        manager = LegoHunterTelegramBot(
+            repository=repo,
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        await manager.cmd_venduto(update, DummyContext(args=["76441", "89,90", "-1"]))
+
+        self.assertTrue(update.message.replies)
+        self.assertIn("Quantita non valida", update.message.replies[-1])
+        self.assertIsNone(repo.last_sale_payload)
+
+    async def test_venduto_reports_when_set_not_in_collection(self) -> None:
+        repo = FakeRepo()
+        manager = LegoHunterTelegramBot(
+            repository=repo,
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        await manager.cmd_venduto(update, DummyContext(args=["99999", "50"]))
+
+        self.assertTrue(update.message.replies)
+        self.assertIn("Vendita non registrata", update.message.replies[-1])
+
     async def test_offerte_uses_cloud_cache_in_light_runtime_without_oracle(self) -> None:
         oracle_factory = Mock(return_value=FakeOracle())
         manager = LegoHunterTelegramBot(
@@ -397,6 +505,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await manager.cmd_start(DummyUpdate(), DummyContext())
         await manager.cmd_help(DummyUpdate(), DummyContext())
         await manager.cmd_acquista(DummyUpdate(), DummyContext(args=["76441", "34,99", "1"]))
+        await manager.cmd_venduto(DummyUpdate(), DummyContext(args=["76441", "49,99"]))
         await manager.cmd_radar(DummyUpdate(), DummyContext())
         await manager.cmd_cerca(DummyUpdate(), DummyContext(args=["Rivendell"]))
         await manager.cmd_collezione(DummyUpdate(), DummyContext())
@@ -856,7 +965,13 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_scheduled_cycle_can_send_single_set_analysis_report(self) -> None:
         class SingleSetOracle(FakeOracle):
-            async def discover_with_diagnostics(self, persist=True, top_limit=12, fallback_limit=3):  # noqa: ANN001
+            async def discover_with_diagnostics(
+                self,
+                persist=True,
+                top_limit=12,
+                fallback_limit=3,
+                exclude_owned=True,
+            ):  # noqa: ANN001
                 return {
                     "selected": [],
                     "above_threshold": [],
