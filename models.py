@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 import random
@@ -95,12 +97,43 @@ class LegoHunterRepository:
     @classmethod
     def from_env(cls) -> "LegoHunterRepository":
         supabase_url = os.getenv("SUPABASE_URL")
-        supabase_key = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
+        supabase_service_role_key = (
+            os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+            or os.getenv("SUPABASE_SERVICE_KEY")
+            or ""
+        )
+        supabase_key = supabase_service_role_key or os.getenv("SUPABASE_KEY") or ""
 
         if not supabase_url or not supabase_key:
-            raise RuntimeError("Missing SUPABASE_URL/SUPABASE_KEY environment variables")
+            raise RuntimeError(
+                "Missing SUPABASE_URL and Supabase key. "
+                "Set SUPABASE_SERVICE_ROLE_KEY (recommended) or SUPABASE_KEY."
+            )
+
+        if not supabase_service_role_key and cls._looks_like_anon_jwt(str(supabase_key)):
+            LOGGER.warning(
+                "Using SUPABASE_KEY that appears to be anon/publishable key. "
+                "With RLS enabled this can fail or be blocked. "
+                "Set SUPABASE_SERVICE_ROLE_KEY for backend jobs/webhooks."
+            )
 
         return cls(supabase_url=supabase_url, supabase_key=supabase_key)
+
+    @staticmethod
+    def _looks_like_anon_jwt(token: str) -> bool:
+        raw = str(token or "").strip()
+        parts = raw.split(".")
+        if len(parts) != 3:
+            return False
+        payload = parts[1]
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        try:
+            decoded = base64.urlsafe_b64decode(payload.encode("utf-8")).decode("utf-8")
+            claims = json.loads(decoded)
+        except Exception:  # noqa: BLE001
+            return False
+        role = str(claims.get("role") or "").strip().lower()
+        return role in {"anon", "authenticated"}
 
     def _with_retry(self, operation_name: str, fn):
         last_exc: Optional[Exception] = None

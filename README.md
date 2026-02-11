@@ -46,7 +46,8 @@ python bot.py --mode scheduled
 
 ## Variabili ambiente richieste
 - `SUPABASE_URL`
-- `SUPABASE_KEY`
+- `SUPABASE_SERVICE_ROLE_KEY` (raccomandata per backend con RLS attiva)
+- `SUPABASE_KEY` (fallback legacy; evitare chiave anon in backend)
 - `TELEGRAM_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `TELEGRAM_WEBHOOK_SECRET` (obbligatoria per endpoint webhook su Vercel)
@@ -116,6 +117,9 @@ curl -s https://<tuo-progetto>.vercel.app/healthz
 ## Database
 Eseguire lo script SQL:
 - `supabase_schema.sql`
+
+Per progetti Supabase gia' esistenti (migrazione sicurezza RLS senza ricreare tabelle):
+- `supabase_rls_hardening.sql`
 
 ## Seed storico (Data Moat bootstrap)
 - Il ranking usa un prior storico da `data/historical_seed/historical_reference_cases.csv`.

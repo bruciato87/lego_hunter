@@ -104,3 +104,61 @@ for each row execute function public.touch_updated_at();
 create trigger trg_portfolio_updated_at
 before update on public.portfolio
 for each row execute function public.touch_updated_at();
+
+-- Security hardening: enable RLS on all public tables exposed by PostgREST.
+alter table public.opportunity_radar enable row level security;
+alter table public.market_time_series enable row level security;
+alter table public.portfolio enable row level security;
+alter table public.fiscal_log enable row level security;
+
+-- Service-role backend access only (GitHub Actions / webhook backend).
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = 'opportunity_radar' and policyname = 'service_role_full_access_opportunity_radar'
+  ) then
+    create policy service_role_full_access_opportunity_radar
+      on public.opportunity_radar
+      for all
+      to service_role
+      using (true)
+      with check (true);
+  end if;
+
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = 'market_time_series' and policyname = 'service_role_full_access_market_time_series'
+  ) then
+    create policy service_role_full_access_market_time_series
+      on public.market_time_series
+      for all
+      to service_role
+      using (true)
+      with check (true);
+  end if;
+
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = 'portfolio' and policyname = 'service_role_full_access_portfolio'
+  ) then
+    create policy service_role_full_access_portfolio
+      on public.portfolio
+      for all
+      to service_role
+      using (true)
+      with check (true);
+  end if;
+
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = 'fiscal_log' and policyname = 'service_role_full_access_fiscal_log'
+  ) then
+    create policy service_role_full_access_fiscal_log
+      on public.fiscal_log
+      for all
+      to service_role
+      using (true)
+      with check (true);
+  end if;
+end $$;
