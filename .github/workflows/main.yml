@@ -132,7 +132,7 @@ jobs:
           GEMINI_FREE_TIER_ONLY: "true"
           OPENROUTER_FREE_TIER_ONLY: "true"
           DISCOVERY_SOURCE_MODE: external_first
-          AI_RANK_MAX_CANDIDATES: "14"
+          AI_RANK_MAX_CANDIDATES: "3"
           AI_SCORING_HARD_BUDGET_SEC: "90"
           AI_TIMEOUT_RECOVERY_PROBES: "2"
           AI_FAST_FAIL_ENABLED: "true"
@@ -141,21 +141,25 @@ jobs:
           AI_BATCH_MAX_CANDIDATES: "12"
           AI_SINGLE_CALL_SCORING_ENABLED: "true"
           AI_SINGLE_CALL_ALLOW_REPAIR_CALLS: "true"
-          AI_SINGLE_CALL_MAX_CANDIDATES: "16"
-          AI_SINGLE_CALL_BATCH_CHUNK_SIZE: "6"
-          AI_SINGLE_CALL_BATCH_MAX_CALLS: "3"
-          AI_SINGLE_CALL_DEGRADED_BATCH_CHUNK_SIZE: "4"
-          AI_SINGLE_CALL_DEGRADED_BATCH_MAX_CALLS: "4"
-          AI_SINGLE_CALL_MISSING_RESCUE_ENABLED: "true"
+          AI_SINGLE_CALL_MAX_CANDIDATES: "3"
+          AI_SINGLE_CALL_BATCH_CHUNK_SIZE: "3"
+          AI_SINGLE_CALL_BATCH_MAX_CALLS: "1"
+          AI_SINGLE_CALL_DEGRADED_BATCH_CHUNK_SIZE: "3"
+          AI_SINGLE_CALL_DEGRADED_BATCH_MAX_CALLS: "1"
+          AI_SINGLE_CALL_MISSING_RESCUE_ENABLED: "false"
           AI_SINGLE_CALL_MISSING_RESCUE_MAX_CANDIDATES: "3"
           AI_SINGLE_CALL_MISSING_RESCUE_TIMEOUT_SEC: "10"
+          AI_STRICT_FINAL_TOP_K_ONLY: "true"
+          AI_STRICT_FINAL_TOP_K: "3"
+          AI_NON_SHORTLIST_CACHE_RESCUE_ENABLED: "false"
+          AI_SINGLE_CALL_SECONDARY_BATCH_ENABLED: "false"
           AI_PROBE_STRICT_REPROBE_ENABLED: "true"
           AI_PROBE_STRICT_MAX_CANDIDATES: "22"
           AI_PROBE_STRICT_BUDGET_SEC: "32"
           AI_PROBE_STRICT_TIMEOUT_SEC: "8"
           AI_PROBE_STRICT_EARLY_SUCCESSES: "1"
-          AI_CACHE_TTL_SEC: ${{ github.event.inputs.disable_ai_cache == 'true' && '0' || '10800' }}
-          AI_PERSISTED_CACHE_TTL_SEC: ${{ github.event.inputs.disable_ai_cache == 'true' && '0' || '129600' }}
+          AI_INSIGHT_CACHE_TTL_SEC: ${{ github.event.inputs.disable_ai_cache == 'true' && '0' || '86400' }}
+          AI_PERSISTED_CACHE_TTL_SEC: ${{ github.event.inputs.disable_ai_cache == 'true' && '0' || '172800' }}
           AI_SCORE_GUARDRAIL_ENABLED: "true"
           AI_SCORE_SOFT_CAP: "95"
           AI_SCORE_SOFT_CAP_FACTOR: "0.35"
@@ -166,6 +170,7 @@ jobs:
           AI_MODEL_QUALITY_MIN_TRUST_RATE: "0.60"
           AI_MODEL_QUALITY_MAX_NON_JSON_RATE: "0.20"
           AI_NON_JSON_CACHE_TTL_SEC: "7200"
+          AI_NON_JSON_RESCORE_ENABLED: "false"
           AI_NON_JSON_RESCORE_MAX_CANDIDATES: "6"
           AI_NON_JSON_RESCORE_MIN_COMPOSITE: "62"
           BOOTSTRAP_THRESHOLDS_ENABLED: "true"
@@ -185,6 +190,6 @@ jobs:
         run: |
           echo "AI cache debug mode: disable_ai_cache=${{ github.event.inputs.disable_ai_cache || 'false' }}"
           echo "On-demand set analysis: analysis_set_id='${{ github.event.inputs.analysis_set_id || '' }}'"
-          echo "AI_CACHE_TTL_SEC=${AI_CACHE_TTL_SEC}"
+          echo "AI_INSIGHT_CACHE_TTL_SEC=${AI_INSIGHT_CACHE_TTL_SEC}"
           echo "AI_PERSISTED_CACHE_TTL_SEC=${AI_PERSISTED_CACHE_TTL_SEC}"
           python bot.py --mode scheduled

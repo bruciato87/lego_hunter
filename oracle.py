@@ -159,6 +159,8 @@ DEFAULT_AI_DYNAMIC_SHORTLIST_FLOOR = 4
 DEFAULT_AI_DYNAMIC_SHORTLIST_MULTI_MODEL_FLOOR = 5
 DEFAULT_AI_DYNAMIC_SHORTLIST_PER_MODEL = 2
 DEFAULT_AI_DYNAMIC_SHORTLIST_BONUS = 1
+DEFAULT_AI_STRICT_FINAL_TOP_K_ONLY = False
+DEFAULT_AI_STRICT_FINAL_TOP_K = 3
 DEFAULT_AI_TOP_PICK_RESCUE_ENABLED = True
 DEFAULT_AI_TOP_PICK_RESCUE_COUNT = 3
 DEFAULT_AI_TOP_PICK_RESCUE_TIMEOUT_SEC = 9.0
@@ -513,6 +515,16 @@ class DiscoveryOracle:
             default=DEFAULT_AI_DYNAMIC_SHORTLIST_BONUS,
             minimum=0,
             maximum=8,
+        )
+        self.ai_strict_final_top_k_only = self._safe_env_bool(
+            "AI_STRICT_FINAL_TOP_K_ONLY",
+            default=DEFAULT_AI_STRICT_FINAL_TOP_K_ONLY,
+        )
+        self.ai_strict_final_top_k = self._safe_env_int(
+            "AI_STRICT_FINAL_TOP_K",
+            default=DEFAULT_AI_STRICT_FINAL_TOP_K,
+            minimum=1,
+            maximum=6,
         )
         self.ai_cache_ttl_sec = self._safe_env_float(
             "AI_INSIGHT_CACHE_TTL_SEC",
@@ -1305,6 +1317,11 @@ class DiscoveryOracle:
             self.ai_single_call_secondary_batch_max_rounds,
             self.ai_single_call_secondary_batch_min_budget_sec,
             self.ai_single_call_secondary_batch_timeout_sec,
+        )
+        LOGGER.info(
+            "AI shortlist policy | strict_top_k_only=%s strict_top_k=%s",
+            self.ai_strict_final_top_k_only,
+            self.ai_strict_final_top_k,
         )
         LOGGER.info(
             "Non-JSON tuning | cache_ttl_sec=%.0f rescore_enabled=%s rescore_max=%s rescore_min_composite=%s rescore_min_budget_sec=%.1f rescore_timeout_sec=%.1f",
@@ -4386,7 +4403,7 @@ class DiscoveryOracle:
             "ai_non_json_rescore_skipped_budget": 0,
         }
 
-        if skipped and self.ai_non_shortlist_cache_rescue_enabled:
+        if skipped and self.ai_non_shortlist_cache_rescue_enabled and (not self.ai_strict_final_top_k_only):
             skipped_candidates = [row.get("candidate") or {} for row in skipped]
             post_shortlist_stats["ai_skip_cache_primed"] = int(self._prime_ai_cache_from_repository(skipped_candidates))
             for row in skipped:
@@ -4404,7 +4421,12 @@ class DiscoveryOracle:
                 row["ai_source_origin"] = "cache_skip"
                 post_shortlist_stats["ai_skip_cache_rescued"] += 1
 
-        if skipped and self.ai_single_call_scoring_enabled and self.ai_single_call_secondary_batch_enabled:
+        if (
+            skipped
+            and self.ai_single_call_scoring_enabled
+            and self.ai_single_call_secondary_batch_enabled
+            and (not self.ai_strict_final_top_k_only)
+        ):
             if self._external_ai_available():
                 attempted_set_ids: set[str] = set()
                 min_budget = float(self.ai_single_call_secondary_batch_min_budget_sec)
@@ -4548,12 +4570,19 @@ class DiscoveryOracle:
             skipped_set_ids=skipped_set_ids,
             shortlist_count=len(shortlist),
         )
-        non_json_rescore_stats = await self._rescore_non_json_high_priority(
-            prepared=prepared,
-            ranked=ranked,
-            ai_results=ai_results,
-            ai_started=ai_started,
-        )
+        if self.ai_strict_final_top_k_only:
+            non_json_rescore_stats: Dict[str, int] = {}
+            LOGGER.info(
+                "AI non-JSON rescore skipped | reason=strict_top_k_only top_k=%s",
+                self.ai_strict_final_top_k,
+            )
+        else:
+            non_json_rescore_stats = await self._rescore_non_json_high_priority(
+                prepared=prepared,
+                ranked=ranked,
+                ai_results=ai_results,
+                ai_started=ai_started,
+            )
         for key in (
             "ai_non_json_rescore_attempted",
             "ai_non_json_rescore_candidates",
@@ -4600,7 +4629,8 @@ class DiscoveryOracle:
                 )
 
             # Always guarantee at least a top-3 external AI attempt before accepting fallback.
-            guarantee_count = max(3, int(self.ai_final_pick_guarantee_count))
+            guarantee_floor = int(self.ai_strict_final_top_k) if self.ai_strict_final_top_k_only else 3
+            guarantee_count = max(guarantee_floor, int(self.ai_final_pick_guarantee_count))
             guarantee_rounds = max(1, int(self.ai_final_pick_guarantee_rounds))
             for _ in range(guarantee_rounds):
                 top_rows = sorted(
@@ -5189,6 +5219,7 @@ class DiscoveryOracle:
                     deadline=batch_deadline,
                     allow_repair_calls=bool(self.ai_single_call_allow_repair_calls),
                     output_mode=batch_output_mode,
+                    strict_only=bool(self.ai_strict_model_required_main_shortlist),
                 )
                 if batch_error:
                     LOGGER.warning(
@@ -5388,6 +5419,22 @@ class DiscoveryOracle:
     def _select_ai_shortlist(self, prepared: list[Dict[str, Any]]) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
         if not prepared:
             return [], []
+
+        if self.ai_strict_final_top_k_only:
+            strict_top_k = min(len(prepared), max(1, int(self.ai_strict_final_top_k)))
+            shortlist = prepared[:strict_top_k]
+            skipped = prepared[strict_top_k:]
+            for row in shortlist:
+                row["ai_shortlisted"] = True
+            if skipped:
+                LOGGER.info(
+                    "AI shortlist strict-top-k policy applied | candidates=%s selected=%s skipped=%s top_k=%s",
+                    len(prepared),
+                    len(shortlist),
+                    len(skipped),
+                    strict_top_k,
+                )
+            return shortlist, skipped
 
         if self.ai_single_call_scoring_enabled:
             shortlist_cap = self._effective_ai_single_call_shortlist_cap(len(prepared))

@@ -617,6 +617,22 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         cap = oracle._effective_ai_single_call_shortlist_cap(41)
         self.assertEqual(cap, 15)
 
+    def test_select_ai_shortlist_respects_strict_top_k_policy(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_single_call_scoring_enabled = True
+        oracle.ai_single_call_max_candidates = 12
+        oracle.ai_strict_final_top_k_only = True
+        oracle.ai_strict_final_top_k = 3
+        prepared = [{"set_id": f"p{idx}", "ai_shortlisted": False} for idx in range(1, 6)]
+
+        shortlist, skipped = oracle._select_ai_shortlist(prepared)
+
+        self.assertEqual(len(shortlist), 3)
+        self.assertEqual(len(skipped), 2)
+        self.assertTrue(all(bool(row.get("ai_shortlisted")) for row in shortlist))
+        self.assertTrue(all(not bool(row.get("ai_shortlisted")) for row in skipped))
+
     def test_success_patterns_summary_uses_top_two_signals(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
@@ -3024,6 +3040,91 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         ranked_by_set = {str(row.get("set_id")): row for row in ranked}
         self.assertFalse(bool(ranked_by_set["14002"].get("ai_fallback_used")))
         self.assertGreaterEqual(int(oracle._last_ranking_diagnostics.get("ai_skip_cache_rescued") or 0), 1)
+        self.assertEqual(int(oracle._last_ranking_diagnostics.get("ai_secondary_batch_attempted") or 0), 0)
+
+    async def test_rank_flow_strict_top_k_only_skips_cache_rescue_for_non_shortlisted(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_single_call_scoring_enabled = True
+        oracle.ai_top_pick_rescue_enabled = False
+        oracle.ai_single_call_secondary_batch_enabled = True
+        oracle.ai_non_shortlist_cache_rescue_enabled = True
+        oracle.ai_strict_final_top_k_only = True
+        oracle.ai_strict_final_top_k = 1
+        repo.recent_ai_insights["15002"] = {
+            "ai_investment_score": 79,
+            "ai_analysis_summary": "cached insight",
+            "eol_date_prediction": "2026-06-01",
+            "metadata": {
+                "ai_raw_score": 79,
+                "ai_confidence": "HIGH_CONFIDENCE",
+                "ai_fallback_used": False,
+                "ai_strict_pass": True,
+            },
+        }
+
+        source_candidates = [
+            {"set_id": "15001"},
+            {"set_id": "15002"},
+            {"set_id": "15003"},
+        ]
+        prepared = []
+        for idx, set_id in enumerate(("15001", "15002", "15003"), start=1):
+            candidate = {
+                "set_id": set_id,
+                "set_name": f"Set {set_id}",
+                "theme": "City",
+                "source": "lego_proxy_reader",
+                "current_price": 39.99 + idx,
+                "eol_date_prediction": "2026-10-01",
+                "metadata": {},
+            }
+            forecast = oracle.forecaster.forecast(candidate=candidate, history_rows=[], theme_baseline={})
+            prepared.append(
+                {
+                    "candidate": candidate,
+                    "set_id": set_id,
+                    "theme": candidate["theme"],
+                    "forecast": forecast,
+                    "history_30": [],
+                    "prefilter_score": 100 - (idx * 10),
+                    "prefilter_rank": idx,
+                    "ai_shortlisted": idx == 1,
+                }
+            )
+        shortlist = [prepared[0]]
+        skipped = [prepared[1], prepared[2]]
+        ai_stats = {
+            "ai_scored_count": 1,
+            "ai_batch_scored_count": 0,
+            "ai_cache_hits": 0,
+            "ai_cache_misses": 1,
+            "ai_persisted_cache_hits": 0,
+            "ai_errors": 0,
+            "ai_budget_exhausted": 0,
+            "ai_timeout_count": 0,
+        }
+        initial_ai_results = {
+            "15001": AIInsight(
+                score=74,
+                summary="primary",
+                predicted_eol_date="2026-10-01",
+                fallback_used=False,
+                confidence="HIGH_CONFIDENCE",
+            )
+        }
+
+        with (
+            patch.object(oracle, "_prepare_quantitative_context", return_value=prepared),
+            patch.object(oracle, "_select_ai_shortlist", return_value=(shortlist, skipped)),
+            patch.object(oracle, "_score_ai_shortlist", new=AsyncMock(return_value=(initial_ai_results, ai_stats))),
+            patch.object(oracle, "_is_ai_score_collapse", return_value=False),
+        ):
+            ranked = await oracle._rank_and_persist_candidates(source_candidates, persist=False)
+
+        ranked_by_set = {str(row.get("set_id")): row for row in ranked}
+        self.assertTrue(bool(ranked_by_set["15002"].get("ai_fallback_used")))
+        self.assertEqual(int(oracle._last_ranking_diagnostics.get("ai_skip_cache_rescued") or 0), 0)
         self.assertEqual(int(oracle._last_ranking_diagnostics.get("ai_secondary_batch_attempted") or 0), 0)
 
     async def test_single_call_scoring_uses_chunked_batches(self) -> None:
