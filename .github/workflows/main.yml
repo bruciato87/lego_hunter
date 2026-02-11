@@ -149,6 +149,11 @@ jobs:
           AI_SINGLE_CALL_MISSING_RESCUE_ENABLED: "true"
           AI_SINGLE_CALL_MISSING_RESCUE_MAX_CANDIDATES: "3"
           AI_SINGLE_CALL_MISSING_RESCUE_TIMEOUT_SEC: "10"
+          AI_PROBE_STRICT_REPROBE_ENABLED: "true"
+          AI_PROBE_STRICT_MAX_CANDIDATES: "22"
+          AI_PROBE_STRICT_BUDGET_SEC: "32"
+          AI_PROBE_STRICT_TIMEOUT_SEC: "8"
+          AI_PROBE_STRICT_EARLY_SUCCESSES: "1"
           AI_CACHE_TTL_SEC: ${{ github.event.inputs.disable_ai_cache == 'true' && '0' || '10800' }}
           AI_PERSISTED_CACHE_TTL_SEC: ${{ github.event.inputs.disable_ai_cache == 'true' && '0' || '129600' }}
           AI_SCORE_GUARDRAIL_ENABLED: "true"
@@ -156,7 +161,8 @@ jobs:
           AI_SCORE_SOFT_CAP_FACTOR: "0.35"
           AI_LOW_CONFIDENCE_SCORE_CAP: "90"
           AI_NON_JSON_SCORE_CAP: "85"
-          AI_NON_JSON_TRUST_WEIGHT: "0.15"
+          AI_NON_JSON_TRUST_WEIGHT: "0.00"
+          AI_NO_SIGNAL_MIN_STRICT_PASS_RATE: "0.55"
           AI_MODEL_QUALITY_MIN_TRUST_RATE: "0.60"
           AI_MODEL_QUALITY_MAX_NON_JSON_RATE: "0.20"
           AI_NON_JSON_CACHE_TTL_SEC: "7200"

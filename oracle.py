@@ -5786,6 +5786,19 @@ class DiscoveryOracle:
         entry_by_set: Dict[str, Dict[str, Any]] = {str(row["set_id"]): row for row in shortlist}
         pending_entries: list[Dict[str, Any]] = []
         single_call_mode = bool(self.ai_single_call_scoring_enabled)
+        if (
+            single_call_mode
+            and self.ai_strict_model_required_main_shortlist
+            and self._external_ai_available()
+            and (not self._strict_json_runtime_available())
+        ):
+            single_call_mode = False
+            LOGGER.info(
+                "AI single-call disabled for cycle | reason=strict_model_unavailable strict_required=%s engine=%s model=%s",
+                self.ai_strict_model_required_main_shortlist,
+                str(self.ai_runtime.get("engine") or ""),
+                str(self.ai_runtime.get("model") or ""),
+            )
 
         # First resolve cache hits in a deterministic pass.
         for entry in shortlist:
