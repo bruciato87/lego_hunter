@@ -104,6 +104,9 @@ DEFAULT_AI_NON_JSON_SCORE_CAP = 85
 DEFAULT_AI_NO_SIGNAL_ON_LOW_STRICT_PASS = True
 DEFAULT_AI_NO_SIGNAL_MIN_STRICT_PASS_RATE = 0.50
 DEFAULT_AI_NON_JSON_TRUST_WEIGHT = 0.60
+DEFAULT_AI_STRICT_MODEL_REQUIRED_MAIN_SHORTLIST = True
+DEFAULT_AI_NON_JSON_MODEL_LAST_RESORT_ENABLED = True
+DEFAULT_AI_DISABLE_BOOTSTRAP_WITHOUT_STRICT_MODEL = True
 DEFAULT_AI_MODEL_QUALITY_MIN_TRUST_RATE = 0.45
 DEFAULT_BOOTSTRAP_THRESHOLDS_ENABLED = False
 DEFAULT_BOOTSTRAP_MIN_HISTORY_POINTS = 45
@@ -746,6 +749,18 @@ class DiscoveryOracle:
             minimum=0.0,
             maximum=1.0,
         )
+        self.ai_strict_model_required_main_shortlist = self._safe_env_bool(
+            "AI_STRICT_MODEL_REQUIRED_MAIN_SHORTLIST",
+            default=DEFAULT_AI_STRICT_MODEL_REQUIRED_MAIN_SHORTLIST,
+        )
+        self.ai_non_json_model_last_resort_enabled = self._safe_env_bool(
+            "AI_NON_JSON_MODEL_LAST_RESORT_ENABLED",
+            default=DEFAULT_AI_NON_JSON_MODEL_LAST_RESORT_ENABLED,
+        )
+        self.ai_disable_bootstrap_without_strict_model = self._safe_env_bool(
+            "AI_DISABLE_BOOTSTRAP_WITHOUT_STRICT_MODEL",
+            default=DEFAULT_AI_DISABLE_BOOTSTRAP_WITHOUT_STRICT_MODEL,
+        )
         self.ai_top_pick_rescue_enabled = self._safe_env_bool(
             "AI_TOP_PICK_RESCUE_ENABLED",
             default=DEFAULT_AI_TOP_PICK_RESCUE_ENABLED,
@@ -1079,6 +1094,7 @@ class DiscoveryOracle:
         self._openrouter_model_id: Optional[str] = None
         self._openrouter_candidates: list[str] = []
         self._openrouter_available_candidates: list[str] = []
+        self._openrouter_available_strict_candidates: list[str] = []
         self._openrouter_probe_report: list[Dict[str, Any]] = []
         self._openrouter_candidate_index: Optional[int] = None
         self._openrouter_inventory_loaded = False
@@ -1872,19 +1888,109 @@ class DiscoveryOracle:
             "trust_rate": trust_rate,
         }
 
+    @staticmethod
+    def _is_non_json_probe_reason(reason: Any) -> bool:
+        lowered = str(reason or "").strip().lower()
+        if not lowered:
+            return False
+        return ("non_json" in lowered) or ("text_non_json" in lowered)
+
+    def _openrouter_probe_report_reason(self, model_name: str) -> str:
+        model_id = str(model_name or "").strip()
+        if not model_id:
+            return ""
+        rows = list(self._openrouter_probe_report or [])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("model") or "").strip() != model_id:
+                continue
+            return str(row.get("reason") or "").strip()
+        return ""
+
+    def _is_openrouter_model_strict_capable(self, model_name: str) -> bool:
+        model_id = str(model_name or "").strip()
+        if not model_id:
+            return False
+        if model_id in self._openrouter_available_strict_candidates:
+            return True
+        reason = self._openrouter_probe_report_reason(model_id)
+        if not reason:
+            return True
+        return not self._is_non_json_probe_reason(reason)
+
+    def _register_openrouter_probe_success(self, model_id: str, reason: str) -> None:
+        normalized_model = str(model_id or "").strip()
+        if not normalized_model:
+            return
+        if normalized_model not in self._openrouter_available_candidates:
+            self._openrouter_available_candidates.append(normalized_model)
+        if self._is_non_json_probe_reason(reason):
+            if normalized_model in self._openrouter_available_strict_candidates:
+                self._openrouter_available_strict_candidates = [
+                    name for name in self._openrouter_available_strict_candidates
+                    if name != normalized_model
+                ]
+        else:
+            if normalized_model not in self._openrouter_available_strict_candidates:
+                self._openrouter_available_strict_candidates.append(normalized_model)
+        if str(self.ai_runtime.get("engine") or "") == "openrouter":
+            self.ai_runtime["inventory_available"] = len(self._openrouter_available_candidates)
+            self.ai_runtime["inventory_available_strict"] = len(self._openrouter_available_strict_candidates)
+            self.ai_runtime["active_model_strict_probe"] = self._is_openrouter_model_strict_capable(
+                str(self._openrouter_model_id or "")
+            )
+
+    def _strict_json_runtime_available(self) -> bool:
+        if self._model is not None:
+            return True
+        if self._openrouter_model_id and self._is_openrouter_model_strict_capable(self._openrouter_model_id):
+            return True
+        strict_pool = self._rank_candidate_models(
+            "openrouter",
+            list(self._openrouter_available_strict_candidates),
+            allow_forced_retry=False,
+        )
+        return bool(strict_pool)
+
+    def _activate_best_openrouter_strict_model(self, *, reason: str, mode: str) -> bool:
+        strict_pool = self._rank_candidate_models(
+            "openrouter",
+            list(self._openrouter_available_strict_candidates),
+            allow_forced_retry=True,
+        )
+        if not strict_pool:
+            return False
+        selected = str(strict_pool[0] or "").strip()
+        if not selected or selected not in self._openrouter_candidates:
+            return False
+        if selected != str(self._openrouter_model_id or "").strip():
+            idx = self._openrouter_candidates.index(selected)
+            self._activate_openrouter_model(
+                model_id=selected,
+                index=idx,
+                mode=mode,
+            )
+        LOGGER.info(
+            "OpenRouter strict model enforced | model=%s reason=%s",
+            selected,
+            str(reason)[:220],
+        )
+        return True
+
     def _probe_report_prefers_non_json(self, model_name: str) -> bool:
         model_id = str(model_name or "").strip()
         if not model_id:
             return False
-        probe_rows = list(self.ai_runtime.get("probe_report") or [])
+        probe_rows = list(self.ai_runtime.get("probe_report") or self._openrouter_probe_report or [])
         for row in probe_rows:
             if not isinstance(row, dict):
                 continue
             if str(row.get("model") or "").strip() != model_id:
                 continue
-            reason = str(row.get("reason") or "").lower()
+            reason = str(row.get("reason") or "").strip().lower()
             status = str(row.get("status") or "").lower()
-            if "non_json" in reason or "text_non_json" in reason:
+            if self._is_non_json_probe_reason(reason):
                 return True
             if status == "available" and "json" not in reason and "ok_text" in reason:
                 return True
@@ -2409,22 +2515,43 @@ class DiscoveryOracle:
             require_suffix_free=self.openrouter_free_tier_only,
         )
         self._openrouter_candidates = candidates
+        self._openrouter_available_candidates = []
+        self._openrouter_available_strict_candidates = []
         if not candidates:
             self._disable_openrouter("fallback_no_openrouter_models", "Nessun modello OpenRouter free-tier text-capable.")
             return
 
         probe_report = self._probe_all_openrouter_candidates(candidates)
         self._openrouter_probe_report = probe_report
-        available_models = [row["model"] for row in probe_report if row.get("available")]
+        available_models = [
+            str(row.get("model") or "").strip()
+            for row in probe_report
+            if row.get("available") and str(row.get("model") or "").strip()
+        ]
+        strict_available_models = [
+            str(row.get("model") or "").strip()
+            for row in probe_report
+            if (
+                row.get("available")
+                and str(row.get("model") or "").strip()
+                and (not self._is_non_json_probe_reason(row.get("reason")))
+            )
+        ]
         self._openrouter_available_candidates = available_models
+        self._openrouter_available_strict_candidates = strict_available_models
         LOGGER.info(
-            "OpenRouter inventory complete | total=%s available=%s",
+            "OpenRouter inventory complete | total=%s available=%s strict_available=%s",
             len(candidates),
             len(available_models),
+            len(strict_available_models),
         )
 
-        if available_models:
-            ordered = self._rank_candidate_models("openrouter", available_models, allow_forced_retry=False) or available_models
+        if strict_available_models:
+            ordered = self._rank_candidate_models(
+                "openrouter",
+                strict_available_models,
+                allow_forced_retry=False,
+            ) or strict_available_models
             best_model = ordered[0]
             best_idx = candidates.index(best_model)
             self._activate_openrouter_model(
@@ -2432,6 +2559,26 @@ class DiscoveryOracle:
                 index=best_idx,
                 mode="api_openrouter_inventory",
                 probe_report=probe_report,
+            )
+            return
+
+        if available_models and self.ai_non_json_model_last_resort_enabled:
+            ordered = self._rank_candidate_models(
+                "openrouter",
+                available_models,
+                allow_forced_retry=False,
+            ) or available_models
+            best_model = ordered[0]
+            best_idx = candidates.index(best_model)
+            self._activate_openrouter_model(
+                model_id=best_model,
+                index=best_idx,
+                mode="api_openrouter_inventory_last_resort_non_json",
+                probe_report=probe_report,
+            )
+            LOGGER.warning(
+                "OpenRouter strict model unavailable at startup; activated non-JSON last-resort model=%s",
+                best_model,
             )
             return
 
@@ -2666,6 +2813,8 @@ class DiscoveryOracle:
             "candidate_count": len(self._openrouter_candidates),
             "inventory_total": len(self._openrouter_candidates),
             "inventory_available": len(self._openrouter_available_candidates),
+            "inventory_available_strict": len(self._openrouter_available_strict_candidates),
+            "active_model_strict_probe": self._is_openrouter_model_strict_capable(model_id),
             "probe_report": (probe_report or self._openrouter_probe_report)[:8],
         }
         LOGGER.info(
@@ -2676,12 +2825,31 @@ class DiscoveryOracle:
             mode,
         )
 
-    def _advance_openrouter_model(self, *, reason: str) -> bool:
+    def _advance_openrouter_model(self, *, reason: str, strict_only: bool = False) -> bool:
         if not self._openrouter_candidates:
             return False
-        current = self._openrouter_model_id
-        pool = [name for name in (self._openrouter_available_candidates or self._openrouter_candidates) if name != current]
-        fallback_pool = self._rank_candidate_models("openrouter", pool, allow_forced_retry=True)
+        current = str(self._openrouter_model_id or "").strip()
+        strict_pool = [
+            name
+            for name in self._openrouter_available_strict_candidates
+            if name and name != current
+        ]
+        if strict_only:
+            candidate_pool = list(strict_pool)
+        else:
+            tail_pool = [
+                name
+                for name in (self._openrouter_available_candidates or self._openrouter_candidates)
+                if name and name != current and name not in strict_pool
+            ]
+            candidate_pool = strict_pool + tail_pool
+        if not candidate_pool:
+            return False
+        fallback_pool = self._rank_candidate_models(
+            "openrouter",
+            candidate_pool,
+            allow_forced_retry=True,
+        )
         for model_id in fallback_pool:
             ok, probe_reason = self._probe_openrouter_model(model_id)
             if not ok:
@@ -2692,9 +2860,19 @@ class DiscoveryOracle:
                     probe_reason,
                 )
                 continue
+            if strict_only and self._is_non_json_probe_reason(probe_reason):
+                self._record_model_failure(
+                    "openrouter",
+                    model_id,
+                    f"strict_only_rejected_non_json_probe:{probe_reason}",
+                    phase="failover_probe",
+                )
+                continue
             self._record_model_success("openrouter", model_id, phase="failover_probe")
+            self._register_openrouter_probe_success(model_id, probe_reason)
             idx = self._openrouter_candidates.index(model_id)
-            self._activate_openrouter_model(model_id=model_id, index=idx, mode="api_openrouter_failover")
+            mode = "api_openrouter_failover_strict" if strict_only else "api_openrouter_failover"
+            self._activate_openrouter_model(model_id=model_id, index=idx, mode=mode)
             LOGGER.warning("OpenRouter failover completed | previous_reason=%s new_model=%s", reason, model_id)
             return True
         return False
@@ -2710,6 +2888,8 @@ class DiscoveryOracle:
         self._openrouter_candidate_index = None
         self._openrouter_recovery_attempted = False
         self._openrouter_malformed_errors = 0
+        self._openrouter_available_candidates = []
+        self._openrouter_available_strict_candidates = []
         if self._model is None:
             self.ai_runtime = {
                 "engine": "local_ai",
@@ -2719,6 +2899,7 @@ class DiscoveryOracle:
                 "reason": reason[:220],
                 "inventory_total": len(self._openrouter_candidates),
                 "inventory_available": len(self._openrouter_available_candidates),
+                "inventory_available_strict": len(self._openrouter_available_strict_candidates),
                 "probe_report": (probe_report or self._openrouter_probe_report)[:8],
             }
         LOGGER.warning("OpenRouter disabled | mode=%s reason=%s", mode, reason)
@@ -2729,11 +2910,11 @@ class DiscoveryOracle:
         async with self._ai_failover_lock:
             return self._advance_gemini_model(reason=reason)
 
-    async def _advance_openrouter_model_locked(self, *, reason: str) -> bool:
+    async def _advance_openrouter_model_locked(self, *, reason: str, strict_only: bool = False) -> bool:
         if self._ai_failover_lock is None:
             self._ai_failover_lock = asyncio.Lock()
         async with self._ai_failover_lock:
-            return self._advance_openrouter_model(reason=reason)
+            return self._advance_openrouter_model(reason=reason, strict_only=strict_only)
 
     @staticmethod
     def _should_rotate_openrouter_model(exc: Exception) -> bool:
@@ -2955,8 +3136,7 @@ class DiscoveryOracle:
             ok, reason = self._probe_openrouter_model(model_id, timeout_sec=probe_timeout)
             if ok:
                 self._record_model_success("openrouter", model_id, phase="json_repair_probe")
-                if model_id not in self._openrouter_available_candidates:
-                    self._openrouter_available_candidates.append(model_id)
+                self._register_openrouter_probe_success(model_id, reason)
                 return model_id
 
             self._record_model_failure("openrouter", model_id, reason, phase="json_repair_probe")
@@ -3099,8 +3279,7 @@ class DiscoveryOracle:
                 if ok:
                     idx = self._openrouter_candidates.index(model_id)
                     self._record_model_success("openrouter", model_id, phase="timeout_recovery_probe")
-                    if model_id not in self._openrouter_available_candidates:
-                        self._openrouter_available_candidates.append(model_id)
+                    self._register_openrouter_probe_success(model_id, reason)
                     self._activate_openrouter_model(
                         model_id=model_id,
                         index=idx,
@@ -3512,6 +3691,15 @@ class DiscoveryOracle:
             for row, strength in above_threshold_with_strength
             if str(strength) == "LOW_CONFIDENCE"
         ]
+        strict_runtime_available = self._strict_json_runtime_available()
+        bootstrap_blocked_due_to_strict_runtime = bool(
+            self.ai_disable_bootstrap_without_strict_model
+            and self.ai_strict_model_required_main_shortlist
+            and self._external_ai_available()
+            and (not strict_runtime_available)
+        )
+        if bootstrap_blocked_due_to_strict_runtime:
+            above_threshold_high_conf = list(above_threshold_high_conf_strict)
 
         selected: list[Dict[str, Any]]
         fallback_used = False
@@ -3653,6 +3841,8 @@ class DiscoveryOracle:
             "above_threshold_high_confidence_strict_count": len(above_threshold_high_conf_strict),
             "above_threshold_high_confidence_bootstrap_count": len(above_threshold_high_conf_bootstrap),
             "above_threshold_low_confidence_count": len(above_threshold_low_conf),
+            "ai_strict_runtime_available": bool(strict_runtime_available),
+            "bootstrap_blocked_due_to_no_strict_runtime": bool(bootstrap_blocked_due_to_strict_runtime),
             "fallback_scored_count": ai_fallback_total_count,
             "ai_shortlist_effective_count": ai_shortlist_count,
             "ai_shortlist_fallback_count": ai_shortlist_fallback_count,
@@ -3751,6 +3941,12 @@ class DiscoveryOracle:
             strict_rate=float(diagnostics["strict_pass_rate_shortlist"]),
             non_json_rate=float(diagnostics["non_json_rate_shortlist"]),
         )
+        if (
+            self.ai_strict_model_required_main_shortlist
+            and self._external_ai_available()
+            and (not bool(diagnostics.get("ai_strict_runtime_available")))
+        ):
+            trust_pass_rate_shortlist = float(diagnostics["strict_pass_rate_shortlist"])
         diagnostics["trust_pass_rate_shortlist"] = round(trust_pass_rate_shortlist, 4)
         diagnostics["no_signal_due_to_low_strict_pass"] = False
         diagnostics["high_conf_strict_rate"] = round(
@@ -3914,6 +4110,11 @@ class DiscoveryOracle:
             strict_rate=strict_rate_value,
             non_json_rate=float(shortlist_quality.get("non_json_rate", 0.0)),
         )
+        if (
+            self.ai_strict_model_required_main_shortlist
+            and (not self._strict_json_runtime_available())
+        ):
+            trust_rate_value = strict_rate_value
         should_quality_rerank = (
             rerank_attempt < 1
             and self.ai_no_signal_on_low_strict_pass
@@ -5427,10 +5628,15 @@ class DiscoveryOracle:
                             allow_repair_calls=bool(self.ai_single_call_allow_repair_calls),
                             allow_failover_call=True,
                             output_mode=single_call_output_mode,
+                            strict_only=bool(self.ai_strict_model_required_main_shortlist),
                         )
 
                     if batch_error:
-                        non_error_reasons = {"no_external_ai_available", "insufficient_budget_for_batch"}
+                        non_error_reasons = {
+                            "no_external_ai_available",
+                            "insufficient_budget_for_batch",
+                            "strict_model_unavailable",
+                        }
                         if str(batch_error) in non_error_reasons:
                             LOGGER.info(
                                 "AI single-call chunk skipped | chunk=%s/%s candidates=%s reason=%s",
@@ -5487,10 +5693,15 @@ class DiscoveryOracle:
                         allow_repair_calls=True,
                         allow_failover_call=True,
                         output_mode=batch_output_mode,
+                        strict_only=bool(self.ai_strict_model_required_main_shortlist),
                     )
 
                 if batch_error:
-                    non_error_reasons = {"no_external_ai_available", "insufficient_budget_for_batch"}
+                    non_error_reasons = {
+                        "no_external_ai_available",
+                        "insufficient_budget_for_batch",
+                        "strict_model_unavailable",
+                    }
                     if str(batch_error) in non_error_reasons:
                         LOGGER.info(
                             "AI batch scoring skipped | candidates=%s reason=%s",
@@ -5546,9 +5757,14 @@ class DiscoveryOracle:
                         allow_repair_calls=True,
                         allow_failover_call=False,
                         output_mode=rescue_output_mode,
+                        strict_only=bool(self.ai_strict_model_required_main_shortlist),
                     )
                     if rescue_error:
-                        non_error_reasons = {"no_external_ai_available", "insufficient_budget_for_batch"}
+                        non_error_reasons = {
+                            "no_external_ai_available",
+                            "insufficient_budget_for_batch",
+                            "strict_model_unavailable",
+                        }
                         if str(rescue_error) in non_error_reasons:
                             LOGGER.info(
                                 "AI single-call missing rescue skipped | candidates=%s reason=%s",
@@ -5845,6 +6061,7 @@ class DiscoveryOracle:
         allow_repair_calls: bool = True,
         allow_failover_call: bool = True,
         output_mode: str = "json_first",
+        strict_only: bool = False,
     ) -> tuple[Dict[str, AIInsight], Optional[str]]:
         if not entries:
             return {}, None
@@ -5903,6 +6120,28 @@ class DiscoveryOracle:
             return {}, "batch_payload_no_valid_rows"
 
         if self._openrouter_model_id is not None:
+            if strict_only:
+                strict_ready = self._strict_json_runtime_available()
+                if not strict_ready:
+                    strict_ready = self._activate_best_openrouter_strict_model(
+                        reason="strict_only_batch_precheck",
+                        mode="api_openrouter_strict_preferred",
+                    )
+                if not strict_ready:
+                    return {}, "strict_model_unavailable"
+                if not self._is_openrouter_model_strict_capable(str(self._openrouter_model_id or "")):
+                    promoted = self._activate_best_openrouter_strict_model(
+                        reason="strict_only_batch_enforcement",
+                        mode="api_openrouter_strict_preferred",
+                    )
+                    if not promoted:
+                        promoted = await self._advance_openrouter_model_locked(
+                            reason="strict_only_batch_enforcement",
+                            strict_only=True,
+                        )
+                    if not promoted or (not self._is_openrouter_model_strict_capable(str(self._openrouter_model_id or ""))):
+                        return {}, "strict_model_unavailable"
+
             async def _insights_from_openrouter_text(raw_text: str) -> Dict[str, AIInsight]:
                 try:
                     payload = self._extract_json(raw_text)
@@ -6040,6 +6279,7 @@ class DiscoveryOracle:
                             )
                             rotated = await self._advance_openrouter_model_locked(
                                 reason=reason,
+                                strict_only=strict_only,
                             )
                             rotated_model = str(self._openrouter_model_id or "")
                             if rotated and rotated_model and rotated_model != current_model:
@@ -6066,6 +6306,7 @@ class DiscoveryOracle:
                     if quality_failover_attempts < max_quality_failover_attempts:
                         rotated = await self._advance_openrouter_model_locked(
                             reason="batch_payload_no_valid_rows",
+                            strict_only=strict_only,
                         )
                         rotated_model = str(self._openrouter_model_id or "")
                         if rotated and rotated_model and rotated_model != current_model:
@@ -6076,7 +6317,10 @@ class DiscoveryOracle:
                 except Exception as exc:  # noqa: BLE001
                     self._record_model_failure("openrouter", current_model, str(exc), phase="batch_scoring")
                     if quality_failover_attempts < max_quality_failover_attempts:
-                        rotated = await self._advance_openrouter_model_locked(reason=f"batch_scoring:{exc}")
+                        rotated = await self._advance_openrouter_model_locked(
+                            reason=f"batch_scoring:{exc}",
+                            strict_only=strict_only,
+                        )
                         rotated_model = str(self._openrouter_model_id or "")
                         if rotated and rotated_model and rotated_model != current_model:
                             quality_failover_attempts += 1
@@ -9183,6 +9427,15 @@ class DiscoveryOracle:
             probability_threshold = min(probability_threshold, float(self.bootstrap_min_upside_probability))
             confidence_threshold = min(confidence_threshold, int(self.bootstrap_min_confidence_score))
             bootstrap_active = True
+            if (
+                self.ai_disable_bootstrap_without_strict_model
+                and self.ai_strict_model_required_main_shortlist
+                and self._external_ai_available()
+                and (not self._strict_json_runtime_available())
+            ):
+                probability_threshold = float(self.min_upside_probability)
+                confidence_threshold = int(self.min_confidence_score)
+                bootstrap_active = False
 
         return probability_threshold, confidence_threshold, bootstrap_active, data_points
 
@@ -9458,6 +9711,15 @@ class DiscoveryOracle:
             )
         probability_pct = float(row.get("forecast_probability_upside_12m") or 0.0)
         probability_threshold, confidence_threshold, bootstrap_active, data_points = self._effective_high_confidence_thresholds(row)
+        bootstrap_blocked = bool(
+            self.bootstrap_thresholds_enabled
+            and data_points > 0
+            and data_points < int(self.bootstrap_min_history_points)
+            and self.ai_disable_bootstrap_without_strict_model
+            and self.ai_strict_model_required_main_shortlist
+            and self._external_ai_available()
+            and (not self._strict_json_runtime_available())
+        )
         min_probability_pct = probability_threshold * 100.0
         if probability_pct < min_probability_pct:
             reasons.append(
@@ -9473,6 +9735,10 @@ class DiscoveryOracle:
         if bootstrap_active:
             reasons.append(
                 f"Bootstrap soglie attivo (data points {data_points} < {self.bootstrap_min_history_points})"
+            )
+        elif bootstrap_blocked:
+            reasons.append(
+                "Bootstrap operativo disabilitato: nessun modello AI strict JSON disponibile nel ciclo"
             )
 
         historical_ok, historical_reasons = self._historical_high_confidence_status(row)

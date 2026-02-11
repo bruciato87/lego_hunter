@@ -691,6 +691,56 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(oracle._openrouter_model_id, "vendor/model-a:free")
         self.assertEqual(oracle.ai_runtime.get("mode"), "api_openrouter_best_effort")
 
+    def test_openrouter_runtime_prefers_strict_available_model_over_non_json(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_gemini_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key="fake", openrouter_api_key="fake-or-key")
+
+        oracle.strict_ai_probe_validation = True
+        oracle._openrouter_inventory_loaded = False
+
+        with patch.object(
+            oracle,
+            "_fetch_openrouter_model_payloads",
+            return_value=[
+                {
+                    "id": "vendor/model-a:free",
+                    "pricing": {"prompt": "0", "completion": "0"},
+                    "architecture": {"modality": "text->text"},
+                    "context_length": 32000,
+                },
+                {
+                    "id": "vendor/model-b:free",
+                    "pricing": {"prompt": "0", "completion": "0"},
+                    "architecture": {"modality": "text->text"},
+                    "context_length": 32000,
+                },
+            ],
+        ), patch.object(
+            oracle,
+            "_probe_all_openrouter_candidates",
+            return_value=[
+                {
+                    "model": "vendor/model-a:free",
+                    "available": True,
+                    "status": "available",
+                    "reason": "ok_text_non_json",
+                },
+                {
+                    "model": "vendor/model-b:free",
+                    "available": True,
+                    "status": "available",
+                    "reason": "ok_json",
+                },
+            ],
+        ):
+            oracle._initialize_openrouter_runtime()
+
+        self.assertEqual(oracle._openrouter_model_id, "vendor/model-b:free")
+        self.assertEqual(oracle.ai_runtime.get("mode"), "api_openrouter_inventory")
+        self.assertEqual(int(oracle.ai_runtime.get("inventory_available_strict") or 0), 1)
+        self.assertIn("vendor/model-b:free", oracle._openrouter_available_strict_candidates)
+
     async def test_discover_opportunities_filters_by_min_score(self) -> None:
         repo = FakeRepo()
         now = datetime.now(timezone.utc)
@@ -2764,8 +2814,9 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             allow_repair_calls=True,
             allow_failover_call=True,
             output_mode: str = "json_first",
+            strict_only: bool = False,
         ):
-            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode)
+            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode, strict_only)
             scored = {}
             for entry in entries:
                 set_id = str(entry.get("set_id") or "")
@@ -2918,8 +2969,9 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             allow_repair_calls: bool = True,
             allow_failover_call: bool = True,
             output_mode: str = "json_first",
+            strict_only: bool = False,
         ):
-            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode)
+            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode, strict_only)
             scored = {}
             for entry in entries:
                 set_id = str(entry.get("set_id") or "")
@@ -2989,8 +3041,9 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             allow_repair_calls: bool = True,
             allow_failover_call: bool = True,
             output_mode: str = "json_first",
+            strict_only: bool = False,
         ):
-            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode)
+            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode, strict_only)
             return {
                 "99701": AIInsight(
                     score=82,
@@ -3084,8 +3137,9 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             allow_repair_calls=True,
             allow_failover_call=True,
             output_mode: str = "json_first",
+            strict_only: bool = False,
         ):
-            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode)
+            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode, strict_only)
             scored = {
                 "15002": AIInsight(
                     score=81,
@@ -3180,8 +3234,9 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             allow_repair_calls=True,
             allow_failover_call=True,
             output_mode: str = "json_first",
+            strict_only: bool = False,
         ):
-            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode)
+            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode, strict_only)
             scored = {}
             for entry in entries:
                 set_id = str(entry.get("set_id") or "")
@@ -3290,8 +3345,9 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             allow_repair_calls=True,
             allow_failover_call=True,
             output_mode: str = "json_first",
+            strict_only: bool = False,
         ):
-            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode)
+            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode, strict_only)
             selected_orders.append([str(entry.get("set_id") or "") for entry in entries])
             scored = {}
             for entry in entries:
@@ -3389,8 +3445,9 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             allow_repair_calls=True,
             allow_failover_call=True,
             output_mode: str = "json_first",
+            strict_only: bool = False,
         ):
-            _ = (entries, deadline, allow_repair_calls, allow_failover_call, output_mode)
+            _ = (entries, deadline, allow_repair_calls, allow_failover_call, output_mode, strict_only)
             return {
                 "16501": AIInsight(
                     score=76,
@@ -3620,6 +3677,57 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(results["75367"].score, 84)
         mocked_repair.assert_awaited_once()
 
+    async def test_score_ai_shortlist_batch_strict_only_rejects_non_json_model(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle._openrouter_model_id = "vendor/model-pro:free"
+        oracle._openrouter_candidates = ["vendor/model-pro:free"]
+        oracle._openrouter_available_candidates = ["vendor/model-pro:free"]
+        oracle._openrouter_available_strict_candidates = []
+        oracle._openrouter_probe_report = [
+            {
+                "model": "vendor/model-pro:free",
+                "available": True,
+                "status": "available",
+                "reason": "ok_text_non_json",
+            }
+        ]
+        oracle.ai_runtime = {
+            "engine": "openrouter",
+            "provider": "openrouter",
+            "model": "vendor/model-pro:free",
+            "mode": "api_openrouter_inventory_last_resort_non_json",
+            "inventory_available": 1,
+            "inventory_available_strict": 0,
+            "probe_report": list(oracle._openrouter_probe_report),
+        }
+
+        entries = [
+            {
+                "set_id": "75367",
+                "candidate": {
+                    "set_id": "75367",
+                    "set_name": "Set 75367",
+                    "theme": "Star Wars",
+                    "source": "lego_proxy_reader",
+                    "current_price": 99.99,
+                    "eol_date_prediction": "2026-12-01",
+                },
+            }
+        ]
+
+        with patch.object(oracle, "_openrouter_generate") as mocked_generate:
+            results, error = await oracle._score_ai_shortlist_batch(
+                entries,
+                deadline=time.monotonic() + 10.0,
+                strict_only=True,
+            )
+
+        self.assertEqual(results, {})
+        self.assertEqual(error, "strict_model_unavailable")
+        mocked_generate.assert_not_called()
+
     async def test_score_ai_shortlist_batch_parses_non_json_without_repair_call(self) -> None:
         repo = FakeRepo()
         with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
@@ -3817,7 +3925,8 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             "]}"
         )
 
-        async def fake_rotate(reason: str) -> bool:  # noqa: ARG001
+        async def fake_rotate(reason: str, strict_only: bool = False) -> bool:  # noqa: ARG001
+            _ = strict_only
             oracle._openrouter_model_id = "vendor/model-b:free"
             return True
 
@@ -4459,6 +4568,54 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(oracle._high_confidence_signal_strength(short_history_row), "HIGH_CONFIDENCE_BOOTSTRAP")
         self.assertFalse(oracle._is_high_confidence_pick(long_history_row))
         self.assertEqual(oracle._high_confidence_signal_strength(long_history_row), "LOW_CONFIDENCE")
+
+    def test_bootstrap_is_blocked_when_only_non_json_model_is_available(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_openrouter_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key="test-key")
+        oracle.historical_high_conf_required = False
+        oracle.bootstrap_thresholds_enabled = True
+        oracle.bootstrap_min_history_points = 45
+        oracle.bootstrap_min_upside_probability = 0.52
+        oracle.bootstrap_min_confidence_score = 55
+        oracle.min_upside_probability = 0.60
+        oracle.min_confidence_score = 68
+        oracle.min_composite_score = 60
+        oracle.ai_disable_bootstrap_without_strict_model = True
+        oracle.ai_strict_model_required_main_shortlist = True
+        oracle._openrouter_model_id = "vendor/model-pro:free"
+        oracle._openrouter_available_candidates = ["vendor/model-pro:free"]
+        oracle._openrouter_available_strict_candidates = []
+        oracle._openrouter_probe_report = [
+            {
+                "model": "vendor/model-pro:free",
+                "available": True,
+                "status": "available",
+                "reason": "ok_text_non_json",
+            }
+        ]
+        oracle.ai_runtime = {
+            "engine": "openrouter",
+            "provider": "openrouter",
+            "model": "vendor/model-pro:free",
+            "mode": "api_openrouter_inventory_last_resort_non_json",
+            "inventory_available": 1,
+            "inventory_available_strict": 0,
+            "probe_report": list(oracle._openrouter_probe_report),
+        }
+
+        row = {
+            "set_id": "77051",
+            "ai_fallback_used": False,
+            "ai_strict_pass": True,
+            "composite_score": 71,
+            "forecast_probability_upside_12m": 56.2,
+            "confidence_score": 57,
+            "forecast_data_points": 20,
+        }
+
+        self.assertFalse(oracle._is_high_confidence_pick(row))
+        self.assertEqual(oracle._high_confidence_signal_strength(row), "LOW_CONFIDENCE")
 
     def test_low_confidence_note_mentions_bootstrap_when_active(self) -> None:
         repo = FakeRepo()
