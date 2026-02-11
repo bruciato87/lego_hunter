@@ -741,6 +741,97 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(int(oracle.ai_runtime.get("inventory_available_strict") or 0), 1)
         self.assertIn("vendor/model-b:free", oracle._openrouter_available_strict_candidates)
 
+    def test_openrouter_runtime_uses_strict_reprobe_before_last_resort_non_json(self) -> None:
+        repo = FakeRepo()
+        with patch.object(DiscoveryOracle, "_initialize_gemini_runtime", autospec=True):
+            oracle = DiscoveryOracle(repo, gemini_api_key="fake", openrouter_api_key="fake-or-key")
+
+        oracle.strict_ai_probe_validation = True
+        oracle._openrouter_inventory_loaded = False
+        oracle.ai_probe_strict_reprobe_enabled = True
+        oracle.ai_strict_model_required_main_shortlist = True
+
+        with patch.object(
+            oracle,
+            "_fetch_openrouter_model_payloads",
+            return_value=[
+                {
+                    "id": "vendor/model-a:free",
+                    "pricing": {"prompt": "0", "completion": "0"},
+                    "architecture": {"modality": "text->text"},
+                    "context_length": 32000,
+                },
+                {
+                    "id": "vendor/model-b:free",
+                    "pricing": {"prompt": "0", "completion": "0"},
+                    "architecture": {"modality": "text->text"},
+                    "context_length": 32000,
+                },
+            ],
+        ), patch.object(
+            oracle,
+            "_probe_all_openrouter_candidates",
+            return_value=[
+                {
+                    "model": "vendor/model-a:free",
+                    "available": True,
+                    "status": "available",
+                    "reason": "ok_text_non_json",
+                },
+                {
+                    "model": "vendor/model-b:free",
+                    "available": False,
+                    "status": "not_probed_early_stop",
+                    "reason": "Early-stop after finding available model.",
+                },
+            ],
+        ), patch.object(
+            oracle,
+            "_probe_openrouter_strict_candidates",
+            return_value=[
+                {
+                    "model": "vendor/model-b:free",
+                    "available": True,
+                    "status": "available",
+                    "reason": "ok_json",
+                }
+            ],
+        ) as mocked_strict_reprobe:
+            oracle._initialize_openrouter_runtime()
+
+        mocked_strict_reprobe.assert_called_once()
+        reprobe_pool = mocked_strict_reprobe.call_args.args[0]
+        self.assertIn("vendor/model-b:free", reprobe_pool)
+        self.assertEqual(oracle._openrouter_model_id, "vendor/model-b:free")
+        self.assertEqual(oracle.ai_runtime.get("mode"), "api_openrouter_inventory")
+        self.assertEqual(int(oracle.ai_runtime.get("inventory_available_strict") or 0), 1)
+        self.assertIn("vendor/model-b:free", oracle._openrouter_available_strict_candidates)
+
+    def test_openrouter_strict_reprobe_rejects_non_json_probe_results(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_probe_batch_size = 1
+        oracle.ai_probe_strict_max_candidates = 3
+        oracle.ai_probe_strict_budget_sec = 60.0
+        oracle.ai_probe_strict_timeout_sec = 1.0
+        oracle.ai_probe_strict_early_successes = 1
+
+        with patch.object(
+            oracle,
+            "_probe_openrouter_model",
+            side_effect=[
+                (True, "ok_text_non_json"),
+                (True, "ok_json"),
+            ],
+        ):
+            report = oracle._probe_openrouter_strict_candidates(["m1", "m2"])
+
+        by_model = {row["model"]: row for row in report}
+        self.assertFalse(by_model["m1"]["available"])
+        self.assertEqual(by_model["m1"]["status"], "invalid_output")
+        self.assertTrue(by_model["m2"]["available"])
+        self.assertEqual(by_model["m2"]["status"], "available")
+
     async def test_discover_opportunities_filters_by_min_score(self) -> None:
         repo = FakeRepo()
         now = datetime.now(timezone.utc)

@@ -51,6 +51,11 @@ DEFAULT_AI_PROBE_MAX_CANDIDATES = 8
 DEFAULT_AI_PROBE_BATCH_SIZE = 3
 DEFAULT_AI_PROBE_BUDGET_SEC = 90.0
 DEFAULT_AI_PROBE_TIMEOUT_SEC = 12.0
+DEFAULT_AI_PROBE_STRICT_REPROBE_ENABLED = True
+DEFAULT_AI_PROBE_STRICT_MAX_CANDIDATES = 14
+DEFAULT_AI_PROBE_STRICT_BUDGET_SEC = 18.0
+DEFAULT_AI_PROBE_STRICT_TIMEOUT_SEC = 8.0
+DEFAULT_AI_PROBE_STRICT_EARLY_SUCCESSES = 1
 DEFAULT_AI_GENERATION_TIMEOUT_SEC = 20.0
 DEFAULT_OPENROUTER_MODELS_TIMEOUT_SEC = 15.0
 DEFAULT_OPENROUTER_JSON_REPAIR_PROBE_TIMEOUT_SEC = 4.0
@@ -422,6 +427,34 @@ class DiscoveryOracle:
             default=DEFAULT_AI_PROBE_TIMEOUT_SEC,
             minimum=4.0,
             maximum=60.0,
+        )
+        self.ai_probe_strict_reprobe_enabled = self._safe_env_bool(
+            "AI_PROBE_STRICT_REPROBE_ENABLED",
+            default=DEFAULT_AI_PROBE_STRICT_REPROBE_ENABLED,
+        )
+        self.ai_probe_strict_max_candidates = self._safe_env_int(
+            "AI_PROBE_STRICT_MAX_CANDIDATES",
+            default=DEFAULT_AI_PROBE_STRICT_MAX_CANDIDATES,
+            minimum=1,
+            maximum=60,
+        )
+        self.ai_probe_strict_budget_sec = self._safe_env_float(
+            "AI_PROBE_STRICT_BUDGET_SEC",
+            default=DEFAULT_AI_PROBE_STRICT_BUDGET_SEC,
+            minimum=4.0,
+            maximum=120.0,
+        )
+        self.ai_probe_strict_timeout_sec = self._safe_env_float(
+            "AI_PROBE_STRICT_TIMEOUT_SEC",
+            default=DEFAULT_AI_PROBE_STRICT_TIMEOUT_SEC,
+            minimum=2.0,
+            maximum=40.0,
+        )
+        self.ai_probe_strict_early_successes = self._safe_env_int(
+            "AI_PROBE_STRICT_EARLY_SUCCESSES",
+            default=DEFAULT_AI_PROBE_STRICT_EARLY_SUCCESSES,
+            minimum=1,
+            maximum=3,
         )
         self.ai_generation_timeout_sec = self._safe_env_float(
             "AI_GENERATION_TIMEOUT_SEC",
@@ -1182,12 +1215,17 @@ class DiscoveryOracle:
             self._apply_auto_tuned_thresholds()
 
         LOGGER.info(
-            "AI probe tuning | max_candidates=%s batch=%s early_successes=%s budget_sec=%.1f probe_timeout_sec=%.1f gen_timeout_sec=%.1f strict_json=%s",
+            "AI probe tuning | max_candidates=%s batch=%s early_successes=%s budget_sec=%.1f probe_timeout_sec=%.1f strict_reprobe=%s strict_max_candidates=%s strict_budget_sec=%.1f strict_timeout_sec=%.1f strict_early_successes=%s gen_timeout_sec=%.1f strict_json=%s",
             self.ai_probe_max_candidates,
             self.ai_probe_batch_size,
             self.ai_probe_early_successes,
             self.ai_probe_budget_sec,
             self.ai_probe_timeout_sec,
+            self.ai_probe_strict_reprobe_enabled,
+            self.ai_probe_strict_max_candidates,
+            self.ai_probe_strict_budget_sec,
+            self.ai_probe_strict_timeout_sec,
+            self.ai_probe_strict_early_successes,
             self.ai_generation_timeout_sec,
             self.strict_ai_probe_validation,
         )
@@ -2159,14 +2197,21 @@ class DiscoveryOracle:
         candidates: list[str],
         probe_fn,
         classify_fn,
+        max_candidates: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        early_successes: Optional[int] = None,
+        budget_sec: Optional[float] = None,
     ) -> list[Dict[str, Any]]:
         if not candidates:
             return []
 
         provider_key = self._provider_health_key(provider)
-        selected = self._select_probe_candidates(candidates, self.ai_probe_max_candidates)
+        max_candidates_limit = max(1, int(max_candidates if max_candidates is not None else self.ai_probe_max_candidates))
+        selected = self._select_probe_candidates(candidates, max_candidates_limit)
         selected_set = set(selected)
-        probe_limit = max(1, self.ai_probe_batch_size)
+        probe_limit = max(1, int(batch_size if batch_size is not None else self.ai_probe_batch_size))
+        early_success_target = max(1, int(early_successes if early_successes is not None else self.ai_probe_early_successes))
+        budget_limit_sec = max(0.0, float(budget_sec if budget_sec is not None else self.ai_probe_budget_sec))
         report_by_model: Dict[str, Dict[str, Any]] = {}
         available_count = 0
         global_quota_zero = False
@@ -2178,16 +2223,16 @@ class DiscoveryOracle:
             provider,
             len(candidates),
             len(selected),
-            self.ai_probe_budget_sec,
+            budget_limit_sec,
             probe_limit,
         )
 
         for offset in range(0, len(selected), probe_limit):
             elapsed = time.monotonic() - started
-            if elapsed >= self.ai_probe_budget_sec:
+            if elapsed >= budget_limit_sec:
                 budget_exhausted = True
                 break
-            if global_quota_zero or available_count >= self.ai_probe_early_successes:
+            if global_quota_zero or available_count >= early_success_target:
                 break
 
             batch = selected[offset : offset + probe_limit]
@@ -2218,7 +2263,7 @@ class DiscoveryOracle:
             executor = ThreadPoolExecutor(max_workers=min(len(allowed_batch), probe_limit))
             try:
                 futures = {executor.submit(probe_fn, model_name): model_name for model_name in allowed_batch}
-                remaining_budget = max(0.1, self.ai_probe_budget_sec - (time.monotonic() - started))
+                remaining_budget = max(0.1, budget_limit_sec - (time.monotonic() - started))
                 batch_timeout = max(
                     1.0,
                     min(
@@ -2281,7 +2326,7 @@ class DiscoveryOracle:
                             model_name,
                             batch_timeout,
                         )
-                    if (time.monotonic() - started) >= self.ai_probe_budget_sec:
+                    if (time.monotonic() - started) >= budget_limit_sec:
                         budget_exhausted = True
                         break
             finally:
@@ -2327,7 +2372,7 @@ class DiscoveryOracle:
                 )
                 continue
 
-            if available_count >= self.ai_probe_early_successes:
+            if available_count >= early_success_target:
                 report.append(
                     {
                         "model": model_name,
@@ -2355,7 +2400,7 @@ class DiscoveryOracle:
             available_count,
             time.monotonic() - started,
             budget_exhausted,
-            available_count >= self.ai_probe_early_successes,
+            available_count >= early_success_target,
             global_quota_zero,
         )
         return report
@@ -2537,6 +2582,46 @@ class DiscoveryOracle:
                 and (not self._is_non_json_probe_reason(row.get("reason")))
             )
         ]
+
+        if (
+            (not strict_available_models)
+            and available_models
+            and self.ai_probe_strict_reprobe_enabled
+            and self.ai_strict_model_required_main_shortlist
+        ):
+            strict_reprobe_pool = self._build_openrouter_strict_reprobe_pool(candidates, probe_report)
+            if strict_reprobe_pool:
+                LOGGER.info(
+                    "OpenRouter strict re-probe start | pool=%s max_candidates=%s budget_sec=%.1f timeout_sec=%.1f",
+                    len(strict_reprobe_pool),
+                    self.ai_probe_strict_max_candidates,
+                    self.ai_probe_strict_budget_sec,
+                    self.ai_probe_strict_timeout_sec,
+                )
+                strict_reprobe_report = self._probe_openrouter_strict_candidates(strict_reprobe_pool)
+                if strict_reprobe_report:
+                    probe_report = self._merge_probe_reports(probe_report, strict_reprobe_report)
+                    self._openrouter_probe_report = probe_report
+                    available_models = [
+                        str(row.get("model") or "").strip()
+                        for row in probe_report
+                        if row.get("available") and str(row.get("model") or "").strip()
+                    ]
+                    strict_available_models = [
+                        str(row.get("model") or "").strip()
+                        for row in probe_report
+                        if (
+                            row.get("available")
+                            and str(row.get("model") or "").strip()
+                            and (not self._is_non_json_probe_reason(row.get("reason")))
+                        )
+                    ]
+                    LOGGER.info(
+                        "OpenRouter strict re-probe complete | available=%s strict_available=%s",
+                        len(available_models),
+                        len(strict_available_models),
+                    )
+
         self._openrouter_available_candidates = available_models
         self._openrouter_available_strict_candidates = strict_available_models
         LOGGER.info(
@@ -2744,6 +2829,120 @@ class DiscoveryOracle:
             candidates=candidates,
             probe_fn=self._probe_openrouter_model,
             classify_fn=self._classify_openrouter_probe_failure,
+        )
+
+    @staticmethod
+    def _merge_probe_reports(
+        primary: list[Dict[str, Any]],
+        overlay: list[Dict[str, Any]],
+    ) -> list[Dict[str, Any]]:
+        if not primary:
+            return list(overlay or [])
+        if not overlay:
+            return list(primary or [])
+
+        merged_by_model: Dict[str, Dict[str, Any]] = {}
+        ordered_models: list[str] = []
+
+        for row in primary:
+            if not isinstance(row, dict):
+                continue
+            model_name = str(row.get("model") or "").strip()
+            if not model_name:
+                continue
+            merged_by_model[model_name] = dict(row)
+            ordered_models.append(model_name)
+
+        for row in overlay:
+            if not isinstance(row, dict):
+                continue
+            model_name = str(row.get("model") or "").strip()
+            if not model_name:
+                continue
+            if model_name not in merged_by_model:
+                ordered_models.append(model_name)
+            merged_by_model[model_name] = dict(row)
+
+        return [merged_by_model[model_name] for model_name in ordered_models if model_name in merged_by_model]
+
+    def _build_openrouter_strict_reprobe_pool(
+        self,
+        candidates: list[str],
+        probe_report: list[Dict[str, Any]],
+    ) -> list[str]:
+        if not candidates:
+            return []
+
+        available_models = {
+            str(row.get("model") or "").strip()
+            for row in (probe_report or [])
+            if isinstance(row, dict) and row.get("available")
+        }
+        preferred_statuses = {
+            "not_probed_early_stop",
+            "not_probed_budget_exhausted",
+            "not_probed",
+            "skipped_low_priority",
+            "transient_error",
+            "probe_error",
+            "quota_limited",
+            "invalid_output",
+        }
+
+        pool: list[str] = []
+        seen: set[str] = set()
+        candidate_set = set(candidates)
+        for row in probe_report or []:
+            if not isinstance(row, dict):
+                continue
+            model_name = str(row.get("model") or "").strip()
+            if (not model_name) or (model_name in seen) or (model_name not in candidate_set):
+                continue
+            if model_name in self._openrouter_available_strict_candidates:
+                continue
+            status = str(row.get("status") or "").strip().lower()
+            if status not in preferred_statuses:
+                continue
+            pool.append(model_name)
+            seen.add(model_name)
+
+        # Backfill from remaining non-available models to widen strict coverage.
+        for model_name in candidates:
+            normalized = str(model_name or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            if normalized in self._openrouter_available_strict_candidates:
+                continue
+            if normalized in available_models:
+                continue
+            pool.append(normalized)
+            seen.add(normalized)
+
+        return pool
+
+    def _probe_openrouter_strict_candidates(self, candidates: list[str]) -> list[Dict[str, Any]]:
+        if not candidates:
+            return []
+
+        strict_timeout = float(self.ai_probe_strict_timeout_sec)
+
+        def strict_probe_fn(model_id: str) -> tuple[bool, str]:
+            ok, reason = self._probe_openrouter_model(model_id, timeout_sec=strict_timeout)
+            if not ok:
+                return False, reason
+            if self._is_non_json_probe_reason(reason):
+                return False, f"strict_reprobe_non_json:{reason}"
+            return True, str(reason or "ok_json")
+
+        return self._probe_candidates_with_budget(
+            provider="OpenRouter strict-reprobe",
+            candidates=candidates,
+            probe_fn=strict_probe_fn,
+            classify_fn=self._classify_openrouter_probe_failure,
+            max_candidates=self.ai_probe_strict_max_candidates,
+            batch_size=self.ai_probe_batch_size,
+            early_successes=self.ai_probe_strict_early_successes,
+            budget_sec=self.ai_probe_strict_budget_sec,
         )
 
     def _probe_openrouter_model(
