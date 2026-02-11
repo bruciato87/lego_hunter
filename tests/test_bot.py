@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -652,6 +653,101 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Pattern 84/100", joined)
         self.assertIn("Completismo di serie", joined)
 
+    def test_format_discovery_report_splits_top_picks_and_quantitative_radar(self) -> None:
+        report = {
+            "selected": [
+                {
+                    "set_id": "76281",
+                    "set_name": "X-Jet di X-Men",
+                    "source": "lego_proxy_reader",
+                    "ai_shortlisted": True,
+                    "signal_strength": "LOW_CONFIDENCE",
+                    "ai_investment_score": 72,
+                    "market_demand_score": 95,
+                    "forecast_score": 59,
+                    "forecast_probability_upside_12m": 66.2,
+                    "confidence_score": 58,
+                    "eol_date_prediction": "2026-05-16",
+                    "risk_note": "Confidenza dati sotto soglia.",
+                },
+                {
+                    "set_id": "71486",
+                    "set_name": "Castello di Nocturnia",
+                    "source": "lego_proxy_reader",
+                    "ai_shortlisted": False,
+                    "signal_strength": "LOW_CONFIDENCE",
+                    "ai_investment_score": 67,
+                    "market_demand_score": 95,
+                    "forecast_score": 61,
+                    "forecast_probability_upside_12m": 69.9,
+                    "confidence_score": 53,
+                    "eol_date_prediction": "2026-05-30",
+                    "risk_note": "AI non eseguita: pre-filter rank #6 oltre top 3.",
+                },
+            ],
+            "diagnostics": {
+                "fallback_used": True,
+                "above_threshold_count": 14,
+                "above_threshold_high_confidence_count": 0,
+                "source_raw_counts": {},
+                "dedup_candidates": 41,
+                "threshold": 60,
+                "max_ai_score": 82,
+                "source_strategy": "external_first",
+                "selected_source": "external_proxy",
+                "ai_runtime": {"engine": "openrouter", "model": "x/y:free", "mode": "api"},
+            },
+        }
+
+        lines = LegoHunterTelegramBot._format_discovery_report(report, top_limit=3)
+        joined = "\n".join(lines)
+        self.assertIn("<b>Top Picks</b>", joined)
+        self.assertIn("<b>Radar quantitativo (AI non eseguita nel ciclo)</b>", joined)
+        top_section = joined.split("<b>Top Picks</b>", 1)[1].split("<b>Radar quantitativo (AI non eseguita nel ciclo)</b>", 1)[0]
+        self.assertIn("X-Jet di X-Men", top_section)
+        self.assertNotIn("Castello di Nocturnia", top_section)
+        radar_section = joined.split("<b>Radar quantitativo (AI non eseguita nel ciclo)</b>", 1)[1]
+        self.assertIn("Castello di Nocturnia", radar_section)
+        self.assertIn("AI non eseguita: pre-filter rank #6 oltre top 3.", radar_section)
+
+    def test_format_discovery_report_only_quantitative_radar_when_no_ai_shortlisted(self) -> None:
+        report = {
+            "selected": [
+                {
+                    "set_id": "71486",
+                    "set_name": "Castello di Nocturnia",
+                    "source": "lego_proxy_reader",
+                    "ai_shortlisted": False,
+                    "signal_strength": "LOW_CONFIDENCE",
+                    "ai_investment_score": 67,
+                    "market_demand_score": 95,
+                    "forecast_score": 61,
+                    "forecast_probability_upside_12m": 69.9,
+                    "confidence_score": 53,
+                    "eol_date_prediction": "2026-05-30",
+                    "risk_note": "AI non eseguita: pre-filter rank #6 oltre top 3.",
+                }
+            ],
+            "diagnostics": {
+                "fallback_used": True,
+                "above_threshold_count": 14,
+                "above_threshold_high_confidence_count": 0,
+                "source_raw_counts": {},
+                "dedup_candidates": 41,
+                "threshold": 60,
+                "max_ai_score": 82,
+                "source_strategy": "external_first",
+                "selected_source": "external_proxy",
+                "ai_runtime": {"engine": "openrouter", "model": "x/y:free", "mode": "api"},
+            },
+        }
+
+        lines = LegoHunterTelegramBot._format_discovery_report(report, top_limit=3)
+        joined = "\n".join(lines)
+        self.assertIn("🟠 Nessun Top Pick AI nel ciclo corrente.", joined)
+        self.assertIn("<b>Radar quantitativo (AI non eseguita nel ciclo)</b>", joined)
+        self.assertIn("Castello di Nocturnia", joined)
+
     def test_format_discovery_report_includes_historical_metrics_and_gate_thresholds(self) -> None:
         report = {
             "selected": [
@@ -868,6 +964,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 "fallback_used": True,
                 "no_signal_due_to_low_strict_pass": True,
                 "no_signal_strict_pass_rate_shortlist": 0.2,
+                "no_signal_trust_pass_rate_shortlist": 0.3,
                 "no_signal_strict_pass_min_rate": 0.5,
                 "source_raw_counts": {},
                 "dedup_candidates": 0,
@@ -882,8 +979,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
         lines = LegoHunterTelegramBot._format_discovery_report(report, top_limit=3)
         joined = "\n".join(lines)
-        self.assertIn("strict-pass shortlist 20% &lt; 50%", joined)
-        self.assertNotIn("strict-pass shortlist 20% < 50%", joined)
+        self.assertIn("affidabilità shortlist 30% &lt; 50%", joined)
+        self.assertIn("strict-pass 20%", joined)
+        self.assertNotIn("affidabilità shortlist 30% < 50%", joined)
 
     async def test_scheduled_cycle_continues_when_command_sync_times_out(self) -> None:
         bot_mock = AsyncMock()
@@ -1038,6 +1136,36 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Set richiesto: <b>76441</b>", text)
         self.assertIn("Set richiesto trovato ma <b>LOW_CONFIDENCE</b>", text)
         self.assertIn("Castello di Hogwarts", text)
+
+    async def test_scheduled_cycle_writes_diagnostic_pack_when_enabled(self) -> None:
+        bot_mock = AsyncMock()
+        bot_mock.set_my_commands = AsyncMock(return_value=True)
+        bot_mock.send_message = AsyncMock(return_value={"ok": True})
+        bot_mock.shutdown = AsyncMock(return_value=None)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                patch("bot.Bot", return_value=bot_mock),
+                patch("bot.PLAYWRIGHT_AVAILABLE", False),
+                patch.dict("os.environ", {"LH_DIAGNOSTIC_DIR": tmp_dir}, clear=False),
+            ):
+                await run_scheduled_cycle(
+                    token="token",
+                    chat_id="123",
+                    oracle=FakeOracle(),
+                    repository=FakeRepo(),
+                    fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+                )
+
+            snapshot_path = os.path.join(tmp_dir, "discovery_snapshot.json")
+            preview_html_path = os.path.join(tmp_dir, "telegram_message_preview.html")
+            preview_txt_path = os.path.join(tmp_dir, "telegram_message_preview.txt")
+            kpi_path = os.path.join(tmp_dir, "kpi_summary.txt")
+
+            self.assertTrue(os.path.exists(snapshot_path))
+            self.assertTrue(os.path.exists(preview_html_path))
+            self.assertTrue(os.path.exists(preview_txt_path))
+            self.assertTrue(os.path.exists(kpi_path))
 
 
 if __name__ == "__main__":

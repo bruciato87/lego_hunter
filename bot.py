@@ -9,7 +9,8 @@ import os
 import re
 import urllib.error
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Optional
 from urllib.parse import quote_plus
 
@@ -261,6 +262,106 @@ def _html_to_plain_text_for_telegram(text: str) -> str:
     plain = re.sub(r"</?(?:b|i|code)>", "", plain, flags=re.IGNORECASE)
     plain = re.sub(r"<[^>]+>", "", plain)
     return html.unescape(plain)
+
+
+def _json_safe_payload(data: Any) -> Any:
+    try:
+        return json.loads(json.dumps(data, ensure_ascii=False, default=str))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _write_diagnostic_pack(
+    *,
+    report: dict[str, Any],
+    diagnostics: dict[str, Any],
+    payload_html: str,
+    requested_single_set_id: str,
+    holdings_count: int,
+) -> Optional[Path]:
+    output_dir = str(os.getenv("LH_DIAGNOSTIC_DIR") or "").strip()
+    if not output_dir:
+        return None
+
+    pack_dir = Path(output_dir)
+    pack_dir.mkdir(parents=True, exist_ok=True)
+
+    strict_rate = float(diagnostics.get("strict_pass_rate_shortlist") or diagnostics.get("strict_pass_rate") or 0.0)
+    trust_rate = float(diagnostics.get("trust_pass_rate_shortlist") or diagnostics.get("trust_pass_rate") or 0.0)
+    non_json_rate = float(diagnostics.get("non_json_rate_shortlist") or diagnostics.get("non_json_rate") or 0.0)
+    fallback_rate = float(diagnostics.get("fallback_rate_shortlist") or diagnostics.get("fallback_rate") or 0.0)
+    no_signal = bool(diagnostics.get("no_signal_due_to_low_strict_pass"))
+    no_signal_reason = str(diagnostics.get("no_signal_reason") or "").strip()
+    ai_runtime = diagnostics.get("ai_runtime") or {}
+    ranking = diagnostics.get("ranking") or {}
+
+    snapshot = {
+        "generated_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "requested_single_set_id": requested_single_set_id or None,
+        "run_context": {
+            "event_name": os.getenv("GITHUB_EVENT_NAME"),
+            "run_id": os.getenv("GITHUB_RUN_ID"),
+            "run_attempt": os.getenv("GITHUB_RUN_ATTEMPT"),
+            "workflow": os.getenv("GITHUB_WORKFLOW"),
+        },
+        "holdings_count": int(holdings_count),
+        "kpi": {
+            "ranked_candidates": int(diagnostics.get("ranked_candidates") or 0),
+            "above_threshold_count": int(diagnostics.get("above_threshold_count") or 0),
+            "high_confidence_count": int(diagnostics.get("above_threshold_high_confidence_count") or 0),
+            "strict_pass_rate_shortlist": round(strict_rate, 4),
+            "trust_pass_rate_shortlist": round(trust_rate, 4),
+            "non_json_rate_shortlist": round(non_json_rate, 4),
+            "fallback_rate_shortlist": round(fallback_rate, 4),
+            "no_signal_due_to_low_quality": no_signal,
+            "no_signal_reason": no_signal_reason or None,
+        },
+        "ai_runtime": _json_safe_payload(ai_runtime),
+        "ranking_runtime": _json_safe_payload(ranking),
+        "selected_top": _json_safe_payload(list(report.get("selected") or [])[:3]),
+        "diagnostics": _json_safe_payload(diagnostics),
+    }
+
+    (pack_dir / "discovery_snapshot.json").write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (pack_dir / "telegram_message_preview.html").write_text(payload_html, encoding="utf-8")
+    (pack_dir / "telegram_message_preview.txt").write_text(
+        _html_to_plain_text_for_telegram(payload_html),
+        encoding="utf-8",
+    )
+
+    kpi_lines = [
+        f"generated_at_utc={snapshot['generated_at_utc']}",
+        f"event_name={snapshot['run_context'].get('event_name') or ''}",
+        f"run_id={snapshot['run_context'].get('run_id') or ''}",
+        f"requested_single_set_id={requested_single_set_id or ''}",
+        f"ranked_candidates={int(diagnostics.get('ranked_candidates') or 0)}",
+        f"above_threshold_count={int(diagnostics.get('above_threshold_count') or 0)}",
+        f"high_confidence_count={int(diagnostics.get('above_threshold_high_confidence_count') or 0)}",
+        f"strict_pass_rate_shortlist={strict_rate:.4f}",
+        f"trust_pass_rate_shortlist={trust_rate:.4f}",
+        f"non_json_rate_shortlist={non_json_rate:.4f}",
+        f"fallback_rate_shortlist={fallback_rate:.4f}",
+        f"no_signal_due_to_low_quality={'true' if no_signal else 'false'}",
+        f"no_signal_reason={no_signal_reason}",
+    ]
+    (pack_dir / "kpi_summary.txt").write_text("\n".join(kpi_lines) + "\n", encoding="utf-8")
+
+    if no_signal and no_signal_reason:
+        (pack_dir / "no_signal_reason.txt").write_text(no_signal_reason + "\n", encoding="utf-8")
+
+    LOGGER.info(
+        "Diagnostic pack saved | dir=%s no_signal=%s strict_pass=%.2f trust_pass=%.2f non_json=%.2f fallback=%.2f",
+        str(pack_dir),
+        no_signal,
+        strict_rate,
+        trust_rate,
+        non_json_rate,
+        fallback_rate,
+    )
+    return pack_dir
 
 
 async def validate_secondary_deals_with_scrapers(
@@ -1011,7 +1112,21 @@ class LegoHunterTelegramBot:
 
     @staticmethod
     def _format_discovery_report(report: dict[str, Any], *, top_limit: int = 3) -> list[str]:
-        selected = list(report.get("selected") or [])[:top_limit]
+        selected_rows = list(report.get("selected") or [])
+
+        def _is_ai_evaluated_row(row: dict[str, Any]) -> bool:
+            if "ai_shortlisted" in row:
+                return bool(row.get("ai_shortlisted"))
+            source_origin = str(row.get("ai_source_origin") or "").strip().lower()
+            if source_origin.startswith("heuristic_skipped"):
+                return False
+            risk_note = str(row.get("risk_note") or "").strip().lower()
+            if "ai non eseguita" in risk_note or "pre-filter rank" in risk_note:
+                return False
+            return True
+
+        selected = [row for row in selected_rows if _is_ai_evaluated_row(row)][:top_limit]
+        quantitative_radar = [row for row in selected_rows if not _is_ai_evaluated_row(row)][:top_limit]
         diagnostics = report.get("diagnostics") or {}
         ai_runtime = diagnostics.get("ai_runtime") or {}
         bootstrap_enabled = bool(diagnostics.get("bootstrap_thresholds_enabled"))
@@ -1031,14 +1146,22 @@ class LegoHunterTelegramBot:
         )
         no_signal_low_strict = bool(diagnostics.get("no_signal_due_to_low_strict_pass"))
         no_signal_strict_rate = float(diagnostics.get("no_signal_strict_pass_rate_shortlist") or 0.0)
+        no_signal_trust_rate = float(diagnostics.get("no_signal_trust_pass_rate_shortlist") or 0.0)
         no_signal_min_rate = float(diagnostics.get("no_signal_strict_pass_min_rate") or 0.0)
 
         lines: list[str] = []
         if no_signal_low_strict:
-            lines.append(
-                "⚠️ Nessun segnale operativo nel ciclo: qualità AI insufficiente "
-                f"(strict-pass shortlist {no_signal_strict_rate * 100.0:.0f}% &lt; {no_signal_min_rate * 100.0:.0f}%)."
-            )
+            if no_signal_trust_rate > 0.0:
+                lines.append(
+                    "⚠️ Nessun segnale operativo nel ciclo: qualità AI insufficiente "
+                    f"(affidabilità shortlist {no_signal_trust_rate * 100.0:.0f}% &lt; {no_signal_min_rate * 100.0:.0f}%, "
+                    f"strict-pass {no_signal_strict_rate * 100.0:.0f}%)."
+                )
+            else:
+                lines.append(
+                    "⚠️ Nessun segnale operativo nel ciclo: qualità AI insufficiente "
+                    f"(strict-pass shortlist {no_signal_strict_rate * 100.0:.0f}% &lt; {no_signal_min_rate * 100.0:.0f}%)."
+                )
         elif diagnostics.get("fallback_used"):
             above_threshold_count = int(diagnostics.get("above_threshold_count") or 0)
             high_conf_count = int(diagnostics.get("above_threshold_high_confidence_count") or 0)
@@ -1163,8 +1286,45 @@ class LegoHunterTelegramBot:
                     risk_note = str(row.get("risk_note") or "Conferma manuale consigliata.")
                     lines.append(f"Nota: {html.escape(risk_note)}")
                 lines.append("")
+        elif quantitative_radar:
+            lines.append("🟠 Nessun Top Pick AI nel ciclo corrente.")
         else:
             lines.append("🟠 Nessun candidato utile in questo ciclo.")
+
+        if quantitative_radar:
+            lines.append("")
+            lines.append("<b>Radar quantitativo (AI non eseguita nel ciclo)</b>")
+            for idx, row in enumerate(quantitative_radar, start=1):
+                set_name = html.escape(str(row.get("set_name") or "n/d"))
+                set_id = html.escape(str(row.get("set_id") or "n/d"))
+                source = html.escape(str(row.get("source") or "unknown"))
+                metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                composite = int(row.get("composite_score") or row.get("ai_investment_score") or metadata.get("composite_score") or 0)
+                quant_score = int(row.get("forecast_score") or metadata.get("forecast_score") or 0)
+                demand_score = int(row.get("market_demand_score") or 0)
+                pattern_score = int(row.get("pattern_score") or metadata.get("success_pattern_score") or 0)
+                prob_12m = float(
+                    row.get("forecast_probability_upside_12m")
+                    or metadata.get("forecast_probability_upside_12m")
+                    or 0.0
+                )
+                roi_12m = float(row.get("expected_roi_12m_pct") or metadata.get("expected_roi_12m_pct") or 0.0)
+                months_to_target = row.get("estimated_months_to_target") or metadata.get("forecast_estimated_months_to_target")
+                confidence_score = int(row.get("confidence_score") or metadata.get("forecast_confidence_score") or 0)
+                eol = html.escape(LegoHunterTelegramBot._format_eol_date(row.get("eol_date_prediction")))
+                target_line = f"Target {int(months_to_target)} mesi" if months_to_target is not None else "Target n/d"
+                lines.append(f"🟠 <b>{idx}) {set_name}</b> ({set_id})")
+                lines.append(
+                    f"Score {composite}/100 | Quant {quant_score}/100 | Demand {demand_score}/100 | Pattern {pattern_score}/100"
+                )
+                lines.append(
+                    f"Prob Upside 12m {prob_12m:.1f}% | ROI atteso 12m {roi_12m:+.1f}% | {target_line} | EOL {eol} | Conf {confidence_score}/100"
+                )
+                lines.append(f"Fonte: {source}")
+                lines.append(LegoHunterTelegramBot._format_pick_link(row))
+                risk_note = str(row.get("risk_note") or "AI non eseguita nel ciclo corrente (ranking quantitativo).")
+                lines.append(f"Nota: {html.escape(risk_note)}")
+                lines.append("")
 
         source_raw = diagnostics.get("source_raw_counts") or {}
         source_strategy = str(diagnostics.get("source_strategy") or "n/d")
@@ -1572,6 +1732,16 @@ async def run_scheduled_cycle(
         lines.append(f"📦 Set in collezione: <b>{len(holdings)}</b>")
 
         payload = "\n".join(lines)
+        try:
+            _write_diagnostic_pack(
+                report=report,
+                diagnostics=diagnostics,
+                payload_html=payload,
+                requested_single_set_id=requested_single_set_id,
+                holdings_count=len(holdings),
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Diagnostic pack generation failed (non-fatal): %s", exc)
         LOGGER.info(
             "Sending scheduled Telegram report | lines=%s chars=%s holdings=%s",
             len(lines),
