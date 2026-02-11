@@ -22,7 +22,8 @@ on:
         default: ""
         type: string
   schedule:
-    - cron: "0 */6 * * *"
+    # GitHub cron is UTC. 07:00/20:00 UTC ~= 08:00/21:00 Europe/Rome in CET.
+    - cron: "0 7,20 * * *"
 
 jobs:
   test:

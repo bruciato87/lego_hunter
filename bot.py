@@ -1554,7 +1554,7 @@ async def run_scheduled_cycle(
         else:
             lines.extend(
                 [
-                    "<b>🧱 LEGO HUNTER</b> <i>Update automatico (ogni 6 ore)</i>",
+                    "<b>🧱 LEGO HUNTER</b> <i>Update automatico (08:00 e 21:00 ora IT)</i>",
                     "",
                 ]
             )
