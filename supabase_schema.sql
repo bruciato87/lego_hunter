@@ -97,10 +97,12 @@ create index if not exists idx_portfolio_status
 create index if not exists idx_fiscal_log_date_platform
   on public.fiscal_log (event_date, platform, event_type);
 
+drop trigger if exists trg_opportunity_updated_at on public.opportunity_radar;
 create trigger trg_opportunity_updated_at
 before update on public.opportunity_radar
 for each row execute function public.touch_updated_at();
 
+drop trigger if exists trg_portfolio_updated_at on public.portfolio;
 create trigger trg_portfolio_updated_at
 before update on public.portfolio
 for each row execute function public.touch_updated_at();
