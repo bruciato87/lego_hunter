@@ -11,7 +11,13 @@ from typing import Any, Optional
 
 from telegram import Bot, Update
 
-from bot import LegoHunterTelegramBot, build_application
+from bot import (
+    LegoHunterTelegramBot,
+    _dispatch_scova_workflow,
+    _dispatch_single_set_analysis_workflow,
+    _normalize_set_id_token,
+    build_application,
+)
 from fiscal import FiscalGuardian
 from models import LegoHunterRepository
 from oracle import DiscoveryOracle
@@ -26,6 +32,7 @@ WEBHOOK_PATHS = {"/api/telegram_webhook", "/telegram/webhook"}
 HEALTH_PATHS = {"/", "/healthz", "/api/telegram_webhook/healthz"}
 
 _MANAGER: Optional[LegoHunterTelegramBot] = None
+CLOUD_DISPATCH_COMMANDS = {"/scova", "/hunt", "/analizza", "/analisi"}
 
 
 def _is_truthy(raw_value: Optional[str], default: bool = False) -> bool:
@@ -88,6 +95,27 @@ def _extract_command_from_payload(payload: dict[str, Any]) -> str:
     return ""
 
 
+def _extract_text_from_payload(payload: dict[str, Any]) -> str:
+    for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+        message = payload.get(key)
+        if not isinstance(message, dict):
+            continue
+        raw_text = str(message.get("text") or message.get("caption") or "").strip()
+        if raw_text:
+            return raw_text
+    return ""
+
+
+def _extract_command_args_from_payload(payload: dict[str, Any]) -> list[str]:
+    raw_text = _extract_text_from_payload(payload)
+    if not raw_text.startswith("/"):
+        return []
+    parts = raw_text.split()
+    if len(parts) <= 1:
+        return []
+    return [str(item).strip() for item in parts[1:] if str(item).strip()]
+
+
 def _extract_chat_and_message_id(payload: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
     for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
         message = payload.get(key)
@@ -110,6 +138,34 @@ def _extract_chat_and_message_id(payload: dict[str, Any]) -> tuple[Optional[int]
     return None, None
 
 
+async def _send_webhook_message(
+    *,
+    token: str,
+    chat_id: int,
+    reply_to_message_id: Optional[int],
+    text: str,
+) -> None:
+    bot = Bot(token=token)
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_to_message_id=reply_to_message_id,
+            disable_web_page_preview=True,
+            connect_timeout=8,
+            read_timeout=12,
+            write_timeout=12,
+            pool_timeout=8,
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Failed to send webhook message | chat_id=%s error=%s", chat_id, exc)
+    finally:
+        try:
+            await bot.shutdown()
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Bot shutdown warning after lightweight notice", exc_info=True)
+
+
 async def _send_webhook_light_notice(
     *,
     token: str,
@@ -119,32 +175,105 @@ async def _send_webhook_light_notice(
     chat_id, reply_to_message_id = _extract_chat_and_message_id(payload)
     if chat_id is None:
         return
-
     notice = (
         "Comando non disponibile nel webhook leggero.\n"
         "Usa /acquista, /venduto, /analizza, /radar, /cerca, /collezione, /vendi, /help.\n"
         "La discovery completa (/scova) gira nei cicli schedulati cloud."
     )
-    bot = Bot(token=token)
-    try:
-        await bot.send_message(
+    await _send_webhook_message(
+        token=token,
+        chat_id=chat_id,
+        reply_to_message_id=reply_to_message_id,
+        text=notice,
+    )
+    LOGGER.info("Webhook lightweight notice sent | command=%s chat_id=%s", command, chat_id)
+
+
+async def _maybe_dispatch_cloud_command_from_webhook(
+    *,
+    token: str,
+    payload: dict[str, Any],
+    command: str,
+) -> bool:
+    if command not in CLOUD_DISPATCH_COMMANDS:
+        return False
+
+    chat_id, reply_to_message_id = _extract_chat_and_message_id(payload)
+    if chat_id is None:
+        return True
+
+    allowed_chat_id = str(os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    if allowed_chat_id and str(chat_id) != allowed_chat_id:
+        await _send_webhook_message(
+            token=token,
             chat_id=chat_id,
-            text=notice,
             reply_to_message_id=reply_to_message_id,
-            disable_web_page_preview=True,
-            connect_timeout=8,
-            read_timeout=12,
-            write_timeout=12,
-            pool_timeout=8,
+            text="Chat non autorizzata.",
         )
-        LOGGER.info("Webhook lightweight notice sent | command=%s chat_id=%s", command, chat_id)
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("Failed to send webhook lightweight notice | command=%s error=%s", command, exc)
-    finally:
-        try:
-            await bot.shutdown()
-        except Exception:  # noqa: BLE001
-            LOGGER.debug("Bot shutdown warning after lightweight notice", exc_info=True)
+        LOGGER.warning("Webhook cloud dispatch rejected for unauthorized chat_id=%s", chat_id)
+        return True
+
+    if command in {"/scova", "/hunt"}:
+        ok, detail = await asyncio.to_thread(
+            _dispatch_scova_workflow,
+            chat_id=str(chat_id),
+        )
+        message = (
+            detail
+            if ok
+            else (
+                "Impossibile avviare /scova su GitHub.\n"
+                f"Dettaglio: {detail}\n"
+                "Config richiesta: GITHUB_ACTIONS_DISPATCH_TOKEN, GITHUB_REPO, "
+                "GITHUB_WORKFLOW_FILE (opzionale), GITHUB_WORKFLOW_REF (opzionale)."
+            )
+        )
+        await _send_webhook_message(
+            token=token,
+            chat_id=chat_id,
+            reply_to_message_id=reply_to_message_id,
+            text=message,
+        )
+        LOGGER.info("Webhook cloud dispatch /scova handled | chat_id=%s ok=%s", chat_id, ok)
+        return True
+
+    if command in {"/analizza", "/analisi"}:
+        args = _extract_command_args_from_payload(payload)
+        set_id = _normalize_set_id_token(args[0] if args else "")
+        if not set_id:
+            await _send_webhook_message(
+                token=token,
+                chat_id=chat_id,
+                reply_to_message_id=reply_to_message_id,
+                text="Uso: /analizza <set_id>  (esempio: /analizza 76441)",
+            )
+            return True
+
+        ok, detail = await asyncio.to_thread(
+            _dispatch_single_set_analysis_workflow,
+            set_id=set_id,
+            chat_id=str(chat_id),
+        )
+        message = (
+            detail
+            if ok
+            else (
+                "Impossibile avviare l'analisi su GitHub.\n"
+                f"Dettaglio: {detail}\n"
+                "Config richiesta: GITHUB_ACTIONS_DISPATCH_TOKEN, GITHUB_REPO, "
+                "GITHUB_WORKFLOW_FILE (opzionale), GITHUB_WORKFLOW_REF (opzionale)."
+            )
+        )
+        await _send_webhook_message(
+            token=token,
+            chat_id=chat_id,
+            reply_to_message_id=reply_to_message_id,
+            text=message,
+        )
+        LOGGER.info("Webhook cloud dispatch /analizza handled | chat_id=%s set_id=%s ok=%s", chat_id, set_id, ok)
+        return True
+
+    return False
 
 
 def _expected_webhook_secret() -> str:
@@ -185,6 +314,14 @@ async def _process_update_payload(payload: dict[str, Any]) -> None:
         raise RuntimeError("Missing TELEGRAM_TOKEN")
 
     command = _extract_command_from_payload(payload)
+    if _webhook_light_mode_enabled() and command:
+        if await _maybe_dispatch_cloud_command_from_webhook(
+            token=token,
+            payload=payload,
+            command=command,
+        ):
+            return
+
     if _webhook_light_mode_enabled() and command and command in _blocked_webhook_commands():
         LOGGER.info("Webhook lightweight command block | command=%s", command)
         await _send_webhook_light_notice(token=token, payload=payload, command=command)

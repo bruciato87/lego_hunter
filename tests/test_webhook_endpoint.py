@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from api.telegram_webhook import (
     _blocked_webhook_commands,
+    _extract_command_args_from_payload,
     _extract_command_from_payload,
     _extract_chat_and_message_id,
     _has_valid_secret,
     _is_health_path,
+    _maybe_dispatch_cloud_command_from_webhook,
     _is_webhook_path,
     _normalize_path,
     _webhook_light_mode_enabled,
@@ -53,6 +55,16 @@ class WebhookEndpointTests(unittest.TestCase):
         }
         self.assertEqual(_extract_command_from_payload(payload), "/scova")
 
+    def test_extract_command_args_from_payload(self) -> None:
+        payload = {
+            "message": {
+                "text": "/analizza@lego_hunter_bot 76441 rapido",
+                "chat": {"id": 12345},
+                "message_id": 88,
+            }
+        }
+        self.assertEqual(_extract_command_args_from_payload(payload), ["76441", "rapido"])
+
     def test_extract_chat_and_message_id(self) -> None:
         payload = {
             "message": {
@@ -72,6 +84,47 @@ class WebhookEndpointTests(unittest.TestCase):
             self.assertEqual(_blocked_webhook_commands(), {"/scova", "/hunt"})
         with patch.dict(os.environ, {"WEBHOOK_BLOCKED_COMMANDS": "scova, hunt,offerte"}, clear=True):
             self.assertEqual(_blocked_webhook_commands(), {"/scova", "/hunt", "/offerte"})
+
+class WebhookCloudDispatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_maybe_dispatch_cloud_command_scova(self) -> None:
+        payload = {
+            "message": {
+                "text": "/scova",
+                "chat": {"id": 12345},
+                "message_id": 88,
+            }
+        }
+        with patch.dict(os.environ, {"TELEGRAM_CHAT_ID": "12345"}, clear=True):
+            with patch("api.telegram_webhook._dispatch_scova_workflow", return_value=(True, "ok")) as mocked_dispatch:
+                with patch("api.telegram_webhook._send_webhook_message", new=AsyncMock()) as mocked_send:
+                    handled = await _maybe_dispatch_cloud_command_from_webhook(
+                        token="token",
+                        payload=payload,
+                        command="/scova",
+                    )
+        self.assertTrue(handled)
+        mocked_dispatch.assert_called_once_with(chat_id="12345")
+        mocked_send.assert_awaited_once()
+
+    async def test_maybe_dispatch_cloud_command_analizza_without_set_id(self) -> None:
+        payload = {
+            "message": {
+                "text": "/analizza",
+                "chat": {"id": 12345},
+                "message_id": 88,
+            }
+        }
+        with patch.dict(os.environ, {"TELEGRAM_CHAT_ID": "12345"}, clear=True):
+            with patch("api.telegram_webhook._dispatch_single_set_analysis_workflow") as mocked_dispatch:
+                with patch("api.telegram_webhook._send_webhook_message", new=AsyncMock()) as mocked_send:
+                    handled = await _maybe_dispatch_cloud_command_from_webhook(
+                        token="token",
+                        payload=payload,
+                        command="/analizza",
+                    )
+        self.assertTrue(handled)
+        mocked_dispatch.assert_not_called()
+        mocked_send.assert_awaited_once()
 
 
 if __name__ == "__main__":

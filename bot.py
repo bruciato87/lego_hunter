@@ -76,10 +76,10 @@ def _github_dispatch_repository() -> str:
     return repo
 
 
-def _dispatch_single_set_analysis_workflow(
+def _dispatch_github_workflow(
     *,
-    set_id: str,
     chat_id: Optional[str],
+    analysis_set_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     token = str(
         os.getenv("GITHUB_ACTIONS_DISPATCH_TOKEN")
@@ -103,7 +103,9 @@ def _dispatch_single_set_analysis_workflow(
             + ".",
         )
 
-    inputs: dict[str, str] = {"analysis_set_id": set_id}
+    inputs: dict[str, str] = {}
+    if analysis_set_id is not None:
+        inputs["analysis_set_id"] = str(analysis_set_id)
     if chat_id:
         inputs["analysis_chat_id"] = str(chat_id)
     payload = {
@@ -147,10 +149,34 @@ def _dispatch_single_set_analysis_workflow(
         return False, f"GitHub dispatch non confermato (status {status})."
 
     workflow_url = f"https://github.com/{repository}/actions/workflows/{workflow_file}"
+    return True, workflow_url
+
+
+def _dispatch_single_set_analysis_workflow(
+    *,
+    set_id: str,
+    chat_id: Optional[str],
+) -> tuple[bool, str]:
+    ok, detail = _dispatch_github_workflow(chat_id=chat_id, analysis_set_id=set_id)
+    if not ok:
+        return False, detail
+    workflow_url = detail
     return (
         True,
         "✅ Analisi approfondita avviata su GitHub Actions per set "
         f"{set_id}.\nSegui qui: {workflow_url}",
+    )
+
+
+def _dispatch_scova_workflow(*, chat_id: Optional[str]) -> tuple[bool, str]:
+    ok, detail = _dispatch_github_workflow(chat_id=chat_id, analysis_set_id="")
+    if not ok:
+        return False, detail
+    workflow_url = detail
+    return (
+        True,
+        "✅ Discovery /scova avviata su GitHub Actions.\n"
+        f"Segui qui: {workflow_url}",
     )
 
 
