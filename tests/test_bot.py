@@ -10,6 +10,7 @@ from telegram.error import BadRequest, TimedOut
 from bot import (
     LegoHunterTelegramBot,
     _dispatch_single_set_analysis_workflow,
+    _telegram_payload_log_preview,
     _parse_eur_amount,
     _parse_positive_quantity,
     build_application,
@@ -954,8 +955,14 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("solo <b>HIGH_CONFIDENCE_BOOTSTRAP</b>", joined)
         self.assertIn("Segnale: HIGH_CONFIDENCE_BOOTSTRAP (preliminare)", joined)
         self.assertIn("🧪 Qualita AI (shortlist): strict-pass 14% | non-JSON 21% | fallback 33%", joined)
-        self.assertIn("📊 Copertura ranking totale: non-JSON 5% | fallback 71%", joined)
+        self.assertIn("📊 Copertura full ranking (incl. pre-filter/cache): non-JSON 5% | fallback 71%", joined)
         self.assertIn("🛡️ AI guardrail: 2 score normalizzati | Max AI raw 99", joined)
+
+    def test_telegram_payload_log_preview_truncates_long_text(self) -> None:
+        long_text = "x" * 8200
+        preview = _telegram_payload_log_preview(long_text, max_chars=8000)
+        self.assertIn("preview truncated", preview)
+        self.assertLessEqual(len(preview), 8100)
 
     def test_format_discovery_report_no_signal_line_is_html_safe(self) -> None:
         report = {

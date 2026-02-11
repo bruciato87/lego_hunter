@@ -264,6 +264,18 @@ def _html_to_plain_text_for_telegram(text: str) -> str:
     return html.unescape(plain)
 
 
+def _telegram_payload_log_preview(text: str, max_chars: int = 8000) -> str:
+    if not text:
+        return ""
+    normalized = text.replace("\r\n", "\n").strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    keep = max(0, max_chars - 64)
+    trimmed = normalized[:keep]
+    omitted = len(normalized) - len(trimmed)
+    return f"{trimmed}\n...[preview truncated: {omitted} chars omitted]"
+
+
 def _json_safe_payload(data: Any) -> Any:
     try:
         return json.loads(json.dumps(data, ensure_ascii=False, default=str))
@@ -1402,7 +1414,7 @@ class LegoHunterTelegramBot:
             or abs(total_fallback_rate - fallback_rate) > 0.0001
         ):
             lines.append(
-                f"📊 Copertura ranking totale: non-JSON {total_non_json_rate * 100.0:.0f}% | "
+                f"📊 Copertura full ranking (incl. pre-filter/cache): non-JSON {total_non_json_rate * 100.0:.0f}% | "
                 f"fallback {total_fallback_rate * 100.0:.0f}%"
             )
         if (
@@ -1748,6 +1760,17 @@ async def run_scheduled_cycle(
             len(payload),
             len(holdings),
         )
+        preview_enabled = str(os.getenv("TELEGRAM_PREVIEW_LOG_ENABLED", "1")).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if preview_enabled:
+            LOGGER.info(
+                "Telegram report preview (HTML payload)\n%s",
+                _telegram_payload_log_preview(payload),
+            )
         try:
             send_result = await _telegram_call_with_retry(
                 operation_name="bot.send_message",
