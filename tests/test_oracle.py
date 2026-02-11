@@ -1014,6 +1014,99 @@ class OracleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bool(diagnostics.get("fallback_used")))
         self.assertEqual(report["selected"], [])
 
+    async def test_discovery_keeps_low_conf_signals_when_trust_rate_is_sufficient(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_no_signal_on_low_strict_pass = True
+        oracle.ai_no_signal_min_strict_pass_rate = 0.5
+        oracle.ai_non_json_trust_weight = 0.6
+        oracle._last_source_diagnostics = {
+            "source_strategy": "external_first",
+            "source_order": ["external_proxy", "playwright"],
+            "selected_source": "external_proxy",
+            "source_raw_counts": {"lego_proxy_reader": 2, "amazon_proxy_reader": 1},
+            "source_dedup_counts": {"lego_proxy_reader": 2, "amazon_proxy_reader": 1},
+            "source_failures": [],
+            "source_signals": {},
+            "dedup_candidates": 3,
+            "fallback_source_used": False,
+            "fallback_notes": [],
+            "anti_bot_alert": False,
+            "anti_bot_message": None,
+            "root_cause_hint": None,
+        }
+        ranked_rows = [
+            {
+                "set_id": "301",
+                "source": "lego_proxy_reader",
+                "composite_score": 72,
+                "forecast_score": 61,
+                "forecast_probability_upside_12m": 66.0,
+                "confidence_score": 59,
+                "market_demand_score": 91,
+                "ai_raw_score": 79,
+                "ai_shortlisted": True,
+                "ai_fallback_used": False,
+                "ai_strict_pass": True,
+            },
+            {
+                "set_id": "302",
+                "source": "lego_proxy_reader",
+                "composite_score": 70,
+                "forecast_score": 60,
+                "forecast_probability_upside_12m": 65.0,
+                "confidence_score": 58,
+                "market_demand_score": 90,
+                "ai_raw_score": 76,
+                "ai_shortlisted": True,
+                "ai_fallback_used": False,
+                "ai_strict_pass": False,
+                "risk_note": "Output AI non JSON: score estratto da testo con parsing robusto.",
+            },
+            {
+                "set_id": "303",
+                "source": "amazon_proxy_reader",
+                "composite_score": 69,
+                "forecast_score": 59,
+                "forecast_probability_upside_12m": 64.0,
+                "confidence_score": 57,
+                "market_demand_score": 88,
+                "ai_raw_score": 74,
+                "ai_shortlisted": True,
+                "ai_fallback_used": False,
+                "ai_strict_pass": False,
+                "risk_note": "Output AI non JSON: score estratto da testo con parsing robusto.",
+            },
+            {
+                "set_id": "304",
+                "source": "amazon_proxy_reader",
+                "composite_score": 65,
+                "forecast_score": 55,
+                "forecast_probability_upside_12m": 61.0,
+                "confidence_score": 53,
+                "market_demand_score": 85,
+                "ai_raw_score": 70,
+                "ai_shortlisted": True,
+                "ai_fallback_used": True,
+                "ai_strict_pass": False,
+                "risk_note": "AI single-call batch non ha restituito output valido per questo set: applicato fallback euristico.",
+            },
+        ]
+        source_candidates = [{"set_id": row["set_id"]} for row in ranked_rows]
+
+        with (
+            patch.object(oracle, "_collect_source_candidates", new=AsyncMock(return_value=source_candidates)),
+            patch.object(oracle, "_rank_and_persist_candidates", new=AsyncMock(return_value=ranked_rows)),
+        ):
+            report = await oracle.discover_with_diagnostics(persist=False, top_limit=10, fallback_limit=3)
+
+        diagnostics = report["diagnostics"]
+        self.assertEqual(int(diagnostics.get("ai_shortlist_strict_pass_count") or 0), 1)
+        self.assertAlmostEqual(float(diagnostics.get("strict_pass_rate_shortlist") or 0.0), 0.25, places=4)
+        self.assertAlmostEqual(float(diagnostics.get("trust_pass_rate_shortlist") or 0.0), 0.55, places=4)
+        self.assertFalse(bool(diagnostics.get("no_signal_due_to_low_strict_pass")))
+        self.assertGreater(len(report.get("selected") or []), 0)
+
     async def test_non_fallback_can_be_low_confidence_with_weak_quant_data(self) -> None:
         repo = FakeRepo()
         candidates = [
@@ -2664,8 +2757,15 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             "ai_timeout_count": 0,
         }
 
-        async def fake_batch(entries, *, deadline, allow_repair_calls=True, allow_failover_call=True):  # noqa: ANN001
-            _ = (deadline, allow_repair_calls, allow_failover_call)
+        async def fake_batch(  # noqa: ANN001
+            entries,
+            *,
+            deadline,
+            allow_repair_calls=True,
+            allow_failover_call=True,
+            output_mode: str = "json_first",
+        ):
+            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode)
             scored = {}
             for entry in entries:
                 set_id = str(entry.get("set_id") or "")
@@ -2817,8 +2917,9 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             deadline: float,
             allow_repair_calls: bool = True,
             allow_failover_call: bool = True,
+            output_mode: str = "json_first",
         ):
-            _ = (deadline, allow_repair_calls, allow_failover_call)
+            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode)
             scored = {}
             for entry in entries:
                 set_id = str(entry.get("set_id") or "")
@@ -2887,8 +2988,9 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             deadline: float,
             allow_repair_calls: bool = True,
             allow_failover_call: bool = True,
+            output_mode: str = "json_first",
         ):
-            _ = (deadline, allow_repair_calls, allow_failover_call)
+            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode)
             return {
                 "99701": AIInsight(
                     score=82,
@@ -2975,8 +3077,15 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             )
         }
 
-        async def fake_secondary_batch(entries, *, deadline, allow_repair_calls=True, allow_failover_call=True):  # noqa: ANN001
-            _ = (deadline, allow_repair_calls, allow_failover_call)
+        async def fake_secondary_batch(  # noqa: ANN001
+            entries,
+            *,
+            deadline,
+            allow_repair_calls=True,
+            allow_failover_call=True,
+            output_mode: str = "json_first",
+        ):
+            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode)
             scored = {
                 "15002": AIInsight(
                     score=81,
@@ -3064,8 +3173,15 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             )
         }
 
-        async def fake_secondary_batch(entries, *, deadline, allow_repair_calls=True, allow_failover_call=True):  # noqa: ANN001
-            _ = (deadline, allow_repair_calls, allow_failover_call)
+        async def fake_secondary_batch(  # noqa: ANN001
+            entries,
+            *,
+            deadline,
+            allow_repair_calls=True,
+            allow_failover_call=True,
+            output_mode: str = "json_first",
+        ):
+            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode)
             scored = {}
             for entry in entries:
                 set_id = str(entry.get("set_id") or "")
@@ -3167,8 +3283,15 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         }
         selected_orders = []
 
-        async def fake_secondary_batch(entries, *, deadline, allow_repair_calls=True, allow_failover_call=True):  # noqa: ANN001
-            _ = (deadline, allow_repair_calls, allow_failover_call)
+        async def fake_secondary_batch(  # noqa: ANN001
+            entries,
+            *,
+            deadline,
+            allow_repair_calls=True,
+            allow_failover_call=True,
+            output_mode: str = "json_first",
+        ):
+            _ = (deadline, allow_repair_calls, allow_failover_call, output_mode)
             selected_orders.append([str(entry.get("set_id") or "") for entry in entries])
             scored = {}
             for entry in entries:
@@ -3259,8 +3382,15 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
             )
         }
 
-        async def fake_batch(entries, *, deadline, allow_repair_calls=True, allow_failover_call=True):  # noqa: ANN001
-            _ = (entries, deadline, allow_repair_calls, allow_failover_call)
+        async def fake_batch(  # noqa: ANN001
+            entries,
+            *,
+            deadline,
+            allow_repair_calls=True,
+            allow_failover_call=True,
+            output_mode: str = "json_first",
+        ):
+            _ = (entries, deadline, allow_repair_calls, allow_failover_call, output_mode)
             return {
                 "16501": AIInsight(
                     score=76,
@@ -3564,6 +3694,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         }
         oracle.ai_no_signal_min_strict_pass_rate = 0.5
         oracle.ai_model_quality_min_samples = 2
+        oracle.ai_model_quality_min_trust_rate = 0.8
         oracle.ai_model_quality_max_non_json_rate = 0.25
 
         entries = [
@@ -3647,6 +3778,7 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         }
         oracle.ai_no_signal_min_strict_pass_rate = 0.5
         oracle.ai_model_quality_min_samples = 2
+        oracle.ai_model_quality_min_trust_rate = 0.8
         oracle.ai_model_quality_max_non_json_rate = 0.4
 
         entries = [
@@ -3774,11 +3906,11 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         low_strict = {
             "76281": AIInsight(
                 score=79,
-                summary="non json",
+                summary="fallback score",
                 predicted_eol_date="2026-10-01",
-                fallback_used=False,
+                fallback_used=True,
                 confidence="LOW_CONFIDENCE",
-                risk_note="Output AI non JSON: score estratto da testo con parsing robusto.",
+                risk_note="AI single-call batch non ha restituito output valido per questo set: applicato fallback euristico.",
             )
         }
         strict = {
@@ -4000,6 +4132,71 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertEqual(insights["75367"].score, 88)
         self.assertEqual(insights["76281"].score, 74)
         self.assertEqual(insights["42182"].score, 71)
+
+    def test_batch_insights_from_unstructured_text_kv_mode_marks_strict(self) -> None:
+        candidates = [
+            {"set_id": "75367", "set_name": "Set A", "theme": "Star Wars", "source": "lego_proxy_reader"},
+            {"set_id": "76281", "set_name": "Set B", "theme": "Marvel", "source": "lego_proxy_reader"},
+        ]
+        raw_text = (
+            "set_id=75367|score=88|summary=alta domanda|predicted_eol_date=2026-12-01\n"
+            "set_id=76281|score=74|summary=buon upside|predicted_eol_date=2026-10-01"
+        )
+        insights = DiscoveryOracle._batch_insights_from_unstructured_text(
+            raw_text,
+            candidates,
+            treat_key_value_as_strict=True,
+        )
+        self.assertEqual(set(insights.keys()), {"75367", "76281"})
+        self.assertEqual(insights["75367"].confidence, "HIGH_CONFIDENCE")
+        self.assertFalse(DiscoveryOracle._is_non_json_ai_note(insights["75367"].risk_note))
+        self.assertIn("kv-only", str(insights["75367"].risk_note or "").lower())
+
+    def test_resolve_batch_output_mode_prefers_kv_only_on_probe_non_json(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle._openrouter_model_id = "vendor/model-pro:free"
+        oracle.ai_runtime["probe_report"] = [
+            {
+                "model": "vendor/model-pro:free",
+                "status": "available",
+                "reason": "ok_text_non_json",
+            }
+        ]
+        mode, reason = oracle._resolve_batch_output_mode(
+            provider="openrouter",
+            model_name="vendor/model-pro:free",
+            candidate_count=5,
+        )
+        self.assertEqual(mode, "kv_only")
+        self.assertEqual(reason, "probe_non_json")
+
+    def test_effective_single_call_batch_plan_degrades_when_kv_only(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.ai_single_call_batch_chunk_size = 8
+        oracle.ai_single_call_batch_max_calls = 2
+        oracle.ai_single_call_degraded_batch_chunk_size = 4
+        oracle.ai_single_call_degraded_batch_max_calls = 3
+        oracle._openrouter_model_id = "vendor/model-pro:free"
+        oracle.ai_runtime.update(
+            {
+                "engine": "openrouter",
+                "provider": "openrouter",
+                "model": "vendor/model-pro:free",
+                "probe_report": [
+                    {
+                        "model": "vendor/model-pro:free",
+                        "status": "available",
+                        "reason": "ok_text_non_json",
+                    }
+                ],
+            }
+        )
+        chunk_size, max_calls, output_mode = oracle._effective_single_call_batch_plan(pending_count=12)
+        self.assertEqual(output_mode, "kv_only")
+        self.assertEqual(chunk_size, 4)
+        self.assertEqual(max_calls, 3)
 
     def test_batch_insights_from_unstructured_text_parses_tagged_blocks(self) -> None:
         candidates = [

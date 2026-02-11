@@ -72,12 +72,16 @@ DEFAULT_AI_BATCH_SCORING_ENABLED = True
 DEFAULT_AI_BATCH_MIN_CANDIDATES = 3
 DEFAULT_AI_BATCH_MAX_CANDIDATES = 12
 DEFAULT_AI_BATCH_TIMEOUT_SEC = 26.0
+DEFAULT_AI_BATCH_OUTPUT_MIN_MODEL_SAMPLES = 3
+DEFAULT_AI_BATCH_OUTPUT_NON_JSON_RATE_THRESHOLD = 0.45
 DEFAULT_AI_SINGLE_CALL_SCORING_ENABLED = False
 DEFAULT_AI_SINGLE_CALL_ALLOW_REPAIR_CALLS = False
 DEFAULT_AI_SINGLE_CALL_MAX_CANDIDATES = 12
 DEFAULT_AI_SINGLE_CALL_DYNAMIC_MAX_CANDIDATES = 16
 DEFAULT_AI_SINGLE_CALL_BATCH_CHUNK_SIZE = 8
 DEFAULT_AI_SINGLE_CALL_BATCH_MAX_CALLS = 2
+DEFAULT_AI_SINGLE_CALL_DEGRADED_BATCH_CHUNK_SIZE = 4
+DEFAULT_AI_SINGLE_CALL_DEGRADED_BATCH_MAX_CALLS = 3
 DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_ENABLED = True
 DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_MAX_CANDIDATES = 3
 DEFAULT_AI_SINGLE_CALL_MISSING_RESCUE_TIMEOUT_SEC = 10.0
@@ -99,6 +103,8 @@ DEFAULT_AI_LOW_CONFIDENCE_SCORE_CAP = 90
 DEFAULT_AI_NON_JSON_SCORE_CAP = 85
 DEFAULT_AI_NO_SIGNAL_ON_LOW_STRICT_PASS = True
 DEFAULT_AI_NO_SIGNAL_MIN_STRICT_PASS_RATE = 0.50
+DEFAULT_AI_NON_JSON_TRUST_WEIGHT = 0.60
+DEFAULT_AI_MODEL_QUALITY_MIN_TRUST_RATE = 0.45
 DEFAULT_BOOTSTRAP_THRESHOLDS_ENABLED = False
 DEFAULT_BOOTSTRAP_MIN_HISTORY_POINTS = 45
 DEFAULT_BOOTSTRAP_MIN_UPSIDE_PROBABILITY = 0.56
@@ -564,6 +570,18 @@ class DiscoveryOracle:
             minimum=6.0,
             maximum=60.0,
         )
+        self.ai_batch_output_min_model_samples = self._safe_env_int(
+            "AI_BATCH_OUTPUT_MIN_MODEL_SAMPLES",
+            default=DEFAULT_AI_BATCH_OUTPUT_MIN_MODEL_SAMPLES,
+            minimum=1,
+            maximum=30,
+        )
+        self.ai_batch_output_non_json_rate_threshold = self._safe_env_float(
+            "AI_BATCH_OUTPUT_NON_JSON_RATE_THRESHOLD",
+            default=DEFAULT_AI_BATCH_OUTPUT_NON_JSON_RATE_THRESHOLD,
+            minimum=0.0,
+            maximum=1.0,
+        )
         self.ai_single_call_scoring_enabled = self._safe_env_bool(
             "AI_SINGLE_CALL_SCORING_ENABLED",
             default=DEFAULT_AI_SINGLE_CALL_SCORING_ENABLED,
@@ -595,6 +613,18 @@ class DiscoveryOracle:
             default=DEFAULT_AI_SINGLE_CALL_BATCH_MAX_CALLS,
             minimum=1,
             maximum=6,
+        )
+        self.ai_single_call_degraded_batch_chunk_size = self._safe_env_int(
+            "AI_SINGLE_CALL_DEGRADED_BATCH_CHUNK_SIZE",
+            default=DEFAULT_AI_SINGLE_CALL_DEGRADED_BATCH_CHUNK_SIZE,
+            minimum=1,
+            maximum=20,
+        )
+        self.ai_single_call_degraded_batch_max_calls = self._safe_env_int(
+            "AI_SINGLE_CALL_DEGRADED_BATCH_MAX_CALLS",
+            default=DEFAULT_AI_SINGLE_CALL_DEGRADED_BATCH_MAX_CALLS,
+            minimum=1,
+            maximum=8,
         )
         self.ai_single_call_missing_rescue_enabled = self._safe_env_bool(
             "AI_SINGLE_CALL_MISSING_RESCUE_ENABLED",
@@ -707,6 +737,12 @@ class DiscoveryOracle:
         self.ai_no_signal_min_strict_pass_rate = self._safe_env_float(
             "AI_NO_SIGNAL_MIN_STRICT_PASS_RATE",
             default=DEFAULT_AI_NO_SIGNAL_MIN_STRICT_PASS_RATE,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        self.ai_non_json_trust_weight = self._safe_env_float(
+            "AI_NON_JSON_TRUST_WEIGHT",
+            default=DEFAULT_AI_NON_JSON_TRUST_WEIGHT,
             minimum=0.0,
             maximum=1.0,
         )
@@ -1013,6 +1049,12 @@ class DiscoveryOracle:
             minimum=0.0,
             maximum=1.0,
         )
+        self.ai_model_quality_min_trust_rate = self._safe_env_float(
+            "AI_MODEL_QUALITY_MIN_TRUST_RATE",
+            default=DEFAULT_AI_MODEL_QUALITY_MIN_TRUST_RATE,
+            minimum=0.0,
+            maximum=1.0,
+        )
         self.ai_model_quality_max_non_json_rate = self._safe_env_float(
             "AI_MODEL_QUALITY_MAX_NON_JSON_RATE",
             default=DEFAULT_AI_MODEL_QUALITY_MAX_NON_JSON_RATE,
@@ -1139,7 +1181,7 @@ class DiscoveryOracle:
             self.openrouter_free_tier_only,
         )
         LOGGER.info(
-            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s floor_multi_model=%s per_model=%s bonus=%s cache_ttl_sec=%.0f persisted_cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f ai_single_call=%s ai_single_call_allow_repair=%s ai_single_call_max_candidates=%s ai_single_call_missing_rescue_enabled=%s ai_single_call_missing_rescue_max=%s ai_single_call_missing_rescue_timeout_sec=%.1f ai_guardrail_enabled=%s ai_soft_cap=%s ai_soft_cap_factor=%.2f ai_low_conf_cap=%s ai_non_json_cap=%s ai_top_pick_rescue_enabled=%s ai_top_pick_rescue_count=%s ai_top_pick_rescue_timeout_sec=%.1f ai_final_pick_guarantee_count=%s ai_final_pick_guarantee_rounds=%s openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f single_call_batch_chunk=%s single_call_batch_max_calls=%s no_signal_low_strict=%s no_signal_min_strict_rate=%.2f model_quality_min_samples=%s model_quality_min_strict=%.2f model_quality_max_non_json=%.2f",
+            "Ranking tuning | ai_concurrency=%s ai_rank_max=%s ai_dynamic_shortlist=%s floor=%s floor_multi_model=%s per_model=%s bonus=%s cache_ttl_sec=%.0f persisted_cache_ttl_sec=%.0f cache_max=%s openrouter_malformed_limit=%s ai_hard_budget_sec=%.1f ai_item_timeout_sec=%.1f ai_timeout_retries=%s ai_retry_timeout_sec=%.1f ai_timeout_recovery_probes=%s ai_timeout_recovery_probe_timeout_sec=%.1f ai_fast_fail_enabled=%s ai_batch_enabled=%s ai_batch_min=%s ai_batch_max=%s ai_batch_timeout_sec=%.1f batch_output_min_samples=%s batch_output_non_json_threshold=%.2f ai_single_call=%s ai_single_call_allow_repair=%s ai_single_call_max_candidates=%s ai_single_call_missing_rescue_enabled=%s ai_single_call_missing_rescue_max=%s ai_single_call_missing_rescue_timeout_sec=%.1f ai_guardrail_enabled=%s ai_soft_cap=%s ai_soft_cap_factor=%.2f ai_low_conf_cap=%s ai_non_json_cap=%s ai_top_pick_rescue_enabled=%s ai_top_pick_rescue_count=%s ai_top_pick_rescue_timeout_sec=%.1f ai_final_pick_guarantee_count=%s ai_final_pick_guarantee_rounds=%s openrouter_json_repair_probe_timeout_sec=%.1f model_ban_sec=%.0f model_ban_failures=%s openrouter_opp_enabled=%s openrouter_opp_attempts=%s openrouter_opp_timeout_sec=%.1f single_call_batch_chunk=%s single_call_batch_max_calls=%s degraded_chunk=%s degraded_max_calls=%s no_signal_low_strict=%s no_signal_min_strict_rate=%.2f no_signal_non_json_weight=%.2f model_quality_min_samples=%s model_quality_min_strict=%.2f model_quality_min_trust=%.2f model_quality_max_non_json=%.2f",
             self.ai_scoring_concurrency,
             self.ai_rank_max_candidates,
             self.ai_dynamic_shortlist_enabled,
@@ -1162,6 +1204,8 @@ class DiscoveryOracle:
             self.ai_batch_min_candidates,
             self.ai_batch_max_candidates,
             self.ai_batch_timeout_sec,
+            self.ai_batch_output_min_model_samples,
+            self.ai_batch_output_non_json_rate_threshold,
             self.ai_single_call_scoring_enabled,
             self.ai_single_call_allow_repair_calls,
             self.ai_single_call_max_candidates,
@@ -1186,10 +1230,14 @@ class DiscoveryOracle:
             self.openrouter_opportunistic_timeout_sec,
             self.ai_single_call_batch_chunk_size,
             self.ai_single_call_batch_max_calls,
+            self.ai_single_call_degraded_batch_chunk_size,
+            self.ai_single_call_degraded_batch_max_calls,
             self.ai_no_signal_on_low_strict_pass,
             self.ai_no_signal_min_strict_pass_rate,
+            self.ai_non_json_trust_weight,
             self.ai_model_quality_min_samples,
             self.ai_model_quality_min_strict_rate,
+            self.ai_model_quality_min_trust_rate,
             self.ai_model_quality_max_non_json_rate,
         )
         LOGGER.info(
@@ -1739,20 +1787,27 @@ class DiscoveryOracle:
         quality_non_json = int(row.get("quality_non_json") or 0)
         strict_rate = (float(quality_strict) / float(quality_total)) if quality_total > 0 else 0.0
         non_json_rate = (float(quality_non_json) / float(quality_total)) if quality_total > 0 else 0.0
+        trust_rate = self._compute_ai_trust_rate(strict_rate=strict_rate, non_json_rate=non_json_rate)
 
         if quality_total >= int(self.ai_model_quality_min_samples):
             low_strict = strict_rate < float(self.ai_model_quality_min_strict_rate)
+            low_trust = trust_rate < float(self.ai_model_quality_min_trust_rate)
             high_non_json = non_json_rate > float(self.ai_model_quality_max_non_json_rate)
-            if low_strict or high_non_json:
+            if low_trust and (low_strict or high_non_json):
                 reason = (
-                    f"quality gate (strict={strict_rate:.2f}, non_json={non_json_rate:.2f}, samples={quality_total})"
+                    "quality gate ("
+                    f"strict={strict_rate:.2f},"
+                    f"trust={trust_rate:.2f},"
+                    f"non_json={non_json_rate:.2f},"
+                    f"samples={quality_total})"
                 )
                 self._record_model_failure(provider, model_name, reason, phase=f"{phase}_quality")
                 LOGGER.warning(
-                    "AI model quality degraded | provider=%s model=%s strict_rate=%.2f non_json_rate=%.2f samples=%s score=%s",
+                    "AI model quality degraded | provider=%s model=%s strict_rate=%.2f trust_rate=%.2f non_json_rate=%.2f samples=%s score=%s",
                     self._provider_health_key(provider),
                     model_name,
                     strict_rate,
+                    trust_rate,
                     non_json_rate,
                     quality_total,
                     row.get("score"),
@@ -1787,6 +1842,136 @@ class DiscoveryOracle:
             "non_json_rate": float(non_json) / float(denom),
             "fallback_rate": float(fallback) / float(denom),
         }
+
+    def _compute_ai_trust_rate(
+        self,
+        *,
+        strict_rate: float,
+        non_json_rate: float,
+    ) -> float:
+        weight = max(0.0, min(1.0, float(self.ai_non_json_trust_weight)))
+        trust = float(strict_rate) + (weight * float(non_json_rate))
+        return max(0.0, min(1.0, trust))
+
+    def _model_quality_snapshot(self, provider: str, model_name: str) -> Dict[str, float]:
+        row = self._get_model_health(provider, model_name)
+        total = int(row.get("quality_total") or 0)
+        strict = int(row.get("quality_strict") or 0)
+        non_json = int(row.get("quality_non_json") or 0)
+        fallback = int(row.get("quality_fallback") or 0)
+        denom = max(1, total)
+        strict_rate = float(strict) / float(denom)
+        non_json_rate = float(non_json) / float(denom)
+        fallback_rate = float(fallback) / float(denom)
+        trust_rate = self._compute_ai_trust_rate(strict_rate=strict_rate, non_json_rate=non_json_rate)
+        return {
+            "total": float(total),
+            "strict_rate": strict_rate,
+            "non_json_rate": non_json_rate,
+            "fallback_rate": fallback_rate,
+            "trust_rate": trust_rate,
+        }
+
+    def _probe_report_prefers_non_json(self, model_name: str) -> bool:
+        model_id = str(model_name or "").strip()
+        if not model_id:
+            return False
+        probe_rows = list(self.ai_runtime.get("probe_report") or [])
+        for row in probe_rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("model") or "").strip() != model_id:
+                continue
+            reason = str(row.get("reason") or "").lower()
+            status = str(row.get("status") or "").lower()
+            if "non_json" in reason or "text_non_json" in reason:
+                return True
+            if status == "available" and "json" not in reason and "ok_text" in reason:
+                return True
+        return False
+
+    def _resolve_batch_output_mode(
+        self,
+        *,
+        provider: str,
+        model_name: str,
+        candidate_count: int,
+    ) -> tuple[str, str]:
+        mode = "json_first"
+        reason = "default_json"
+        model_id = str(model_name or "").strip()
+        if candidate_count <= 0 or not model_id:
+            return mode, reason
+
+        if self._probe_report_prefers_non_json(model_id):
+            return "kv_only", "probe_non_json"
+
+        quality = self._model_quality_snapshot(provider, model_id)
+        total_samples = int(quality.get("total") or 0)
+        min_samples = max(1, int(self.ai_batch_output_min_model_samples))
+        if total_samples >= min_samples:
+            non_json_rate = float(quality.get("non_json_rate") or 0.0)
+            trust_rate = float(quality.get("trust_rate") or 1.0)
+            if (
+                non_json_rate >= float(self.ai_batch_output_non_json_rate_threshold)
+                or trust_rate < float(self.ai_model_quality_min_trust_rate)
+            ):
+                mode = "kv_only"
+                reason = (
+                    f"quality_non_json_{non_json_rate:.2f}_trust_{trust_rate:.2f}_samples_{total_samples}"
+                )
+        return mode, reason
+
+    def _effective_single_call_batch_plan(self, *, pending_count: int) -> tuple[int, int, str]:
+        chunk_size = max(1, int(self.ai_single_call_batch_chunk_size))
+        max_calls = max(1, int(self.ai_single_call_batch_max_calls))
+        output_mode = "json_first"
+
+        if pending_count <= 0:
+            return chunk_size, max_calls, output_mode
+
+        provider, model_name = self._active_ai_provider_and_model()
+        output_mode, mode_reason = self._resolve_batch_output_mode(
+            provider=provider or "openrouter",
+            model_name=model_name,
+            candidate_count=pending_count,
+        )
+        if output_mode == "kv_only":
+            adjusted_chunk = min(chunk_size, max(1, int(self.ai_single_call_degraded_batch_chunk_size)))
+            adjusted_calls = max(max_calls, int(self.ai_single_call_degraded_batch_max_calls))
+            if adjusted_chunk != chunk_size or adjusted_calls != max_calls:
+                LOGGER.info(
+                    "AI single-call degraded batch plan | model=%s mode=%s reason=%s chunk=%s->%s calls=%s->%s pending=%s",
+                    model_name or "n/d",
+                    output_mode,
+                    mode_reason,
+                    chunk_size,
+                    adjusted_chunk,
+                    max_calls,
+                    adjusted_calls,
+                    pending_count,
+                )
+            chunk_size = adjusted_chunk
+            max_calls = adjusted_calls
+
+        return chunk_size, max_calls, output_mode
+
+    def _active_ai_provider_and_model(self) -> tuple[str, str]:
+        provider = str(self.ai_runtime.get("provider") or self.ai_runtime.get("engine") or "").strip().lower()
+        model_name = ""
+
+        if provider == "openrouter":
+            model_name = str(self._openrouter_model_id or self.ai_runtime.get("model") or "").strip()
+        elif provider == "gemini":
+            model_name = str(self.gemini_model or self.ai_runtime.get("model") or "").strip()
+        elif self._openrouter_model_id:
+            provider = "openrouter"
+            model_name = str(self._openrouter_model_id).strip()
+        elif self._model is not None:
+            provider = "gemini"
+            model_name = str(self.gemini_model or "").strip()
+
+        return provider, model_name
 
     def _rank_candidate_models(
         self,
@@ -3562,33 +3747,42 @@ class DiscoveryOracle:
             float(diagnostics["ai_shortlist_strict_pass_count"]) / shortlist_count_for_rate,
             4,
         )
+        trust_pass_rate_shortlist = self._compute_ai_trust_rate(
+            strict_rate=float(diagnostics["strict_pass_rate_shortlist"]),
+            non_json_rate=float(diagnostics["non_json_rate_shortlist"]),
+        )
+        diagnostics["trust_pass_rate_shortlist"] = round(trust_pass_rate_shortlist, 4)
         diagnostics["no_signal_due_to_low_strict_pass"] = False
         diagnostics["high_conf_strict_rate"] = round(
             float(diagnostics["above_threshold_high_confidence_strict_count"]) / max(1, int(diagnostics["above_threshold_count"])),
             4,
         )
         strict_pass_rate_shortlist = float(diagnostics["strict_pass_rate_shortlist"])
+        trust_pass_rate_shortlist = float(diagnostics["trust_pass_rate_shortlist"])
         if (
             self.ai_no_signal_on_low_strict_pass
             and (not above_threshold_high_conf)
             and ai_shortlist_count > 0
-            and strict_pass_rate_shortlist < float(self.ai_no_signal_min_strict_pass_rate)
+            and trust_pass_rate_shortlist < float(self.ai_no_signal_min_strict_pass_rate)
         ):
             selected = []
             fallback_used = True
             diagnostics["fallback_used"] = True
             diagnostics["no_signal_due_to_low_strict_pass"] = True
             diagnostics["no_signal_reason"] = (
-                "Strict-pass shortlist insufficiente: nessun segnale operativo nel ciclo corrente."
+                "Affidabilita AI shortlist insufficiente: nessun segnale operativo nel ciclo corrente."
             )
             diagnostics["no_signal_strict_pass_rate_shortlist"] = round(strict_pass_rate_shortlist, 4)
+            diagnostics["no_signal_trust_pass_rate_shortlist"] = round(trust_pass_rate_shortlist, 4)
             diagnostics["no_signal_strict_pass_min_rate"] = round(
                 float(self.ai_no_signal_min_strict_pass_rate),
                 4,
             )
+            diagnostics["no_signal_non_json_trust_weight"] = round(float(self.ai_non_json_trust_weight), 4)
         diagnostics["fallback_rate"] = diagnostics["fallback_rate_shortlist"]
         diagnostics["non_json_rate"] = diagnostics["non_json_rate_shortlist"]
         diagnostics["strict_pass_rate"] = diagnostics["strict_pass_rate_shortlist"]
+        diagnostics["trust_pass_rate"] = diagnostics["trust_pass_rate_shortlist"]
 
         if ranked:
             top_debug = [
@@ -3716,11 +3910,15 @@ class DiscoveryOracle:
 
         strict_rate_threshold = float(self.ai_no_signal_min_strict_pass_rate)
         strict_rate_value = float(shortlist_quality.get("strict_rate", 0.0))
+        trust_rate_value = self._compute_ai_trust_rate(
+            strict_rate=strict_rate_value,
+            non_json_rate=float(shortlist_quality.get("non_json_rate", 0.0)),
+        )
         should_quality_rerank = (
             rerank_attempt < 1
             and self.ai_no_signal_on_low_strict_pass
             and int(shortlist_quality.get("total", 0)) > 0
-            and strict_rate_value < strict_rate_threshold
+            and trust_rate_value < strict_rate_threshold
         )
         if should_quality_rerank:
             switched = False
@@ -3733,7 +3931,11 @@ class DiscoveryOracle:
                 ]
                 if openrouter_pool:
                     switched = self._advance_openrouter_model(
-                        reason=f"low_strict_pass_rerank strict={strict_rate_value:.2f} threshold={strict_rate_threshold:.2f}"
+                        reason=(
+                            "low_trust_pass_rerank "
+                            f"strict={strict_rate_value:.2f} trust={trust_rate_value:.2f} "
+                            f"threshold={strict_rate_threshold:.2f}"
+                        )
                     )
             elif self._model is not None:
                 gemini_pool = [
@@ -3743,13 +3945,18 @@ class DiscoveryOracle:
                 ]
                 if gemini_pool:
                     switched = self._advance_gemini_model(
-                        reason=f"low_strict_pass_rerank strict={strict_rate_value:.2f} threshold={strict_rate_threshold:.2f}"
+                        reason=(
+                            "low_trust_pass_rerank "
+                            f"strict={strict_rate_value:.2f} trust={trust_rate_value:.2f} "
+                            f"threshold={strict_rate_threshold:.2f}"
+                        )
                     )
 
             if switched:
                 LOGGER.warning(
-                    "AI low strict-pass rerank | strict_rate=%.2f threshold=%.2f rerank_attempt=%s model_before=%s model_after=%s",
+                    "AI low trust-pass rerank | strict_rate=%.2f trust_rate=%.2f threshold=%.2f rerank_attempt=%s model_before=%s model_after=%s",
                     strict_rate_value,
+                    trust_rate_value,
                     strict_rate_threshold,
                     rerank_attempt + 1,
                     prev_model or "unknown",
@@ -3860,11 +4067,18 @@ class DiscoveryOracle:
                         max(6.0, budget_left),
                     )
                     secondary_deadline = time.monotonic() + secondary_timeout
+                    provider_key, model_name = self._active_ai_provider_and_model()
+                    secondary_output_mode, _ = self._resolve_batch_output_mode(
+                        provider=provider_key or "openrouter",
+                        model_name=model_name,
+                        candidate_count=len(secondary_entries),
+                    )
                     secondary_results, secondary_error = await self._score_ai_shortlist_batch(
                         secondary_entries,
                         deadline=secondary_deadline,
                         allow_repair_calls=True,
                         allow_failover_call=True,
+                        output_mode=secondary_output_mode,
                     )
                     if secondary_error:
                         if str(secondary_error) in non_error_reasons:
@@ -4563,11 +4777,18 @@ class DiscoveryOracle:
                     for candidate in unresolved
                     if str(candidate.get("set_id") or "").strip()
                 ]
+                provider_key, model_name = self._active_ai_provider_and_model()
+                batch_output_mode, _ = self._resolve_batch_output_mode(
+                    provider=provider_key or "openrouter",
+                    model_name=model_name,
+                    candidate_count=len(entries),
+                )
                 batch_deadline = time.monotonic() + max(6.0, float(self.ai_top_pick_rescue_timeout_sec) + 1.0)
                 batch_results, batch_error = await self._score_ai_shortlist_batch(
                     entries,
                     deadline=batch_deadline,
                     allow_repair_calls=bool(self.ai_single_call_allow_repair_calls),
+                    output_mode=batch_output_mode,
                 )
                 if batch_error:
                     LOGGER.warning(
@@ -5070,6 +5291,12 @@ class DiscoveryOracle:
         stats["ai_non_json_rescore_candidates"] = len(entries)
         timeout_sec = min(float(self.ai_non_json_rescore_timeout_sec), max(6.0, budget_left))
         deadline = time.monotonic() + timeout_sec
+        provider_key, model_name = self._active_ai_provider_and_model()
+        rescore_output_mode, _ = self._resolve_batch_output_mode(
+            provider=provider_key or "openrouter",
+            model_name=model_name,
+            candidate_count=len(entries),
+        )
         LOGGER.info(
             "AI non-JSON rescore round | candidates=%s budget_left=%.2fs timeout=%.2fs",
             len(entries),
@@ -5081,6 +5308,7 @@ class DiscoveryOracle:
             deadline=deadline,
             allow_repair_calls=True,
             allow_failover_call=True,
+            output_mode=rescore_output_mode,
         )
         if batch_error:
             non_error_reasons = {"no_external_ai_available", "insufficient_budget_for_batch"}
@@ -5174,8 +5402,9 @@ class DiscoveryOracle:
         # Batch scoring pass: in single-call mode this is the only external scoring call.
         if pending_entries and (self.ai_batch_scoring_enabled or single_call_mode):
             if single_call_mode:
-                chunk_size = max(1, int(self.ai_single_call_batch_chunk_size))
-                max_calls = max(1, int(self.ai_single_call_batch_max_calls))
+                chunk_size, max_calls, single_call_output_mode = self._effective_single_call_batch_plan(
+                    pending_count=len(pending_entries),
+                )
                 batch_chunks: list[list[Dict[str, Any]]] = [
                     pending_entries[idx : idx + chunk_size]
                     for idx in range(0, len(pending_entries), chunk_size)
@@ -5197,6 +5426,7 @@ class DiscoveryOracle:
                             deadline=chunk_deadline,
                             allow_repair_calls=bool(self.ai_single_call_allow_repair_calls),
                             allow_failover_call=True,
+                            output_mode=single_call_output_mode,
                         )
 
                     if batch_error:
@@ -5242,6 +5472,12 @@ class DiscoveryOracle:
                 else:
                     batch_cap = max(min_batch, int(self.ai_batch_max_candidates))
                     batch_entries = pending_entries[: min(len(pending_entries), batch_cap)]
+                provider_key, model_name = self._active_ai_provider_and_model()
+                batch_output_mode, _ = self._resolve_batch_output_mode(
+                    provider=provider_key or "openrouter",
+                    model_name=model_name,
+                    candidate_count=len(batch_entries),
+                )
                 batch_results: Dict[str, AIInsight] = {}
                 batch_error: Optional[str] = None
                 if batch_entries:
@@ -5250,6 +5486,7 @@ class DiscoveryOracle:
                         deadline=deadline,
                         allow_repair_calls=True,
                         allow_failover_call=True,
+                        output_mode=batch_output_mode,
                     )
 
                 if batch_error:
@@ -5297,11 +5534,18 @@ class DiscoveryOracle:
                 if rescue_timeout_sec >= 6.0 and rescue_entries:
                     stats["ai_single_call_rescue_attempted"] = 1
                     rescue_deadline = time.monotonic() + rescue_timeout_sec
+                    provider_key, model_name = self._active_ai_provider_and_model()
+                    rescue_output_mode, _ = self._resolve_batch_output_mode(
+                        provider=provider_key or "openrouter",
+                        model_name=model_name,
+                        candidate_count=len(rescue_entries),
+                    )
                     rescue_results, rescue_error = await self._score_ai_shortlist_batch(
                         rescue_entries,
                         deadline=rescue_deadline,
                         allow_repair_calls=True,
                         allow_failover_call=False,
+                        output_mode=rescue_output_mode,
                     )
                     if rescue_error:
                         non_error_reasons = {"no_external_ai_available", "insufficient_budget_for_batch"}
@@ -5600,6 +5844,7 @@ class DiscoveryOracle:
         deadline: float,
         allow_repair_calls: bool = True,
         allow_failover_call: bool = True,
+        output_mode: str = "json_first",
     ) -> tuple[Dict[str, AIInsight], Optional[str]]:
         if not entries:
             return {}, None
@@ -5614,7 +5859,9 @@ class DiscoveryOracle:
             max(6.0, remaining - 1.0),
         )
         candidates = [entry["candidate"] for entry in entries]
-        prompt = self._build_batch_ai_prompt(candidates)
+        requested_output_mode = str(output_mode or "json_first").strip().lower() or "json_first"
+        effective_allow_repair_calls = bool(allow_repair_calls and requested_output_mode != "kv_only")
+        prompt = self._build_batch_ai_prompt(candidates, output_mode=requested_output_mode)
 
         if self._model is not None:
             current_model = str(self.gemini_model or "")
@@ -5632,7 +5879,12 @@ class DiscoveryOracle:
                 payload = self._extract_json(text)
                 insights = self._batch_payload_to_ai_insights(payload, candidates)
             except Exception:
-                insights = self._batch_insights_from_unstructured_text(text, candidates)
+                insights = self._batch_insights_from_unstructured_text(
+                    text,
+                    candidates,
+                    treat_key_value_as_strict=(requested_output_mode == "kv_only"),
+                    treat_tagged_as_strict=(requested_output_mode == "kv_only"),
+                )
             insights = self._normalize_batch_ai_insights(insights, candidates)
 
             if insights:
@@ -5656,10 +5908,15 @@ class DiscoveryOracle:
                     payload = self._extract_json(raw_text)
                     return self._batch_payload_to_ai_insights(payload, candidates)
                 except Exception:
-                    parsed = self._batch_insights_from_unstructured_text(raw_text, candidates)
+                    parsed = self._batch_insights_from_unstructured_text(
+                        raw_text,
+                        candidates,
+                        treat_key_value_as_strict=(requested_output_mode == "kv_only"),
+                        treat_tagged_as_strict=(requested_output_mode == "kv_only"),
+                    )
                     if parsed:
                         return parsed
-                    if not allow_repair_calls:
+                    if not effective_allow_repair_calls:
                         return {}
                     repaired = await self._repair_openrouter_non_json_batch_output(
                         raw_text=raw_text,
@@ -5674,6 +5931,7 @@ class DiscoveryOracle:
             quality_repair_attempted = False
             min_quality_samples = max(2, min(int(self.ai_model_quality_min_samples), len(candidates)))
             strict_quality_threshold = float(self.ai_no_signal_min_strict_pass_rate)
+            trust_quality_threshold = float(self.ai_model_quality_min_trust_rate)
             non_json_quality_threshold = float(self.ai_model_quality_max_non_json_rate)
 
             while True:
@@ -5687,16 +5945,23 @@ class DiscoveryOracle:
                     insights = self._normalize_batch_ai_insights(insights, candidates)
                     if insights:
                         quality = self._ai_insight_quality_breakdown(insights)
+                        trust_rate = self._compute_ai_trust_rate(
+                            strict_rate=float(quality.get("strict_rate", 0.0)),
+                            non_json_rate=float(quality.get("non_json_rate", 0.0)),
+                        )
                         low_quality = (
                             int(quality.get("total", 0)) >= min_quality_samples
                             and (
-                                float(quality.get("strict_rate", 0.0)) < strict_quality_threshold
-                                or float(quality.get("non_json_rate", 0.0)) > non_json_quality_threshold
+                                trust_rate < trust_quality_threshold
+                                and (
+                                    float(quality.get("strict_rate", 0.0)) < strict_quality_threshold
+                                    or float(quality.get("non_json_rate", 0.0)) > non_json_quality_threshold
+                                )
                             )
                         )
                         if (
                             low_quality
-                            and allow_repair_calls
+                            and effective_allow_repair_calls
                             and not quality_repair_attempted
                             and float(quality.get("non_json_rate", 0.0)) > 0.0
                         ):
@@ -5709,6 +5974,10 @@ class DiscoveryOracle:
                             if repaired:
                                 repaired = self._normalize_batch_ai_insights(repaired, candidates)
                                 repaired_quality = self._ai_insight_quality_breakdown(repaired)
+                                repaired_trust_rate = self._compute_ai_trust_rate(
+                                    strict_rate=float(repaired_quality.get("strict_rate", 0.0)),
+                                    non_json_rate=float(repaired_quality.get("non_json_rate", 0.0)),
+                                )
                                 repaired_improved = (
                                     int(repaired_quality.get("strict", 0)) > int(quality.get("strict", 0))
                                     or int(repaired_quality.get("non_json", 0)) < int(quality.get("non_json", 0))
@@ -5716,17 +5985,22 @@ class DiscoveryOracle:
                                 if repaired_improved:
                                     insights = repaired
                                     quality = repaired_quality
+                                    trust_rate = repaired_trust_rate
                                     low_quality = (
                                         int(quality.get("total", 0)) >= min_quality_samples
                                         and (
-                                            float(quality.get("strict_rate", 0.0)) < strict_quality_threshold
-                                            or float(quality.get("non_json_rate", 0.0)) > non_json_quality_threshold
+                                            trust_rate < trust_quality_threshold
+                                            and (
+                                                float(quality.get("strict_rate", 0.0)) < strict_quality_threshold
+                                                or float(quality.get("non_json_rate", 0.0)) > non_json_quality_threshold
+                                            )
                                         )
                                     )
                                     LOGGER.info(
-                                        "AI batch quality repaired via JSON repair | model=%s strict_rate=%.2f non_json_rate=%.2f",
+                                        "AI batch quality repaired via JSON repair | model=%s strict_rate=%.2f trust_rate=%.2f non_json_rate=%.2f",
                                         current_model,
                                         float(quality.get("strict_rate", 0.0)),
+                                        trust_rate,
                                         float(quality.get("non_json_rate", 0.0)),
                                     )
                                 else:
@@ -5743,6 +6017,7 @@ class DiscoveryOracle:
                             reason = (
                                 "batch_quality_low("
                                 f"strict={float(quality.get('strict_rate', 0.0)):.2f},"
+                                f"trust={trust_rate:.2f},"
                                 f"non_json={float(quality.get('non_json_rate', 0.0)):.2f},"
                                 f"samples={int(quality.get('total', 0))})"
                             )
@@ -5753,12 +6028,14 @@ class DiscoveryOracle:
                                 phase="batch_scoring_quality_gate",
                             )
                             LOGGER.warning(
-                                "AI batch quality low, attempting failover | model=%s strict_rate=%.2f non_json_rate=%.2f samples=%s threshold_strict=%.2f threshold_non_json=%.2f",
+                                "AI batch quality low, attempting failover | model=%s strict_rate=%.2f trust_rate=%.2f non_json_rate=%.2f samples=%s threshold_strict=%.2f threshold_trust=%.2f threshold_non_json=%.2f",
                                 current_model,
                                 float(quality.get("strict_rate", 0.0)),
+                                trust_rate,
                                 float(quality.get("non_json_rate", 0.0)),
                                 int(quality.get("total", 0)),
                                 strict_quality_threshold,
+                                trust_quality_threshold,
                                 non_json_quality_threshold,
                             )
                             rotated = await self._advance_openrouter_model_locked(
@@ -5935,6 +6212,8 @@ class DiscoveryOracle:
         cls,
         raw_text: str,
         candidate_by_set_id: Dict[str, Dict[str, Any]],
+        *,
+        treat_as_strict: bool = False,
     ) -> Dict[str, AIInsight]:
         text = str(raw_text or "")
         if not text.strip() or not candidate_by_set_id:
@@ -5981,14 +6260,20 @@ class DiscoveryOracle:
                 summary = " ".join(free_lines).strip()
             if not summary:
                 summary = f"Output AI tagged non JSON: score {score}/100 estratto da blocco [SET]."
+            confidence = "HIGH_CONFIDENCE" if treat_as_strict else "LOW_CONFIDENCE"
+            risk_note = (
+                "Output AI formato tagged validato in modalita' KV-only."
+                if treat_as_strict
+                else "Output AI tagged non JSON: score estratto da testo con parsing robusto."
+            )
 
             insights[set_id] = AIInsight(
                 score=score,
                 summary=summary[:1200],
                 predicted_eol_date=cls._extract_first_date(merged) or candidate.get("eol_date_prediction"),
                 fallback_used=False,
-                confidence="LOW_CONFIDENCE",
-                risk_note="Output AI tagged non JSON: score estratto da testo con parsing robusto.",
+                confidence=confidence,
+                risk_note=risk_note,
             )
 
         for match in re.finditer(r"(?is)\[SET(?P<attrs>[^\]]*)\](?P<body>.*?)\[/SET\]", text):
@@ -6005,6 +6290,9 @@ class DiscoveryOracle:
         cls,
         raw_text: str,
         candidates: list[Dict[str, Any]],
+        *,
+        treat_key_value_as_strict: bool = False,
+        treat_tagged_as_strict: bool = False,
     ) -> Dict[str, AIInsight]:
         insights: Dict[str, AIInsight] = {}
         text = str(raw_text or "")
@@ -6018,7 +6306,11 @@ class DiscoveryOracle:
         }
 
         # Pass -1: explicit tagged blocks, e.g. [SET] ... [/SET] or <set> ... </set>.
-        tagged_insights = cls._batch_insights_from_tagged_blocks(text, candidate_by_set_id)
+        tagged_insights = cls._batch_insights_from_tagged_blocks(
+            text,
+            candidate_by_set_id,
+            treat_as_strict=treat_tagged_as_strict,
+        )
         if tagged_insights:
             insights.update(tagged_insights)
             if len(insights) == len(candidate_by_set_id):
@@ -6070,13 +6362,19 @@ class DiscoveryOracle:
             if not summary:
                 summary = f"Output AI non JSON: score {score}/100 estratto da formato key-value."
             summary = summary[:1200]
+            confidence = "HIGH_CONFIDENCE" if treat_key_value_as_strict else "LOW_CONFIDENCE"
+            risk_note = (
+                "Output AI formato key-value validato in modalita' KV-only."
+                if treat_key_value_as_strict
+                else "Output AI non JSON: score estratto da testo con parsing robusto."
+            )
             insights[set_id] = AIInsight(
                 score=score,
                 summary=summary,
                 predicted_eol_date=eol or candidate.get("eol_date_prediction"),
                 fallback_used=False,
-                confidence="LOW_CONFIDENCE",
-                risk_note="Output AI non JSON: score estratto da testo con parsing robusto.",
+                confidence=confidence,
+                risk_note=risk_note,
             )
 
         if len(insights) == len(candidate_by_set_id):
@@ -6171,26 +6469,42 @@ class DiscoveryOracle:
         return insights
 
     @staticmethod
-    def _build_batch_ai_prompt(candidates: list[Dict[str, Any]]) -> str:
-        lines = [
-            "Analizza i seguenti set LEGO per investimento a 12 mesi.",
-            "Rispondi usando UNO dei formati validi sotto (in ordine di preferenza).",
-            "Formato 1 (preferito): JSON valido.",
-            'JSON: {"results":[{"set_id":"...", "score":1-100, "summary":"max 2 frasi", "predicted_eol_date":"YYYY-MM-DD o null"}]}',
-            (
-                "Formato 2 (fallback tagged): per ogni set usa un blocco:\n"
-                "[SET]\nset_id: <ID>\nscore: <1-100>\nsummary: <max 12 parole>\n"
-                "predicted_eol_date: <YYYY-MM-DD|null>\n[/SET]"
-            ),
-            (
-                "Formato 3 (fallback compatibilita'): una riga per set:\n"
-                "set_id=<ID>|score=<1-100>|summary=<max 12 parole>|predicted_eol_date=<YYYY-MM-DD|null>"
-            ),
-            f"Devi restituire esattamente {len(candidates)} risultati (uno per ogni set_id). Non omettere nessun set.",
-            "Non aggiungere testo fuori dal formato scelto.",
-            "",
-            "SET LIST:",
-        ]
+    def _build_batch_ai_prompt(candidates: list[Dict[str, Any]], *, output_mode: str = "json_first") -> str:
+        mode = str(output_mode or "json_first").strip().lower() or "json_first"
+        lines = ["Analizza i seguenti set LEGO per investimento a 12 mesi."]
+        if mode == "kv_only":
+            lines.extend(
+                [
+                    "Rispondi SOLO in formato key-value, una riga per set.",
+                    "Formato obbligatorio per ogni riga:",
+                    "set_id=<ID>|score=<1-100>|summary=<max 12 parole>|predicted_eol_date=<YYYY-MM-DD|null>",
+                    f"Devi restituire esattamente {len(candidates)} righe (una per ogni set_id). Non omettere nessun set.",
+                    "Non usare JSON. Non usare markdown. Non aggiungere testo extra.",
+                    "",
+                    "SET LIST:",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "Rispondi usando UNO dei formati validi sotto (in ordine di preferenza).",
+                    "Formato 1 (preferito): JSON valido.",
+                    'JSON: {"results":[{"set_id":"...", "score":1-100, "summary":"max 2 frasi", "predicted_eol_date":"YYYY-MM-DD o null"}]}',
+                    (
+                        "Formato 2 (fallback tagged): per ogni set usa un blocco:\n"
+                        "[SET]\nset_id: <ID>\nscore: <1-100>\nsummary: <max 12 parole>\n"
+                        "predicted_eol_date: <YYYY-MM-DD|null>\n[/SET]"
+                    ),
+                    (
+                        "Formato 3 (fallback compatibilita'): una riga per set:\n"
+                        "set_id=<ID>|score=<1-100>|summary=<max 12 parole>|predicted_eol_date=<YYYY-MM-DD|null>"
+                    ),
+                    f"Devi restituire esattamente {len(candidates)} risultati (uno per ogni set_id). Non omettere nessun set.",
+                    "Non aggiungere testo fuori dal formato scelto.",
+                    "",
+                    "SET LIST:",
+                ]
+            )
         for idx, row in enumerate(candidates, start=1):
             lines.append(
                 f"- idx={idx} | set_id={row.get('set_id')} | nome={row.get('set_name')} | tema={row.get('theme')} | "
