@@ -81,6 +81,7 @@ def _dispatch_github_workflow(
     *,
     chat_id: Optional[str],
     analysis_set_id: Optional[str] = None,
+    workflow_file: Optional[str] = None,
 ) -> tuple[bool, str]:
     token = str(
         os.getenv("GITHUB_ACTIONS_DISPATCH_TOKEN")
@@ -88,7 +89,7 @@ def _dispatch_github_workflow(
         or ""
     ).strip()
     repository = _github_dispatch_repository()
-    workflow_file = str(os.getenv("GITHUB_WORKFLOW_FILE") or "main.yml").strip() or "main.yml"
+    workflow_file = str(workflow_file or os.getenv("GITHUB_WORKFLOW_FILE") or "main.yml").strip() or "main.yml"
     workflow_ref = str(os.getenv("GITHUB_WORKFLOW_REF") or "main").strip() or "main"
 
     missing: list[str] = []
@@ -177,6 +178,26 @@ def _dispatch_scova_workflow(*, chat_id: Optional[str]) -> tuple[bool, str]:
     return (
         True,
         "✅ Discovery /scova avviata su GitHub Actions.\n"
+        f"Segui qui: {workflow_url}",
+    )
+
+
+def _dispatch_seed_sync_workflow(*, chat_id: Optional[str]) -> tuple[bool, str]:
+    workflow_file = (
+        str(os.getenv("GITHUB_SEED_SYNC_WORKFLOW_FILE") or "historical-seed-sync.yml").strip()
+        or "historical-seed-sync.yml"
+    )
+    ok, detail = _dispatch_github_workflow(
+        chat_id=chat_id,
+        analysis_set_id=None,
+        workflow_file=workflow_file,
+    )
+    if not ok:
+        return False, detail
+    workflow_url = detail
+    return (
+        True,
+        "✅ Sync storico seed avviato su GitHub Actions.\n"
         f"Segui qui: {workflow_url}",
     )
 
@@ -470,6 +491,7 @@ class LegoHunterTelegramBot:
             BotCommand("acquista", "Registra acquisto in collezione: /acquista 76441 34,99"),
             BotCommand("venduto", "Registra vendita e aggiorna collezione: /venduto 76441 89,90"),
             BotCommand("analizza", "Analisi approfondita set su GitHub Actions: /analizza 76441"),
+            BotCommand("seedsync", "Aggiorna seed storico su GitHub Actions"),
             BotCommand("radar", "Mostra le opportunita' piu' forti in radar"),
             BotCommand("cerca", "Cerca un set nel radar: /cerca 75367"),
             BotCommand("offerte", "Confronta prezzo primario vs secondario"),
@@ -498,6 +520,7 @@ class LegoHunterTelegramBot:
             "/acquista <set_id> <prezzo> [quantita] - Registra un acquisto in collezione (es. /acquista 76441 34,99 1).\n"
             "/venduto <set_id> <prezzo_vendita> [quantita] [piattaforma] - Registra una vendita e aggiorna la collezione (es. /venduto 76441 89,90 1 ebay).\n"
             "/analizza <set_id> - Avvia su GitHub un'analisi approfondita singolo set (es. /analizza 76441).\n"
+            "/seedsync - Avvia su GitHub la sincronizzazione del seed storico (historical-seed-sync).\n"
             "/radar - Mostra le opportunita' gia' in Opportunity Radar, ordinate per score.\n"
             "/cerca <id|nome|tema> - Cerca set nel radar (es. /cerca 75367).\n"
             "/offerte - Verifica se sul secondario trovi prezzi migliori del primario.\n"
@@ -515,6 +538,7 @@ class LegoHunterTelegramBot:
             "/acquista 76441 34,99\n"
             "/venduto 76441 89,90\n"
             "/analizza 76441\n"
+            "/seedsync\n"
             "/cerca millennium falcon\n"
             "/cerca 10332\n"
             "/offerte\n"
@@ -594,6 +618,30 @@ class LegoHunterTelegramBot:
             f"Dettaglio: {detail}\n"
             "Config richiesta su Vercel: GITHUB_ACTIONS_DISPATCH_TOKEN, GITHUB_REPO, "
             "GITHUB_WORKFLOW_FILE (opzionale), GITHUB_WORKFLOW_REF (opzionale)."
+        )
+
+    async def cmd_seedsync(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+
+        chat_id = str(update.effective_chat.id) if update.effective_chat else None
+        await update.message.reply_text(
+            "Avvio sincronizzazione seed storico su GitHub Actions..."
+        )
+
+        ok, detail = await asyncio.to_thread(
+            _dispatch_seed_sync_workflow,
+            chat_id=chat_id,
+        )
+        if ok:
+            await update.message.reply_text(detail, disable_web_page_preview=True)
+            return
+
+        await update.message.reply_text(
+            "Impossibile avviare /seedsync su GitHub.\n"
+            f"Dettaglio: {detail}\n"
+            "Config richiesta su Vercel: GITHUB_ACTIONS_DISPATCH_TOKEN, GITHUB_REPO, "
+            "GITHUB_SEED_SYNC_WORKFLOW_FILE (opzionale), GITHUB_WORKFLOW_REF (opzionale)."
         )
 
     async def cmd_acquista(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1579,6 +1627,8 @@ def build_application(
     app.add_handler(CommandHandler("registra_vendita", manager.cmd_venduto))
     app.add_handler(CommandHandler("analizza", manager.cmd_analizza))
     app.add_handler(CommandHandler("analisi", manager.cmd_analizza))
+    app.add_handler(CommandHandler("seedsync", manager.cmd_seedsync))
+    app.add_handler(CommandHandler("seed", manager.cmd_seedsync))
     app.add_handler(CommandHandler("radar", manager.cmd_radar))
     app.add_handler(CommandHandler("cerca", manager.cmd_cerca))
     app.add_handler(CommandHandler("offerte", manager.cmd_offerte))

@@ -128,6 +128,8 @@ Per progetti Supabase gia' esistenti (migrazione sicurezza RLS senza ricreare ta
 - Il prior applica pesi di recency (piu peso ai casi recenti) e filtri geografici (`HISTORICAL_ALLOWED_COUNTRIES`, `HISTORICAL_ALLOWED_REGIONS`).
 - Script di rigenerazione seed: `scripts/build_historical_reference_cases.py`.
 - Script sync secondario (eBay sold + Vinted active): `scripts/sync_ebay_sold_history.py`.
+- Lo sync secondario supporta finestra rolling (`--rolling-days`, default 540) e persistenza snapshot su Supabase (`--persist-market-snapshots`) per accumulo storico reale tra le run.
+- Workflow dedicato di refresh frequente: `.github/workflows/historical-seed-sync.yml` (ogni 4 ore, UTC) per mantenere il seed recente aggiornato anche fuori dai cicli discovery.
 - Lo script legge il dataset raw ZIP in `data/historical_seed/raw/` (non versionato) e produce il CSV finale versionato.
 - Lo script secondario non richiede API key a pagamento.
 - Audit qualità seed:

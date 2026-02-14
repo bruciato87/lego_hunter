@@ -9,6 +9,7 @@ from telegram.error import BadRequest, TimedOut
 
 from bot import (
     LegoHunterTelegramBot,
+    _dispatch_seed_sync_workflow,
     _dispatch_single_set_analysis_workflow,
     _telegram_payload_log_preview,
     _parse_eur_amount,
@@ -236,6 +237,38 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Analisi approfondita avviata", detail)
         self.assertEqual(urlopen_mock.call_count, 1)
 
+    def test_dispatch_seed_sync_requires_config(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            ok, detail = _dispatch_seed_sync_workflow(chat_id="123")
+        self.assertFalse(ok)
+        self.assertIn("Configurazione incompleta", detail)
+
+    def test_dispatch_seed_sync_success(self) -> None:
+        fake_response = Mock()
+        fake_response.status = 204
+        fake_cm = Mock()
+        fake_cm.__enter__ = Mock(return_value=fake_response)
+        fake_cm.__exit__ = Mock(return_value=None)
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GITHUB_ACTIONS_DISPATCH_TOKEN": "token",
+                    "GITHUB_REPO": "bruciato87/lego_hunter",
+                    "GITHUB_SEED_SYNC_WORKFLOW_FILE": "historical-seed-sync.yml",
+                    "GITHUB_WORKFLOW_REF": "main",
+                },
+                clear=False,
+            ),
+            patch("bot.urllib.request.urlopen", return_value=fake_cm) as urlopen_mock,
+        ):
+            ok, detail = _dispatch_seed_sync_workflow(chat_id="123")
+
+        self.assertTrue(ok)
+        self.assertIn("Sync storico seed avviato", detail)
+        self.assertEqual(urlopen_mock.call_count, 1)
+
     def test_build_application_can_disable_post_init_command_sync(self) -> None:
         manager = LegoHunterTelegramBot(
             repository=FakeRepo(),
@@ -263,6 +296,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/acquista <set_id> <prezzo>", text)
         self.assertIn("/venduto <set_id> <prezzo_vendita>", text)
         self.assertIn("/analizza <set_id>", text)
+        self.assertIn("/seedsync", text)
         self.assertIn("/offerte", text)
         self.assertIn("/collezione", text)
         self.assertIn("Alias compatibilita'", text)
@@ -345,6 +379,43 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(update.message.replies)
         self.assertIn("Impossibile avviare l'analisi su GitHub", update.message.replies[-1])
+        self.assertIn("missing token", update.message.replies[-1])
+
+    async def test_seedsync_dispatches_github_workflow(self) -> None:
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        with patch(
+            "bot._dispatch_seed_sync_workflow",
+            return_value=(True, "dispatch ok"),
+        ) as dispatch_mock:
+            await manager.cmd_seedsync(update, DummyContext(args=[]))
+
+        dispatch_mock.assert_called_once_with(chat_id="98765")
+        self.assertGreaterEqual(len(update.message.replies), 2)
+        self.assertIn("Avvio sincronizzazione seed storico", update.message.replies[0])
+        self.assertIn("dispatch ok", update.message.replies[-1])
+
+    async def test_seedsync_reports_dispatch_configuration_error(self) -> None:
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        with patch(
+            "bot._dispatch_seed_sync_workflow",
+            return_value=(False, "missing token"),
+        ):
+            await manager.cmd_seedsync(update, DummyContext(args=[]))
+
+        self.assertTrue(update.message.replies)
+        self.assertIn("Impossibile avviare /seedsync su GitHub", update.message.replies[-1])
         self.assertIn("missing token", update.message.replies[-1])
 
     async def test_acquista_requires_required_args(self) -> None:

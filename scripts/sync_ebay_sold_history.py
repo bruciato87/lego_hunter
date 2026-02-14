@@ -22,7 +22,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from models import LegoHunterRepository
+from models import LegoHunterRepository, MarketTimeSeriesRecord
 
 
 LOGGER = logging.getLogger("ebay_history_sync")
@@ -413,6 +413,106 @@ def merge_reference_rows(
     return merged_rows, stats
 
 
+def _parse_end_date(raw_value: Any) -> Optional[datetime]:
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+    try:
+        if len(text) == 10:
+            parsed = datetime.fromisoformat(f"{text}T00:00:00+00:00")
+        else:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def prune_rows_by_rolling_window(
+    rows: list[Dict[str, Any]],
+    *,
+    rolling_days: int,
+    now_utc: Optional[datetime] = None,
+) -> tuple[list[Dict[str, Any]], int]:
+    window_days = int(rolling_days)
+    if window_days <= 0:
+        return list(rows), 0
+    now_dt = now_utc or datetime.now(timezone.utc)
+    cutoff = now_dt - timedelta(days=window_days)
+    kept: list[Dict[str, Any]] = []
+    dropped = 0
+    for row in rows:
+        end_dt = _parse_end_date(row.get("end_date"))
+        if end_dt is not None and end_dt < cutoff:
+            dropped += 1
+            continue
+        kept.append(row)
+    return kept, dropped
+
+
+def build_market_snapshots_from_rows(rows: list[Dict[str, Any]]) -> list[MarketTimeSeriesRecord]:
+    snapshots: list[MarketTimeSeriesRecord] = []
+    for row in rows:
+        set_id = str(row.get("set_id") or "").strip()
+        if not set_id:
+            continue
+        source_dataset = str(row.get("source_dataset") or "").strip().lower()
+        if source_dataset.startswith("ebay_sold_"):
+            platform = "ebay"
+            listing_type = "sold_seed"
+        elif source_dataset.startswith("vinted_active_"):
+            platform = "vinted"
+            listing_type = "listing_seed"
+        else:
+            platform = "secondary_seed"
+            listing_type = "seed"
+
+        price = _safe_float(row.get("price_12m_usd"))
+        if price is None or price <= 0:
+            price = _safe_float(row.get("sold_avg_price"))
+        if price is None or price <= 0:
+            continue
+
+        end_dt = _parse_end_date(row.get("end_date")) or datetime.now(timezone.utc)
+        snapshots.append(
+            MarketTimeSeriesRecord(
+                set_id=set_id,
+                platform=platform,
+                price=round(float(price), 4),
+                recorded_at=end_dt.isoformat(),
+                set_name=str(row.get("set_name") or "").strip() or set_id,
+                listing_type=listing_type,
+                shipping_cost=0.0,
+                currency="EUR",
+                raw_payload={
+                    "source_dataset": source_dataset,
+                    "sold_listing_count": row.get("sold_listing_count"),
+                    "roi_12m_pct": row.get("roi_12m_pct"),
+                    "seed_sync": True,
+                },
+            )
+        )
+    return snapshots
+
+
+def persist_market_snapshots(rows: list[Dict[str, Any]]) -> tuple[int, Optional[str]]:
+    if not rows:
+        return 0, None
+    snapshots = build_market_snapshots_from_rows(rows)
+    if not snapshots:
+        return 0, None
+    try:
+        repository = LegoHunterRepository.from_env()
+    except Exception as exc:  # noqa: BLE001
+        return 0, str(exc)
+    try:
+        repository.insert_market_snapshots(snapshots)
+    except Exception as exc:  # noqa: BLE001
+        return 0, str(exc)
+    return len(snapshots), None
+
+
 def _discover_targets_from_supabase(limit: int, lookback_days: int) -> list[Dict[str, Any]]:
     repository = LegoHunterRepository.from_env()
     opportunities = repository.get_recent_opportunities(days=lookback_days, limit=max(50, limit * 3))
@@ -760,6 +860,8 @@ def main() -> int:
     parser.add_argument("--min-vinted-listings", type=int, default=3)
     parser.add_argument("--max-vinted-markets-per-set", type=int, default=1)
     parser.add_argument("--target-roi-pct", type=float, default=20.0)
+    parser.add_argument("--rolling-days", type=int, default=540)
+    parser.add_argument("--persist-market-snapshots", action="store_true", default=False)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -815,9 +917,20 @@ def main() -> int:
 
     existing_rows = load_existing_rows(args.out)
     merged_rows, merge_stats = merge_reference_rows(existing_rows, rows)
-    write_rows(args.out, merged_rows)
+    pruned_rows, dropped_old_rows = prune_rows_by_rolling_window(
+        merged_rows,
+        rolling_days=max(0, int(args.rolling_days)),
+    )
+    write_rows(args.out, pruned_rows)
+    persisted_snapshots = 0
+    if args.persist_market_snapshots:
+        persisted_snapshots, persist_error = persist_market_snapshots(pruned_rows)
+        if persist_error:
+            LOGGER.warning("Secondary market snapshot persistence failed | error=%s", persist_error)
+        else:
+            LOGGER.info("Secondary market snapshots persisted | count=%s", persisted_snapshots)
     LOGGER.info(
-        "Secondary market sync completed | ebay_rows=%s vinted_rows=%s incoming_total=%s existing_rows=%s added=%s updated=%s unchanged=%s merged_total=%s dropped_existing_dups=%s dropped_incoming_dups=%s out=%s",
+        "Secondary market sync completed | ebay_rows=%s vinted_rows=%s incoming_total=%s existing_rows=%s added=%s updated=%s unchanged=%s merged_total=%s dropped_existing_dups=%s dropped_incoming_dups=%s rolling_days=%s pruned_old_rows=%s persisted_snapshots=%s out=%s",
         len(ebay_rows),
         len(vinted_rows),
         len(rows),
@@ -825,9 +938,12 @@ def main() -> int:
         merge_stats.get("added", 0),
         merge_stats.get("updated", 0),
         merge_stats.get("unchanged", 0),
-        merge_stats.get("merged_total", 0),
+        len(pruned_rows),
         merge_stats.get("dropped_existing_duplicates", 0),
         merge_stats.get("dropped_incoming_duplicates", 0),
+        max(0, int(args.rolling_days)),
+        dropped_old_rows,
+        persisted_snapshots,
         args.out,
     )
     return 0

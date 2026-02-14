@@ -7113,6 +7113,7 @@ class DiscoveryOracle:
         theme_counter: Counter[str] = Counter()
         tag_counter: Counter[str] = Counter()
         years: list[int] = []
+        year_weights: list[float] = []
         for row in cases:
             theme_key = str(row.get("theme_norm") or "").strip()
             if theme_key:
@@ -7127,6 +7128,7 @@ class DiscoveryOracle:
             end_text = str(row.get("end_date") or "").strip()
             if len(end_text) >= 4 and end_text[:4].isdigit():
                 years.append(int(end_text[:4]))
+                year_weights.append(float(row.get("resolved_weight") or self._historical_case_weight(row)))
 
         rois = [float(row.get("roi_12m_pct")) for row in cases if row.get("roi_12m_pct") is not None]
         wins = [int(row.get("win_12m")) for row in cases if row.get("win_12m") in (0, 1)]
@@ -7148,11 +7150,12 @@ class DiscoveryOracle:
         profile["top_theme"] = theme_counter.most_common(1)[0][0] if theme_counter else None
 
         if years:
-            median_end_year = int(round(statistics.median(years)))
+            median_end_year = int(round(self._weighted_median([float(year) for year in years], year_weights)))
             latest_end_year = int(max(years))
             profile["median_end_year"] = median_end_year
             profile["latest_end_year"] = latest_end_year
             profile["median_age_years"] = int(max(0, date.today().year - median_end_year))
+            profile["median_age_method"] = "weighted"
         else:
             profile["issues"].append("assenza_end_date")
 
@@ -7260,6 +7263,19 @@ class DiscoveryOracle:
             base_weight = 1.0
         weight *= max(0.1, min(3.0, base_weight))
 
+        # Bias towards fresher, market-native datasets and down-weight legacy academic seeds.
+        source_dataset = str(row.get("source_dataset") or "").strip().lower()
+        source_multiplier = 1.0
+        if source_dataset.startswith("mendeley_"):
+            source_multiplier = 0.15
+        elif source_dataset.startswith("ebay_sold_"):
+            source_multiplier = 1.30
+        elif source_dataset.startswith("vinted_active_"):
+            source_multiplier = 1.20
+        elif source_dataset.startswith("market_ts_live_"):
+            source_multiplier = 1.25
+        weight *= source_multiplier
+
         explicit_recency_raw = row.get("recency_weight")
         try:
             explicit_recency = float(explicit_recency_raw) if explicit_recency_raw not in (None, "") else 1.0
@@ -7316,6 +7332,30 @@ class DiscoveryOracle:
             return float(statistics.pstdev(values))
         variance = sum(weight * ((value - mean) ** 2) for value, weight in zip(values, positive_weights)) / total_weight
         return float(math.sqrt(max(0.0, variance)))
+
+    @staticmethod
+    def _weighted_median(values: list[float], weights: list[float]) -> float:
+        if not values:
+            return 0.0
+        if len(values) != len(weights):
+            return float(statistics.median(values))
+        points = sorted(
+            (
+                (float(value), max(0.0, float(weight)))
+                for value, weight in zip(values, weights)
+            ),
+            key=lambda item: item[0],
+        )
+        total_weight = float(sum(weight for _, weight in points))
+        if total_weight <= 0:
+            return float(statistics.median(values))
+        threshold = total_weight / 2.0
+        cumulative = 0.0
+        for value, weight in points:
+            cumulative += weight
+            if cumulative >= threshold:
+                return float(value)
+        return float(points[-1][0])
 
     def _load_historical_reference_cases(self) -> list[Dict[str, Any]]:
         if not self.historical_reference_enabled:

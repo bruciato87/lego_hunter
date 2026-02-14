@@ -343,6 +343,65 @@ class EbayHistorySyncTests(unittest.TestCase):
         self.assertEqual(merged[0]["roi_12m_pct"], "11.5000")
         self.assertEqual(merged[0]["sold_listing_count"], "6")
 
+    def test_prune_rows_by_rolling_window_removes_old_rows(self) -> None:
+        now = self.mod.datetime(2026, 2, 14, tzinfo=self.mod.timezone.utc)
+        rows = [
+            {
+                "set_id": "76281",
+                "source_dataset": "ebay_sold_it_90d",
+                "market_country": "IT",
+                "end_date": "2026-02-10",
+            },
+            {
+                "set_id": "10332",
+                "source_dataset": "ebay_sold_it_90d",
+                "market_country": "IT",
+                "end_date": "2024-06-01",
+            },
+            {
+                # Keep rows with invalid date rather than dropping potentially usable data.
+                "set_id": "40747",
+                "source_dataset": "vinted_active_it_30d",
+                "market_country": "IT",
+                "end_date": "invalid-date",
+            },
+        ]
+        kept, dropped = self.mod.prune_rows_by_rolling_window(rows, rolling_days=365, now_utc=now)
+        self.assertEqual(dropped, 1)
+        kept_ids = {row["set_id"] for row in kept}
+        self.assertEqual(kept_ids, {"76281", "40747"})
+
+    def test_build_market_snapshots_from_rows_maps_platforms(self) -> None:
+        rows = [
+            {
+                "set_id": "76281",
+                "set_name": "X-Jet",
+                "source_dataset": "ebay_sold_it_90d",
+                "end_date": "2026-02-14",
+                "price_12m_usd": "79.99",
+                "sold_listing_count": "8",
+                "roi_12m_pct": "11.2",
+            },
+            {
+                "set_id": "40747",
+                "set_name": "Narcisi",
+                "source_dataset": "vinted_active_it_30d",
+                "end_date": "2026-02-14",
+                "price_12m_usd": "16.50",
+                "sold_listing_count": "5",
+                "roi_12m_pct": "9.5",
+            },
+        ]
+        snapshots = self.mod.build_market_snapshots_from_rows(rows)
+        self.assertEqual(len(snapshots), 2)
+        by_set = {item.set_id: item for item in snapshots}
+        self.assertEqual(by_set["76281"].platform, "ebay")
+        self.assertEqual(by_set["76281"].listing_type, "sold_seed")
+        self.assertAlmostEqual(by_set["76281"].price, 79.99, places=2)
+        self.assertEqual(by_set["40747"].platform, "vinted")
+        self.assertEqual(by_set["40747"].listing_type, "listing_seed")
+        self.assertAlmostEqual(by_set["40747"].price, 16.5, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

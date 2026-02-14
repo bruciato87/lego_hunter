@@ -14,6 +14,7 @@ from telegram import Bot, Update
 from bot import (
     LegoHunterTelegramBot,
     _dispatch_scova_workflow,
+    _dispatch_seed_sync_workflow,
     _dispatch_single_set_analysis_workflow,
     _normalize_set_id_token,
     build_application,
@@ -32,7 +33,7 @@ WEBHOOK_PATHS = {"/api/telegram_webhook", "/telegram/webhook"}
 HEALTH_PATHS = {"/", "/healthz", "/api/telegram_webhook/healthz"}
 
 _MANAGER: Optional[LegoHunterTelegramBot] = None
-CLOUD_DISPATCH_COMMANDS = {"/scova", "/hunt", "/analizza", "/analisi"}
+CLOUD_DISPATCH_COMMANDS = {"/scova", "/hunt", "/analizza", "/analisi", "/seedsync", "/seed"}
 
 
 def _is_truthy(raw_value: Optional[str], default: bool = False) -> bool:
@@ -177,7 +178,7 @@ async def _send_webhook_light_notice(
         return
     notice = (
         "Comando non disponibile nel webhook leggero.\n"
-        "Usa /acquista, /venduto, /analizza, /radar, /cerca, /collezione, /vendi, /help.\n"
+        "Usa /acquista, /venduto, /analizza, /seedsync, /radar, /cerca, /collezione, /vendi, /help.\n"
         "La discovery completa (/scova) gira nei cicli schedulati cloud."
     )
     await _send_webhook_message(
@@ -271,6 +272,30 @@ async def _maybe_dispatch_cloud_command_from_webhook(
             text=message,
         )
         LOGGER.info("Webhook cloud dispatch /analizza handled | chat_id=%s set_id=%s ok=%s", chat_id, set_id, ok)
+        return True
+
+    if command in {"/seedsync", "/seed"}:
+        ok, detail = await asyncio.to_thread(
+            _dispatch_seed_sync_workflow,
+            chat_id=str(chat_id),
+        )
+        message = (
+            detail
+            if ok
+            else (
+                "Impossibile avviare /seedsync su GitHub.\n"
+                f"Dettaglio: {detail}\n"
+                "Config richiesta: GITHUB_ACTIONS_DISPATCH_TOKEN, GITHUB_REPO, "
+                "GITHUB_SEED_SYNC_WORKFLOW_FILE (opzionale), GITHUB_WORKFLOW_REF (opzionale)."
+            )
+        )
+        await _send_webhook_message(
+            token=token,
+            chat_id=chat_id,
+            reply_to_message_id=reply_to_message_id,
+            text=message,
+        )
+        LOGGER.info("Webhook cloud dispatch /seedsync handled | chat_id=%s ok=%s", chat_id, ok)
         return True
 
     return False

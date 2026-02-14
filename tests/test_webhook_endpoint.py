@@ -126,6 +126,26 @@ class WebhookCloudDispatchTests(unittest.IsolatedAsyncioTestCase):
         mocked_dispatch.assert_not_called()
         mocked_send.assert_awaited_once()
 
+    async def test_maybe_dispatch_cloud_command_seedsync(self) -> None:
+        payload = {
+            "message": {
+                "text": "/seedsync",
+                "chat": {"id": 12345},
+                "message_id": 88,
+            }
+        }
+        with patch.dict(os.environ, {"TELEGRAM_CHAT_ID": "12345"}, clear=True):
+            with patch("api.telegram_webhook._dispatch_seed_sync_workflow", return_value=(True, "ok")) as mocked_dispatch:
+                with patch("api.telegram_webhook._send_webhook_message", new=AsyncMock()) as mocked_send:
+                    handled = await _maybe_dispatch_cloud_command_from_webhook(
+                        token="token",
+                        payload=payload,
+                        command="/seedsync",
+                    )
+        self.assertTrue(handled)
+        mocked_dispatch.assert_called_once_with(chat_id="12345")
+        mocked_send.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()

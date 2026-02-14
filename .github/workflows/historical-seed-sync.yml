@@ -1,0 +1,50 @@
+name: historical-seed-sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Frequent historical refresh (UTC) to keep the data moat fresh without running full AI discovery.
+    - cron: "25 */4 * * *"
+
+jobs:
+  seed-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: lego_hunter
+    concurrency:
+      group: historical-seed-sync
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Sync secondary historical seed and persist snapshots
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY != '' && secrets.SUPABASE_SERVICE_ROLE_KEY || secrets.SUPABASE_KEY }}
+        run: |
+          python scripts/sync_ebay_sold_history.py \
+            --out data/historical_seed/ebay_reference_cases.csv \
+            --markets IT \
+            --include-eu-fallback \
+            --include-vinted \
+            --max-sets 120 \
+            --max-vinted-targets 60 \
+            --lookback-days 365 \
+            --rolling-days 540 \
+            --min-sold-listings 4 \
+            --max-markets-per-set 1 \
+            --min-vinted-listings 3 \
+            --max-vinted-markets-per-set 1 \
+            --persist-market-snapshots

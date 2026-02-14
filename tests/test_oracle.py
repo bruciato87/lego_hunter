@@ -5149,6 +5149,46 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         self.assertIn("seed_datato", issues)
         self.assertIn("pattern_generico", issues)
 
+    def test_historical_quality_weighted_median_prioritizes_recent_secondary_rows(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+
+        synthetic = []
+        for idx in range(30):
+            synthetic.append(
+                {
+                    "set_id": str(91000 + idx),
+                    "theme_norm": "city",
+                    "roi_12m_pct": 4.0,
+                    "win_12m": 0,
+                    "end_date": "2018-04-01",
+                    "source_dataset": "mendeley_historical",
+                    "pattern_tags": '["general_collectible"]',
+                    "pattern_tags_list": ["general_collectible"],
+                }
+            )
+        for idx in range(12):
+            synthetic.append(
+                {
+                    "set_id": str(92000 + idx),
+                    "theme_norm": "harry potter",
+                    "roi_12m_pct": 18.0,
+                    "win_12m": 1,
+                    "end_date": "2026-02-01",
+                    "source_dataset": "ebay_sold_it_90d",
+                    "case_weight": 3.0,
+                    "recency_weight": 2.0,
+                    "pattern_tags": '["secondary_market_signal"]',
+                    "pattern_tags_list": ["secondary_market_signal"],
+                }
+            )
+
+        profile = oracle._evaluate_historical_reference_quality(synthetic)
+        self.assertEqual(profile.get("median_end_year"), 2026)
+        self.assertEqual(profile.get("median_age_method"), "weighted")
+        issues = " ".join(profile.get("issues") or [])
+        self.assertNotIn("seed_datato", issues)
+
     def test_historical_quality_soft_gate_allows_zero_sample_when_seed_is_degraded(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
