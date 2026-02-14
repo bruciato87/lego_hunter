@@ -572,6 +572,63 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Segnali uscita", text)
         self.assertIn("ebay.it", text.lower())
 
+    async def test_sell_signals_shipping_in_counted_once_for_position(self) -> None:
+        class ShippingCostRepo(FakeRepo):
+            def get_portfolio(self, status="holding"):  # noqa: ANN001
+                return [
+                    {
+                        "set_id": "71824",
+                        "set_name": "Spinner del drago Spinjitzu di Sora",
+                        "quantity": 2,
+                        "purchase_price": 50.0,
+                        "shipping_in_cost": 10.0,
+                    }
+                ]
+
+            def get_latest_price(self, set_id, platform=None):  # noqa: ANN001
+                if platform == "ebay":
+                    return {"platform": "ebay", "price": 100.0}
+                return None
+
+        manager = LegoHunterTelegramBot(
+            repository=ShippingCostRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+
+        signals = await manager._compute_sell_signals()
+        self.assertTrue(signals)
+        # Correct math: total_cost=(50*2)+10=110 ; net_sale=(100-7)*2=186 ; ROI=69.09%
+        self.assertAlmostEqual(float(signals[0]["roi_net"]), 69.0909, places=3)
+
+    async def test_collezione_shipping_in_counted_once_for_position(self) -> None:
+        class ShippingCostRepo(FakeRepo):
+            def get_portfolio(self, status="holding"):  # noqa: ANN001
+                return [
+                    {
+                        "set_id": "71824",
+                        "set_name": "Spinner del drago Spinjitzu di Sora",
+                        "quantity": 2,
+                        "purchase_price": 50.0,
+                        "shipping_in_cost": 10.0,
+                    }
+                ]
+
+            def get_best_secondary_price(self, set_id):  # noqa: ANN001
+                return {"platform": "ebay", "price": 100.0}
+
+        manager = LegoHunterTelegramBot(
+            repository=ShippingCostRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate()
+
+        await manager.cmd_collezione(update, DummyContext())
+        self.assertTrue(update.message.replies)
+        text = update.message.replies[-1]
+        self.assertIn("ROI +81.8%", text)
+
     async def test_scova_runs_silent_sell_scan_and_shows_only_when_profitable(self) -> None:
         manager = LegoHunterTelegramBot(
             repository=FakeRepo(),

@@ -926,7 +926,8 @@ class LegoHunterTelegramBot:
             qty = int(row.get("quantity") or 1)
             buy_price = float(row.get("purchase_price") or 0.0)
             ship_in = float(row.get("shipping_in_cost") or 0.0)
-            cost_total = (buy_price + ship_in) * qty
+            # `shipping_in_cost` is stored as total inbound shipping for the position, not per-unit.
+            cost_total = (buy_price * qty) + ship_in
             invested += cost_total
 
             latest = await asyncio.to_thread(self.repository.get_best_secondary_price, row.get("set_id"))
@@ -993,7 +994,8 @@ class LegoHunterTelegramBot:
             qty = int(row.get("quantity") or 1)
             buy_price = float(row.get("purchase_price") or 0.0)
             ship_in = float(row.get("shipping_in_cost") or 0.0)
-            total_cost = (buy_price + ship_in) * qty
+            # `shipping_in_cost` is total inbound shipping for the whole holding.
+            total_cost = (buy_price * qty) + ship_in
             if total_cost <= 0:
                 continue
 

@@ -39,6 +39,53 @@ class ModelsRetryTests(unittest.TestCase):
 
         self.assertEqual(repo.search_opportunities("   "), [])
 
+    def test_search_opportunities_merges_fields_without_or_filter_parser_issues(self) -> None:
+        repo = object.__new__(LegoHunterRepository)
+        repo.max_retries = 1
+        repo.retry_base_delay = 0.01
+        calls: list[tuple[str, str, int]] = []
+
+        def fake_search(field: str, pattern: str, limit: int):  # noqa: ANN001
+            calls.append((field, pattern, limit))
+            if field == "set_name":
+                return [
+                    {
+                        "set_id": "76441",
+                        "source": "lego_proxy_reader",
+                        "ai_investment_score": 80,
+                        "market_demand_score": 90,
+                        "last_seen_at": "2026-02-11T10:00:00Z",
+                    }
+                ]
+            if field == "set_id":
+                return [
+                    {
+                        "set_id": "76441",
+                        "source": "lego_proxy_reader",
+                        "ai_investment_score": 85,
+                        "market_demand_score": 91,
+                        "last_seen_at": "2026-02-11T11:00:00Z",
+                    }
+                ]
+            return [
+                {
+                    "set_id": "10332",
+                    "source": "amazon_proxy_reader",
+                    "ai_investment_score": 70,
+                    "market_demand_score": 80,
+                    "last_seen_at": "2026-02-11T09:00:00Z",
+                }
+            ]
+
+        repo._search_opportunities_by_field = fake_search  # type: ignore[attr-defined]
+
+        rows = repo.search_opportunities("76441, Hogwarts (club)", limit=10)
+        self.assertEqual([field for field, _, _ in calls], ["set_name", "set_id", "theme"])
+        self.assertEqual(calls[0][1], "%76441, Hogwarts (club)%")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["set_id"], "76441")
+        self.assertEqual(rows[0]["ai_investment_score"], 85)
+
     def test_get_recent_ai_insights_empty_set_ids_short_circuit(self) -> None:
         repo = object.__new__(LegoHunterRepository)
         repo.max_retries = 1
@@ -88,7 +135,7 @@ class ModelsRetryTests(unittest.TestCase):
             "quantity": 3,
             "purchase_price": 30.0,
             "purchase_date": "2026-01-01",
-            "shipping_in_cost": 0.0,
+            "shipping_in_cost": 9.0,
         }
         repo.insert_fiscal_log = lambda record: {"id": "f2"}
         repo.delete_portfolio_item = lambda set_id: calls.__setitem__("deleted", set_id)
@@ -110,6 +157,7 @@ class ModelsRetryTests(unittest.TestCase):
         self.assertIsNotNone(calls["upserted"])
         self.assertEqual(calls["upserted"].quantity, 2)
         self.assertEqual(calls["upserted"].status, "holding")
+        self.assertEqual(calls["upserted"].shipping_in_cost, 6.0)
 
 
 if __name__ == "__main__":

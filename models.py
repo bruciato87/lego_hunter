@@ -191,13 +191,45 @@ class LegoHunterRepository:
         safe_query = query_text.strip()
         if not safe_query:
             return []
+        pattern = f"%{safe_query}%"
+        merged: Dict[tuple[str, str], Dict[str, Any]] = {}
 
+        # Avoid a raw `.or_` string so special characters in user query cannot break PostgREST filter parsing.
+        for field in ("set_name", "set_id", "theme"):
+            rows = self._search_opportunities_by_field(field=field, pattern=pattern, limit=limit)
+            for row in rows:
+                row_set_id = str(row.get("set_id") or "").strip()
+                row_source = str(row.get("source") or "").strip()
+                key = (row_set_id, row_source)
+                existing = merged.get(key)
+                if existing is None:
+                    merged[key] = row
+                    continue
+                existing_ai = float(existing.get("ai_investment_score") or 0.0)
+                row_ai = float(row.get("ai_investment_score") or 0.0)
+                existing_last = str(existing.get("last_seen_at") or "")
+                row_last = str(row.get("last_seen_at") or "")
+                if row_ai > existing_ai or (row_ai == existing_ai and row_last > existing_last):
+                    merged[key] = row
+
+        rows = list(merged.values())
+        rows.sort(
+            key=lambda row: (
+                float(row.get("ai_investment_score") or 0.0),
+                float(row.get("market_demand_score") or 0.0),
+                str(row.get("last_seen_at") or ""),
+            ),
+            reverse=True,
+        )
+        return rows[:limit]
+
+    def _search_opportunities_by_field(self, *, field: str, pattern: str, limit: int) -> list[Dict[str, Any]]:
         result = self._with_retry(
-            "search_opportunities",
+            f"search_opportunities_{field}",
             lambda: self.client.table("opportunity_radar")
             .select("*")
             .eq("is_archived", False)
-            .or_(f"set_name.ilike.%{safe_query}%,set_id.ilike.%{safe_query}%,theme.ilike.%{safe_query}%")
+            .ilike(field, pattern)
             .order("ai_investment_score", desc=True)
             .order("last_seen_at", desc=True)
             .limit(limit)
@@ -445,6 +477,9 @@ class LegoHunterRepository:
         if sold_all:
             self.delete_portfolio_item(key)
         else:
+            prev_shipping_total = round(max(0.0, float(existing.get("shipping_in_cost") or 0.0)), 2)
+            # Keep inbound shipping cost proportional to the remaining quantity.
+            remaining_shipping_in = round(prev_shipping_total * (remaining_qty / available_qty), 2)
             updated = PortfolioRecord(
                 set_id=key,
                 set_name=str(existing.get("set_name") or key).strip() or key,
@@ -453,7 +488,7 @@ class LegoHunterRepository:
                 purchase_date=str(existing.get("purchase_date") or safe_date),
                 quantity=remaining_qty,
                 purchase_platform=str(existing.get("purchase_platform") or "").strip() or None,
-                shipping_in_cost=round(max(0.0, float(existing.get("shipping_in_cost") or 0.0)), 2),
+                shipping_in_cost=remaining_shipping_in,
                 estimated_market_price=(
                     float(existing.get("estimated_market_price"))
                     if existing.get("estimated_market_price") is not None
