@@ -293,6 +293,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(update.message.replies)
         text = update.message.replies[-1]
         self.assertIn("/scova", text)
+        self.assertIn("/schedula_scova <ore_IT>", text)
+        self.assertIn("/orari_scova", text)
         self.assertIn("/acquista <set_id> <prezzo>", text)
         self.assertIn("/venduto <set_id> <prezzo_vendita>", text)
         self.assertIn("/analizza <set_id>", text)
@@ -380,6 +382,62 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(update.message.replies)
         self.assertIn("Impossibile avviare l'analisi su GitHub", update.message.replies[-1])
         self.assertIn("missing token", update.message.replies[-1])
+
+    async def test_schedula_scova_requires_args(self) -> None:
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        await manager.cmd_schedula_scova(update, DummyContext(args=[]))
+
+        self.assertTrue(update.message.replies)
+        self.assertIn("Uso: /schedula_scova", update.message.replies[-1])
+
+    async def test_schedula_scova_rejects_invalid_hours(self) -> None:
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        await manager.cmd_schedula_scova(update, DummyContext(args=["24,21"]))
+
+        self.assertTrue(update.message.replies)
+        self.assertIn("Orari non validi", update.message.replies[-1])
+
+    async def test_schedula_scova_updates_github_variable(self) -> None:
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        with patch("bot._upsert_github_actions_variable", return_value=(True, "ok")) as patched:
+            await manager.cmd_schedula_scova(update, DummyContext(args=["8,21"]))
+
+        patched.assert_called_once_with(name="SCOVA_SCHEDULE_HOURS_IT", value="08,21")
+        self.assertTrue(update.message.replies)
+        self.assertIn("Schedulazione /scova aggiornata", update.message.replies[-1])
+
+    async def test_orari_scova_uses_default_when_not_set(self) -> None:
+        manager = LegoHunterTelegramBot(
+            repository=FakeRepo(),
+            oracle=FakeOracle(),
+            fiscal_guardian=FakeFiscal({"allow_sell_signals": True, "status": "GREEN", "message": "ok"}),
+        )
+        update = DummyUpdate(chat_id="98765")
+
+        with patch("bot._get_github_actions_variable", return_value=(True, None, "Variabile non impostata.")):
+            await manager.cmd_orari_scova(update, DummyContext(args=[]))
+
+        self.assertTrue(update.message.replies)
+        self.assertIn("08, 21", update.message.replies[-1])
+        self.assertIn("default workflow", update.message.replies[-1])
 
     async def test_seedsync_dispatches_github_workflow(self) -> None:
         manager = LegoHunterTelegramBot(

@@ -31,6 +31,7 @@ jobs:
     outputs:
       should_run: ${{ steps.decide.outputs.should_run }}
       local_hour: ${{ steps.decide.outputs.local_hour }}
+      schedule_hours: ${{ steps.decide.outputs.schedule_hours }}
     steps:
       - name: Decide schedule window (Europe/Rome)
         id: decide
@@ -38,19 +39,55 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
             echo "local_hour=manual" >> "$GITHUB_OUTPUT"
+            echo "schedule_hours=manual" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          configured_hours="${{ vars.SCOVA_SCHEDULE_HOURS_IT }}"
+          if [ -z "$configured_hours" ]; then
+            configured_hours="08,21"
+          fi
+          normalized_hours=""
+          for token in $(echo "$configured_hours" | tr ',;' ' '); do
+            token="$(echo "$token" | xargs)"
+            [ -z "$token" ] && continue
+            if ! [[ "$token" =~ ^[0-9]{1,2}$ ]]; then
+              continue
+            fi
+            hour="$(printf "%02d" "$token")"
+            if [ "$hour" -lt 00 ] || [ "$hour" -gt 23 ]; then
+              continue
+            fi
+            if [[ ",$normalized_hours," != *",$hour,"* ]]; then
+              if [ -z "$normalized_hours" ]; then
+                normalized_hours="$hour"
+              else
+                normalized_hours="$normalized_hours,$hour"
+              fi
+            fi
+          done
+          if [ -z "$normalized_hours" ]; then
+            normalized_hours="08,21"
+          fi
           local_hour="$(TZ=Europe/Rome date +%H)"
-          if [ "$local_hour" = "08" ] || [ "$local_hour" = "21" ]; then
+          should_run="false"
+          for hour in $(echo "$normalized_hours" | tr ',' ' '); do
+            if [ "$local_hour" = "$hour" ]; then
+              should_run="true"
+              break
+            fi
+          done
+          if [ "$should_run" = "true" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
           else
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           fi
           echo "local_hour=$local_hour" >> "$GITHUB_OUTPUT"
+          echo "schedule_hours=$normalized_hours" >> "$GITHUB_OUTPUT"
       - name: Gate summary
         run: |
           echo "event=${{ github.event_name }}"
           echo "local_hour=${{ steps.decide.outputs.local_hour }}"
+          echo "schedule_hours=${{ steps.decide.outputs.schedule_hours }}"
           echo "should_run=${{ steps.decide.outputs.should_run }}"
 
   test:

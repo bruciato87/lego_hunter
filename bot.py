@@ -154,6 +154,171 @@ def _dispatch_github_workflow(
     return True, workflow_url
 
 
+def _github_actions_variable_token_and_repo() -> tuple[str, str, list[str]]:
+    token = str(
+        os.getenv("GITHUB_ACTIONS_DISPATCH_TOKEN")
+        or os.getenv("GITHUB_TOKEN")
+        or ""
+    ).strip()
+    repository = _github_dispatch_repository()
+    missing: list[str] = []
+    if not token:
+        missing.append("GITHUB_ACTIONS_DISPATCH_TOKEN (o GITHUB_TOKEN)")
+    if not repository:
+        missing.append("GITHUB_REPO")
+    return token, repository, missing
+
+
+def _upsert_github_actions_variable(*, name: str, value: str) -> tuple[bool, str]:
+    token, repository, missing = _github_actions_variable_token_and_repo()
+    if missing:
+        return (
+            False,
+            "Configurazione incompleta per variabili GitHub Actions: " + ", ".join(missing) + ".",
+        )
+    var_name = str(name or "").strip().upper()
+    var_value = str(value or "").strip()
+    if not var_name:
+        return False, "Nome variabile non valido."
+
+    patch_url = f"https://api.github.com/repos/{repository}/actions/variables/{var_name}"
+    patch_payload = {"name": var_name, "value": var_value}
+    patch_request = urllib.request.Request(
+        patch_url,
+        data=json.dumps(patch_payload).encode("utf-8"),
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="PATCH",
+    )
+    try:
+        with urllib.request.urlopen(patch_request, timeout=12) as response:
+            status = int(getattr(response, "status", 0) or 0)
+        if status in {200, 201, 204}:
+            return True, f"Variabile {var_name} aggiornata."
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="ignore")
+            except Exception:  # noqa: BLE001
+                detail = ""
+            detail = (detail or "")[:240]
+            return (
+                False,
+                f"GitHub API HTTP {exc.code} durante update variabile"
+                + (f" ({detail})" if detail else "."),
+            )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Errore rete durante update variabile GitHub: {exc}"
+
+    create_url = f"https://api.github.com/repos/{repository}/actions/variables"
+    create_payload = {"name": var_name, "value": var_value}
+    create_request = urllib.request.Request(
+        create_url,
+        data=json.dumps(create_payload).encode("utf-8"),
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(create_request, timeout=12) as response:
+            status = int(getattr(response, "status", 0) or 0)
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            detail = ""
+        detail = (detail or "")[:240]
+        return (
+            False,
+            f"GitHub API HTTP {exc.code} durante create variabile"
+            + (f" ({detail})" if detail else "."),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Errore rete durante create variabile GitHub: {exc}"
+
+    if status not in {200, 201, 204}:
+        return False, f"GitHub variabile non confermata (status {status})."
+    return True, f"Variabile {var_name} creata."
+
+
+def _get_github_actions_variable(name: str) -> tuple[bool, Optional[str], str]:
+    token, repository, missing = _github_actions_variable_token_and_repo()
+    if missing:
+        return False, None, "Configurazione incompleta per variabili GitHub Actions: " + ", ".join(missing) + "."
+    var_name = str(name or "").strip().upper()
+    if not var_name:
+        return False, None, "Nome variabile non valido."
+    request_url = f"https://api.github.com/repos/{repository}/actions/variables/{var_name}"
+    request = urllib.request.Request(
+        request_url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            body = response.read().decode("utf-8", errors="ignore")
+            status = int(getattr(response, "status", 0) or 0)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return True, None, "Variabile non impostata."
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            detail = ""
+        detail = (detail or "")[:240]
+        return False, None, (
+            f"GitHub API HTTP {exc.code} durante lettura variabile"
+            + (f" ({detail})" if detail else ".")
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, None, f"Errore rete durante lettura variabile GitHub: {exc}"
+    if status not in {200, 201}:
+        return False, None, f"GitHub variabile non leggibile (status {status})."
+    try:
+        payload = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return False, None, "Risposta GitHub variabili non valida."
+    value = str(payload.get("value") or "").strip()
+    return True, (value or None), "OK"
+
+
+def _parse_scova_schedule_hours(raw_hours: str) -> tuple[bool, list[str], str]:
+    raw = str(raw_hours or "").strip()
+    if not raw:
+        return False, [], "Nessun orario specificato."
+    hours: list[str] = []
+    seen: set[str] = set()
+    for token in re.split(r"[,\s;]+", raw):
+        part = str(token or "").strip()
+        if not part:
+            continue
+        if not re.fullmatch(r"\d{1,2}", part):
+            return False, [], f"Formato orario non valido: {part}"
+        hour_int = int(part)
+        if hour_int < 0 or hour_int > 23:
+            return False, [], f"Ora fuori range (0-23): {part}"
+        hour = f"{hour_int:02d}"
+        if hour in seen:
+            continue
+        seen.add(hour)
+        hours.append(hour)
+    if not hours:
+        return False, [], "Nessun orario valido."
+    return True, hours, "OK"
+
+
 def _dispatch_single_set_analysis_workflow(
     *,
     set_id: str,
@@ -488,6 +653,8 @@ class LegoHunterTelegramBot:
         return [
             BotCommand("start", "Attiva il bot e mostra guida rapida"),
             BotCommand("scova", "Scopre i migliori set da monitorare/acquistare"),
+            BotCommand("schedula_scova", "Imposta orari /scova GitHub (ora IT)"),
+            BotCommand("orari_scova", "Mostra orari /scova correnti"),
             BotCommand("acquista", "Registra acquisto in collezione: /acquista 76441 34,99"),
             BotCommand("venduto", "Registra vendita e aggiorna collezione: /venduto 76441 89,90"),
             BotCommand("analizza", "Analisi approfondita set su GitHub Actions: /analizza 76441"),
@@ -517,6 +684,8 @@ class LegoHunterTelegramBot:
             "🧱 LEGO HUNTER - Guida comandi\n\n"
             "Comandi principali:\n"
             "/scova - Discovery completa (LEGO + Amazon + ranking AI) e Top Picks del ciclo.\n"
+            "/schedula_scova <ore_IT> - Imposta gli orari italiani di lancio automatico /scova su GitHub (es. /schedula_scova 8,21 o /schedula_scova 7 13 21).\n"
+            "/orari_scova - Mostra gli orari italiani attualmente configurati per il lancio schedulato.\n"
             "/acquista <set_id> <prezzo> [quantita] - Registra un acquisto in collezione (es. /acquista 76441 34,99 1).\n"
             "/venduto <set_id> <prezzo_vendita> [quantita] [piattaforma] - Registra una vendita e aggiorna la collezione (es. /venduto 76441 89,90 1 ebay).\n"
             "/analizza <set_id> - Avvia su GitHub un'analisi approfondita singolo set (es. /analizza 76441).\n"
@@ -537,6 +706,8 @@ class LegoHunterTelegramBot:
             "Esempi rapidi:\n"
             "/acquista 76441 34,99\n"
             "/venduto 76441 89,90\n"
+            "/schedula_scova 8,21\n"
+            "/orari_scova\n"
             "/analizza 76441\n"
             "/seedsync\n"
             "/cerca millennium falcon\n"
@@ -588,6 +759,66 @@ class LegoHunterTelegramBot:
             lines.append("💸 <b>Occasioni vendita rilevate</b>")
             lines.extend(self._format_sell_signal_lines(sell_signals[:3]))
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+    async def cmd_schedula_scova(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+        raw_hours = " ".join(context.args or []).strip()
+        if not raw_hours:
+            await update.message.reply_text(
+                "Uso: /schedula_scova <ore_IT>\n"
+                "Esempi: /schedula_scova 8,21  oppure  /schedula_scova 7 13 21"
+            )
+            return
+        ok_parse, hours, parse_message = _parse_scova_schedule_hours(raw_hours)
+        if not ok_parse:
+            await update.message.reply_text(
+                "Orari non validi.\n"
+                f"Dettaglio: {parse_message}\n"
+                "Usa ore 0-23, separate da virgola o spazio (es. 8,21)."
+            )
+            return
+        normalized_value = ",".join(hours)
+        ok, detail = await asyncio.to_thread(
+            _upsert_github_actions_variable,
+            name="SCOVA_SCHEDULE_HOURS_IT",
+            value=normalized_value,
+        )
+        if not ok:
+            await update.message.reply_text(
+                "Impossibile aggiornare la schedulazione /scova su GitHub.\n"
+                f"Dettaglio: {detail}"
+            )
+            return
+        hours_pretty = ", ".join(hours)
+        await update.message.reply_text(
+            "✅ Schedulazione /scova aggiornata.\n"
+            f"Orari Italia (Europe/Rome): {hours_pretty}\n"
+            "Nota: il workflow viene verificato ad ogni tick cron UTC e parte solo nelle ore configurate."
+        )
+
+    async def cmd_orari_scova(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+        ok, value, detail = await asyncio.to_thread(
+            _get_github_actions_variable,
+            "SCOVA_SCHEDULE_HOURS_IT",
+        )
+        if not ok:
+            await update.message.reply_text(
+                "Impossibile leggere gli orari /scova da GitHub.\n"
+                f"Dettaglio: {detail}"
+            )
+            return
+        effective = value or "08,21"
+        parsed_ok, hours, _ = _parse_scova_schedule_hours(effective)
+        pretty = ", ".join(hours) if parsed_ok else effective
+        source = "Repository Variable" if value else "default workflow"
+        await update.message.reply_text(
+            "⏱️ Orari /scova correnti (ora Italia):\n"
+            f"{pretty}\n"
+            f"Fonte: {source}"
+        )
 
     async def cmd_analizza(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update):
@@ -1621,6 +1852,10 @@ def build_application(
 
     # New LEGO-focused commands.
     app.add_handler(CommandHandler("scova", manager.cmd_scova))
+    app.add_handler(CommandHandler("schedula_scova", manager.cmd_schedula_scova))
+    app.add_handler(CommandHandler("schedula", manager.cmd_schedula_scova))
+    app.add_handler(CommandHandler("orari_scova", manager.cmd_orari_scova))
+    app.add_handler(CommandHandler("orari", manager.cmd_orari_scova))
     app.add_handler(CommandHandler("acquista", manager.cmd_acquista))
     app.add_handler(CommandHandler("compra", manager.cmd_acquista))
     app.add_handler(CommandHandler("venduto", manager.cmd_venduto))
