@@ -53,10 +53,11 @@ jobs:
             if ! [[ "$token" =~ ^[0-9]{1,2}$ ]]; then
               continue
             fi
-            hour="$(printf "%02d" "$token")"
-            if [ "$hour" -lt 00 ] || [ "$hour" -gt 23 ]; then
+            hour_int=$((10#$token))
+            if [ "$hour_int" -lt 0 ] || [ "$hour_int" -gt 23 ]; then
               continue
             fi
+            hour="$(printf "%02d" "$hour_int")"
             if [[ ",$normalized_hours," != *",$hour,"* ]]; then
               if [ -z "$normalized_hours" ]; then
                 normalized_hours="$hour"
