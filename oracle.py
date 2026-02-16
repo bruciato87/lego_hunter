@@ -179,6 +179,14 @@ DEFAULT_HISTORICAL_RECENCY_MIN_WEIGHT = 0.20
 DEFAULT_HISTORY_WINDOW_DAYS = 180
 DEFAULT_BACKTEST_LOOKBACK_DAYS = 365
 DEFAULT_BACKTEST_HORIZON_DAYS = 180
+DEFAULT_SIGNAL_PROMOTION_COOLDOWN_HOURS = 12.0
+
+SIGNAL_STRENGTH_VALUES = {
+    "HIGH_CONFIDENCE",
+    "HIGH_CONFIDENCE_STRICT",
+    "HIGH_CONFIDENCE_BOOTSTRAP",
+    "LOW_CONFIDENCE",
+}
 
 CULT_MOVIE_KEYWORDS = (
     "fast & furious",
@@ -909,6 +917,12 @@ class DiscoveryOracle:
             minimum=1,
             maximum=100,
         )
+        self.signal_promotion_cooldown_hours = self._safe_env_float(
+            "SIGNAL_PROMOTION_COOLDOWN_HOURS",
+            default=DEFAULT_SIGNAL_PROMOTION_COOLDOWN_HOURS,
+            minimum=0.0,
+            maximum=168.0,
+        )
         self.historical_high_conf_required = self._safe_env_bool(
             "HISTORICAL_HIGH_CONF_REQUIRED",
             default=DEFAULT_HISTORICAL_HIGH_CONF_REQUIRED,
@@ -1322,6 +1336,11 @@ class DiscoveryOracle:
             "AI shortlist policy | strict_top_k_only=%s strict_top_k=%s",
             self.ai_strict_final_top_k_only,
             self.ai_strict_final_top_k,
+        )
+        LOGGER.info(
+            "Signal anti-flip tuning | promotion_cooldown_hours=%.1f enabled=%s",
+            self.signal_promotion_cooldown_hours,
+            self.signal_promotion_cooldown_hours > 0.0,
         )
         LOGGER.info(
             "Non-JSON tuning | cache_ttl_sec=%.0f rescore_enabled=%s rescore_max=%s rescore_min_composite=%s rescore_min_budget_sec=%.1f rescore_timeout_sec=%.1f",
@@ -4007,6 +4026,12 @@ class DiscoveryOracle:
             for row in ai_shortlisted_rows
             if (not bool(row.get("ai_fallback_used")) and not _is_non_json_row(row))
         )
+        signal_lock_applied_count = sum(1 for row in ranked if bool(row.get("signal_lock_applied")))
+        signal_lock_promotion_cooldown_count = sum(
+            1
+            for row in ranked
+            if str(row.get("signal_lock_reason") or "").strip().lower() == "promotion_cooldown"
+        )
 
         diagnostics = {
             "threshold": self.min_composite_score,
@@ -4017,6 +4042,9 @@ class DiscoveryOracle:
             "bootstrap_min_history_points": self.bootstrap_min_history_points,
             "bootstrap_min_probability_high_confidence": self.bootstrap_min_upside_probability,
             "bootstrap_min_confidence_score_high_confidence": self.bootstrap_min_confidence_score,
+            "signal_promotion_cooldown_hours": self.signal_promotion_cooldown_hours,
+            "signal_lock_applied_count": signal_lock_applied_count,
+            "signal_lock_promotion_cooldown_count": signal_lock_promotion_cooldown_count,
             "bootstrap_rows_count": bootstrap_rows_count,
             "historical_high_conf_required": self.historical_high_conf_required,
             "historical_high_conf_min_samples": self.historical_high_conf_min_samples,
@@ -4842,6 +4870,9 @@ class DiscoveryOracle:
     ) -> tuple[list[Dict[str, Any]], list[tuple[OpportunityRadarRecord, Dict[str, Any]]]]:
         ranked: list[Dict[str, Any]] = []
         opportunities: list[tuple[OpportunityRadarRecord, Dict[str, Any]]] = []
+        recent_signal_by_set = self._load_recent_signal_strengths(
+            str(row.get("set_id") or "").strip() for row in prepared
+        )
 
         for row in prepared:
             candidate = row["candidate"]
@@ -5092,6 +5123,31 @@ class DiscoveryOracle:
             )
             if ai.risk_note:
                 payload["risk_note"] = ai.risk_note
+            raw_signal_strength = self._high_confidence_signal_strength(payload)
+            previous_signal = recent_signal_by_set.get(set_id)
+            signal_strength, signal_lock_applied, signal_lock_note, signal_lock_reason = (
+                self._apply_signal_promotion_cooldown(
+                    set_id=set_id,
+                    signal_strength=raw_signal_strength,
+                    previous_signal=previous_signal,
+                )
+            )
+            if signal_lock_applied and signal_lock_note:
+                payload["risk_note"] = self._merge_risk_note(payload.get("risk_note"), signal_lock_note)
+            payload["signal_strength_raw"] = raw_signal_strength
+            payload["signal_strength"] = signal_strength
+            payload["signal_lock_applied"] = bool(signal_lock_applied)
+            payload["signal_lock_reason"] = signal_lock_reason
+            if signal_lock_note:
+                payload["signal_lock_note"] = signal_lock_note
+            metadata_payload = payload.get("metadata")
+            if isinstance(metadata_payload, dict):
+                metadata_payload["signal_strength_raw"] = raw_signal_strength
+                metadata_payload["signal_strength"] = signal_strength
+                metadata_payload["signal_lock_applied"] = bool(signal_lock_applied)
+                metadata_payload["signal_lock_reason"] = signal_lock_reason
+                if signal_lock_note:
+                    metadata_payload["signal_lock_note"] = signal_lock_note
             ranked.append(payload)
             opportunities.append((opportunity, candidate))
 
@@ -7951,6 +8007,79 @@ class DiscoveryOracle:
                 return float(age_sec)
         return None
 
+    @staticmethod
+    def _normalize_signal_strength(value: Any) -> Optional[str]:
+        text = str(value or "").strip().upper()
+        if text in SIGNAL_STRENGTH_VALUES:
+            return text
+        return None
+
+    def _load_recent_signal_strengths(self, set_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+        cooldown_hours = float(self.signal_promotion_cooldown_hours)
+        if cooldown_hours <= 0.0:
+            return {}
+        unique_ids = [str(item).strip() for item in set_ids if str(item).strip()]
+        if not unique_ids:
+            return {}
+        try:
+            rows = self.repository.get_recent_ai_insights(
+                unique_ids,
+                max_age_hours=max(1.0, cooldown_hours),
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Signal anti-flip preload failed: %s", exc)
+            return {}
+        loaded: Dict[str, Dict[str, Any]] = {}
+        max_age_sec = cooldown_hours * 3600.0
+        for set_id, row in rows.items():
+            if not isinstance(row, dict):
+                continue
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            signal = self._normalize_signal_strength(metadata.get("signal_strength"))
+            if signal is None:
+                continue
+            age_sec = self._row_age_seconds(row)
+            if age_sec is not None and age_sec > max_age_sec:
+                continue
+            loaded[str(set_id)] = {
+                "signal_strength": signal,
+                "age_sec": age_sec,
+            }
+        return loaded
+
+    def _apply_signal_promotion_cooldown(
+        self,
+        *,
+        set_id: str,
+        signal_strength: str,
+        previous_signal: Optional[Dict[str, Any]],
+    ) -> tuple[str, bool, Optional[str], Optional[str]]:
+        normalized_current = self._normalize_signal_strength(signal_strength) or "LOW_CONFIDENCE"
+        if float(self.signal_promotion_cooldown_hours) <= 0.0:
+            return normalized_current, False, None, None
+        if not normalized_current.startswith("HIGH_CONFIDENCE"):
+            return normalized_current, False, None, None
+        if not previous_signal:
+            return normalized_current, False, None, None
+        prev_strength = self._normalize_signal_strength(previous_signal.get("signal_strength"))
+        if prev_strength != "LOW_CONFIDENCE":
+            return normalized_current, False, None, None
+        age_sec_raw = previous_signal.get("age_sec")
+        age_sec: Optional[float]
+        try:
+            age_sec = float(age_sec_raw) if age_sec_raw is not None else None
+        except (TypeError, ValueError):
+            age_sec = None
+        cooldown_hours = float(self.signal_promotion_cooldown_hours)
+        if age_sec is not None and age_sec > cooldown_hours * 3600.0:
+            return normalized_current, False, None, None
+        age_text = f"{(age_sec / 3600.0):.1f}h" if age_sec is not None else "n/d"
+        note = (
+            "Anti-flip attivo: promozione HIGH bloccata "
+            f"(set {set_id}, ultimo LOW {age_text} fa, cooldown {cooldown_hours:.0f}h)."
+        )
+        return "LOW_CONFIDENCE", True, note, "promotion_cooldown"
+
     def _effective_cache_ttl_for_insight(self, insight: AIInsight) -> float:
         ttl_sec = float(self.ai_cache_ttl_sec)
         if self._is_non_json_ai_note(insight.risk_note):
@@ -9972,6 +10101,12 @@ class DiscoveryOracle:
         return self._high_confidence_signal_strength(row).startswith("HIGH_CONFIDENCE")
 
     def _high_confidence_signal_strength(self, row: Dict[str, Any]) -> str:
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        precomputed = self._normalize_signal_strength(
+            row.get("signal_strength") or metadata.get("signal_strength")
+        )
+        if precomputed:
+            return precomputed
         if row.get("ai_fallback_used"):
             return "LOW_CONFIDENCE"
         strict_pass = self._coerce_optional_bool(row.get("ai_strict_pass"))

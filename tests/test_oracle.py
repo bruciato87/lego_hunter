@@ -4922,6 +4922,94 @@ Price, product page[€47,51€47,51](https://www.amazon.it/-/en/LEGO-Super-Mari
         note = oracle._build_low_confidence_note(row)
         self.assertIn("AI strict-pass assente", note)
 
+    def test_signal_promotion_cooldown_blocks_fast_low_to_high_flip(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_high_conf_required = False
+        oracle.signal_promotion_cooldown_hours = 12.0
+        oracle.min_upside_probability = 0.60
+        oracle.min_confidence_score = 68
+        oracle.min_composite_score = 60
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        repo.recent_ai_insights["10311"] = {
+            "set_id": "10311",
+            "source": "amazon_proxy_reader",
+            "last_seen_at": now_iso,
+            "metadata": {"signal_strength": "LOW_CONFIDENCE"},
+            "ai_investment_score": 70,
+            "ai_analysis_summary": "prev",
+        }
+
+        prepared = [
+            {
+                "candidate": {
+                    "set_id": "10311",
+                    "set_name": "Orchid",
+                    "theme": "Botanicals",
+                    "source": "amazon_proxy_reader",
+                    "current_price": 42.99,
+                    "eol_date_prediction": "2025-11-01",
+                },
+                "set_id": "10311",
+                "theme": "Botanicals",
+                "forecast": ForecastInsight(
+                    forecast_score=74,
+                    probability_upside_12m=0.755,
+                    expected_roi_12m_pct=38.4,
+                    interval_low_pct=22.0,
+                    interval_high_pct=49.0,
+                    target_roi_pct=30.0,
+                    estimated_months_to_target=9,
+                    confidence_score=80,
+                    data_points=120,
+                    rationale="test",
+                ),
+                "history_30": [],
+                "prefilter_score": 90,
+                "prefilter_rank": 1,
+                "ai_shortlisted": True,
+            }
+        ]
+        ai_results = {
+            "10311": AIInsight(
+                score=75,
+                summary="strict",
+                predicted_eol_date="2025-11-01",
+                fallback_used=False,
+                confidence="HIGH_CONFIDENCE",
+            )
+        }
+
+        ranked, _ = oracle._build_ranked_payloads(
+            prepared=prepared,
+            ai_results=ai_results,
+            skipped_set_ids={},
+            shortlist_count=1,
+        )
+        self.assertEqual(len(ranked), 1)
+        row = ranked[0]
+        self.assertEqual(row.get("signal_strength_raw"), "HIGH_CONFIDENCE_STRICT")
+        self.assertEqual(row.get("signal_strength"), "LOW_CONFIDENCE")
+        self.assertTrue(bool(row.get("signal_lock_applied")))
+        self.assertEqual(row.get("signal_lock_reason"), "promotion_cooldown")
+        self.assertIn("Anti-flip attivo", str(row.get("risk_note") or ""))
+
+    def test_signal_promotion_cooldown_does_not_block_high_when_previous_not_low(self) -> None:
+        repo = FakeRepo()
+        oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
+        oracle.historical_high_conf_required = False
+        oracle.signal_promotion_cooldown_hours = 12.0
+        signal, applied, note, reason = oracle._apply_signal_promotion_cooldown(
+            set_id="10311",
+            signal_strength="HIGH_CONFIDENCE_STRICT",
+            previous_signal={"signal_strength": "HIGH_CONFIDENCE_STRICT", "age_sec": 1800.0},
+        )
+        self.assertEqual(signal, "HIGH_CONFIDENCE_STRICT")
+        self.assertFalse(applied)
+        self.assertIsNone(note)
+        self.assertIsNone(reason)
+
     def test_adaptive_historical_thresholds_relax_gate_using_reference_distribution(self) -> None:
         repo = FakeRepo()
         oracle = DiscoveryOracle(repo, gemini_api_key=None, openrouter_api_key=None)
