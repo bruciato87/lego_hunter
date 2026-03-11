@@ -22,8 +22,8 @@ on:
         default: ""
         type: string
   schedule:
-    # GitHub cron is UTC; we schedule DST/CET candidate slots and gate by Europe/Rome hour.
-    - cron: "0 6,7,19,20 * * *"
+    # GitHub cron is UTC; we schedule DST/CET candidate slots and gate by Europe/Rome hour + cadence.
+    - cron: "0 6,7 * * *"
 
 jobs:
   schedule-gate:
@@ -44,7 +44,17 @@ jobs:
           fi
           configured_hours="${{ vars.SCOVA_SCHEDULE_HOURS_IT }}"
           if [ -z "$configured_hours" ]; then
-            configured_hours="08,21"
+            configured_hours="08"
+          fi
+          configured_every_n_days="${{ vars.SCOVA_SCHEDULE_EVERY_N_DAYS_IT }}"
+          if [ -z "$configured_every_n_days" ]; then
+            configured_every_n_days="3"
+          fi
+          if ! [[ "$configured_every_n_days" =~ ^[0-9]+$ ]]; then
+            configured_every_n_days="3"
+          fi
+          if [ "$configured_every_n_days" -lt 1 ]; then
+            configured_every_n_days="1"
           fi
           normalized_hours=""
           for token in $(echo "$configured_hours" | tr ',;' ' '); do
@@ -67,16 +77,29 @@ jobs:
             fi
           done
           if [ -z "$normalized_hours" ]; then
-            normalized_hours="08,21"
+            normalized_hours="08"
           fi
           local_hour="$(TZ=Europe/Rome date +%H)"
-          should_run="false"
-          for hour in $(echo "$normalized_hours" | tr ',' ' '); do
-            if [ "$local_hour" = "$hour" ]; then
-              should_run="true"
-              break
+          local_epoch_day="$(( $(TZ=Europe/Rome date +%s) / 86400 ))"
+          anchor_epoch_day="$(( $(TZ=Europe/Rome date -d '2026-01-01 00:00:00' +%s) / 86400 ))"
+          cadence_ok="false"
+          if [ "$configured_every_n_days" -eq 1 ]; then
+            cadence_ok="true"
+          else
+            delta_days="$(( local_epoch_day - anchor_epoch_day ))"
+            if [ $(( delta_days % configured_every_n_days )) -eq 0 ]; then
+              cadence_ok="true"
             fi
-          done
+          fi
+          should_run="false"
+          if [ "$cadence_ok" = "true" ]; then
+            for hour in $(echo "$normalized_hours" | tr ',' ' '); do
+              if [ "$local_hour" = "$hour" ]; then
+                should_run="true"
+                break
+              fi
+            done
+          fi
           if [ "$should_run" = "true" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
           else
@@ -84,11 +107,15 @@ jobs:
           fi
           echo "local_hour=$local_hour" >> "$GITHUB_OUTPUT"
           echo "schedule_hours=$normalized_hours" >> "$GITHUB_OUTPUT"
+          echo "schedule_every_n_days=$configured_every_n_days" >> "$GITHUB_OUTPUT"
+          echo "cadence_ok=$cadence_ok" >> "$GITHUB_OUTPUT"
       - name: Gate summary
         run: |
           echo "event=${{ github.event_name }}"
           echo "local_hour=${{ steps.decide.outputs.local_hour }}"
           echo "schedule_hours=${{ steps.decide.outputs.schedule_hours }}"
+          echo "schedule_every_n_days=${{ steps.decide.outputs.schedule_every_n_days }}"
+          echo "cadence_ok=${{ steps.decide.outputs.cadence_ok }}"
           echo "should_run=${{ steps.decide.outputs.should_run }}"
 
   test:
